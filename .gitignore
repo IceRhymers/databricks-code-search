@@ -11,3 +11,7 @@ __pycache__/
 dist/
 build/
 pgdata/
+
+# uv.lock not tracked yet: local resolver pins the internal Databricks PyPI proxy,
+# which public CI cannot reach. CI resolves fresh against public PyPI. See issue #3.
+uv.lock
