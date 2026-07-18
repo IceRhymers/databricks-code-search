@@ -42,7 +42,7 @@ deploy: ## Deploy the bundle to the dev target
 
 deploy-prod: ## Deploy to prod (requires JOB_RUN_AS_SP=<job run-as SP client id>)
 	@test -n "$$JOB_RUN_AS_SP" || (echo "deploy-prod requires JOB_RUN_AS_SP=<client-id> (the job run-as SP); an empty value creates a broken NO-LOGIN role" && exit 1)
-	databricks bundle deploy -t prod --var job_run_as_sp=$$JOB_RUN_AS_SP
+	databricks bundle deploy -t prod --var job_run_as_sp="$$JOB_RUN_AS_SP"
 
 set-secrets: ## Write the GitHub token into the bundle's secret scope (run after deploy). Requires GITHUB_TOKEN; scope/key via SECRET_SCOPE/SECRET_KEY.
 	@test -n "$$GITHUB_TOKEN" || (echo "set-secrets requires GITHUB_TOKEN in env" && exit 1)
