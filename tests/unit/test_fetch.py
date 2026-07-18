@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import indexer.fetch as fetch
 from indexer.fetch import download_tarball, extract_tarball, resolve_ref
 
 ORG = "acme"
@@ -66,6 +67,31 @@ def test_download_tarball_follows_redirect_and_writes_bytes(tmp_path: Path) -> N
         out = download_tarball(client, ORG, REPO, SHA, tmp_path)
     assert out == tmp_path / "source.tar.gz"
     assert out.read_bytes() == CLEAN_TARBALL
+
+
+@pytest.mark.unit
+def test_download_tarball_rejects_oversized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Cap below the served tarball size -> the streamed download aborts.
+    monkeypatch.setattr(fetch, "MAX_TARBALL_BYTES", 4)
+    with _client() as client:
+        with pytest.raises(ValueError, match="exceeds"):
+            download_tarball(client, ORG, REPO, SHA, tmp_path)
+
+
+@pytest.mark.unit
+def test_extract_tarball_rejects_decompression_bomb(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Cap below the summed member size -> extraction is refused before writing.
+    monkeypatch.setattr(fetch, "MAX_EXTRACTED_BYTES", 4)
+    tar_path = tmp_path / "source.tar.gz"
+    tar_path.write_bytes(CLEAN_TARBALL)
+    dest = tmp_path / "extracted"
+    with pytest.raises(ValueError, match="exceeding"):
+        extract_tarball(tar_path, dest)
+    assert not any(dest.iterdir()) if dest.exists() else True
 
 
 @pytest.mark.unit

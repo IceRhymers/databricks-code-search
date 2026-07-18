@@ -19,6 +19,12 @@ _GITHUB_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
+# Defense-in-depth caps for the untrusted tarball on an ephemeral serverless disk:
+# bound the compressed download and the uncompressed extraction independently so a
+# gzip bomb or an oversized tracked blob can't exhaust local storage.
+MAX_TARBALL_BYTES = 500_000_000
+MAX_EXTRACTED_BYTES = 2_000_000_000
+
 
 def resolve_ref(client: httpx.Client, org: str, repo: str) -> tuple[str, str]:
     """Return ``(default_branch, head_sha)`` for ``org/repo``.
@@ -52,8 +58,12 @@ def download_tarball(client: httpx.Client, org: str, repo: str, ref: str, dest: 
     url = f"{_API_BASE}/repos/{org}/{repo}/tarball/{ref}"
     with client.stream("GET", url, headers=_GITHUB_HEADERS, follow_redirects=True) as resp:
         resp.raise_for_status()
+        total = 0
         with out.open("wb") as fh:
             for chunk in resp.iter_bytes():
+                total += len(chunk)
+                if total > MAX_TARBALL_BYTES:
+                    raise ValueError(f"tarball for {org}/{repo} exceeds {MAX_TARBALL_BYTES} bytes")
                 fh.write(chunk)
     return out
 
@@ -68,6 +78,12 @@ def extract_tarball(tar_path: Path, dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(tar_path, mode="r:*") as tf:
         members = tf.getmembers()
+        # Reject a decompression bomb before writing any of it to disk.
+        extracted = sum(m.size for m in members if m.isreg())
+        if extracted > MAX_EXTRACTED_BYTES:
+            raise ValueError(
+                f"tarball extracts to {extracted} bytes, exceeding {MAX_EXTRACTED_BYTES}"
+            )
         tf.extractall(dest, filter="data")
 
     top_level = {

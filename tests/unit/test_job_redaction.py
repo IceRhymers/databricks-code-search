@@ -117,6 +117,39 @@ def test_token_never_appears_in_debug_logs(caplog: pytest.LogCaptureFixture) -> 
         assert SENTINEL not in record.getMessage()
 
 
+def _error_handler(request: httpx.Request) -> httpx.Response:
+    # Fail the tarball download so run() hits its per-repo `logger.exception` path
+    # (an httpx error carries the request, whose headers hold the Authorization token).
+    parts = request.url.path.strip("/").split("/")
+    if len(parts) == 3:
+        return httpx.Response(200, json={"default_branch": "main"})
+    if parts[3] == "commits":
+        return httpx.Response(200, json={"sha": "sha_widgets"})
+    return httpx.Response(500)
+
+
+@pytest.mark.unit
+def test_token_never_appears_on_error_path(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    wc = _FakeWorkspaceClient()
+    with httpx.Client(transport=httpx.MockTransport(_error_handler)) as client:
+        code = run(
+            repos="acme/widgets",
+            scope="scope",
+            key="key",
+            endpoint="ep",
+            database="db",
+            workspace_client=wc,
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=_index_fn,
+        )
+    assert code == 1  # the repo failed and was isolated
+    assert SENTINEL not in caplog.text
+    for record in caplog.records:
+        assert SENTINEL not in record.getMessage()
+
+
 @pytest.mark.unit
 def test_source_has_no_debug_level_lowering() -> None:
     forbidden = (

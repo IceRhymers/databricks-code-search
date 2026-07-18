@@ -68,6 +68,10 @@ def normalize_repo(entry: str) -> str:
 
     if not _REPO_RE.match(slug):
         raise ValueError(f"could not parse a github org/repo from {entry!r}")
+    # Reject degenerate `.`/`..` segments GitHub itself rejects; keeps them out of
+    # the API URL path and the tarball dest even though the host is fixed.
+    if any(part in {".", ".."} for part in slug.split("/")):
+        raise ValueError(f"invalid org/repo segment in {entry!r}")
     return slug
 
 

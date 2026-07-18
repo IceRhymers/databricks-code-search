@@ -48,6 +48,10 @@ def test_normalize_repo_accepts(entry: str, expected: str) -> None:
         "https://gitlab.com/acme/widgets",
         "git@bitbucket.org:acme/widgets.git",
         "https://evil.com/a/b",
+        "../..",
+        "acme/..",
+        "../widgets",
+        "https://github.com/acme/../secrets",
     ],
 )
 def test_normalize_repo_rejects(entry: str) -> None:
