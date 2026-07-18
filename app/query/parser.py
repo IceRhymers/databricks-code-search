@@ -455,6 +455,18 @@ def _resolve_case(tokens: list[Token]) -> bool:
     return flag
 
 
+def resolve_case(query: str) -> bool:
+    """Return the query-global case flag (last ``case:`` wins; default False).
+
+    A thin, stdlib-only wrapper over :func:`tokenize` + :func:`_resolve_case`. Issue #9's
+    compiler holds only the AST (where case is stamped on ``Substring``/``Regex`` leaves);
+    a caller holding the raw query string can pass ``resolve_case(query)`` so a filter-only
+    ``case:yes`` query (e.g. ``case:yes file:x``) resolves case exactly instead of falling
+    back to insensitive. Additive: no node change, no :func:`parse` output change.
+    """
+    return _resolve_case(tokenize(query))
+
+
 def parse(query: str) -> Node:
     """Parse a zoekt-style query string into an immutable AST, or raise QueryParseError."""
     tokens = tokenize(query)
