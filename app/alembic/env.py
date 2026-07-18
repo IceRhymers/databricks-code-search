@@ -30,8 +30,11 @@ target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' (--sql) mode, without a DB connection."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("offline (--sql) mode requires DATABASE_URL to be set")
     context.configure(
-        url=os.environ.get("DATABASE_URL"),
+        url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},

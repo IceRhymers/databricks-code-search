@@ -12,8 +12,11 @@ connect as the CI superuser and silently bypass the grants under test.
 
 from __future__ import annotations
 
+import importlib.util
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple
 
 import psycopg
@@ -29,6 +32,8 @@ from app.db.client import create_db_engine
 from app.db.grants import build_app_grants, build_job_grants
 from app.db.models import Base
 
+_MIGRATE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "migrate.py"
+
 
 class Migrated(NamedTuple):
     conn: Connection
@@ -38,6 +43,15 @@ class Migrated(NamedTuple):
 
 def _unique(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _load_migrate() -> ModuleType:
+    """Load scripts/migrate.py by path (scripts/ is not an importable package)."""
+    spec = importlib.util.spec_from_file_location("migrate_under_test", _MIGRATE_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture
@@ -212,3 +226,95 @@ def test_no_vector_extension_installed(migrated: Migrated) -> None:
         text("SELECT count(*) FROM pg_extension WHERE extname = 'vector'")
     ).scalar()
     assert count == 0
+
+
+@pytest.mark.integration
+def test_migrate_run_apply_grants_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drive scripts/migrate.py run(apply_grants=True) — the real execution path.
+
+    Exercises env-var resolution, the pg_roles existence check, and grant
+    application against roles that actually exist, then proves enforcement via
+    SET ROLE. This is the coverage the builder-only enforcement test lacks.
+    """
+    migrate = _load_migrate()
+    schema = _unique("test_apply")
+    app_role = _unique("app_sp")
+    job_role = _unique("job_wr")
+
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"CREATE ROLE {app_role} NOLOGIN"))
+        conn.execute(text(f"CREATE ROLE {job_role} NOLOGIN"))
+        conn.commit()
+
+        monkeypatch.setenv("PGSCHEMA", schema)
+        monkeypatch.setenv("APP_SP_ROLE", app_role)
+        monkeypatch.setenv("JOB_WRITER_ROLE", job_role)
+
+        # Opens its own engine/connection, runs upgrade + grants, and commits.
+        migrate.run(apply_grants=True)
+
+        # DDL landed in the grant target schema (fix for schema divergence).
+        tables = (
+            conn.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_schema = :s"),
+                {"s": schema},
+            )
+            .scalars()
+            .all()
+        )
+        assert {"repos", "files", "symbols"} <= set(tables)
+
+        # Enforcement: app role reads but cannot write; job role can write.
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text(f"SET ROLE {app_role}"))
+        conn.execute(text("SELECT * FROM files")).all()
+        with pytest.raises(ProgrammingError) as excinfo:
+            conn.execute(text("INSERT INTO repos (name) VALUES ('denied')"))
+        assert isinstance(excinfo.value.orig, psycopg.errors.InsufficientPrivilege)
+        conn.rollback()
+
+        conn.execute(text(f"SET ROLE {job_role}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("INSERT INTO repos (name) VALUES ('allowed')"))
+        conn.execute(text("RESET ROLE"))
+        conn.rollback()
+    finally:
+        conn.rollback()
+        conn.execute(text("RESET ROLE"))
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        for role in (app_role, job_role):
+            conn.execute(text(f"DROP OWNED BY {role} CASCADE"))
+            conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_migrate_apply_grants_missing_role_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A grant target that is not in pg_roles hard-fails (no silent skip, no self-CREATE)."""
+    migrate = _load_migrate()
+    schema = _unique("test_missing")
+
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.commit()
+
+        monkeypatch.setenv("PGSCHEMA", schema)
+        monkeypatch.setenv("APP_SP_ROLE", _unique("absent_app"))
+        monkeypatch.setenv("JOB_WRITER_ROLE", _unique("absent_job"))
+
+        with pytest.raises(RuntimeError, match="does not exist"):
+            migrate.run(apply_grants=True)
+    finally:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
