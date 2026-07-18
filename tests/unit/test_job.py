@@ -216,3 +216,31 @@ def test_run_empty_repos_is_noop() -> None:
     )
     assert code == 0
     assert idx.calls == []
+
+
+# --- main() exit semantics --------------------------------------------------
+# A serverless python_wheel_task entry point must RETURN on success; any raised
+# SystemExit (even code 0) is reported as a workload failure. main() must only
+# exit non-zero, and only when a repo actually failed. (Regression: a live run
+# failed with "SystemExit: 0" despite indexing succeeding.)
+
+
+@pytest.mark.unit
+def test_main_returns_normally_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    import indexer.job as job
+
+    monkeypatch.setattr(job.sys, "argv", ["code-search-index", "--scope", "s", "--key", "k"])
+    monkeypatch.setattr(job, "run", lambda **_: 0)
+    # Must NOT raise SystemExit on the success path.
+    assert job.main() is None
+
+
+@pytest.mark.unit
+def test_main_exits_nonzero_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import indexer.job as job
+
+    monkeypatch.setattr(job.sys, "argv", ["code-search-index", "--scope", "s", "--key", "k"])
+    monkeypatch.setattr(job, "run", lambda **_: 1)
+    with pytest.raises(SystemExit) as excinfo:
+        job.main()
+    assert excinfo.value.code == 1

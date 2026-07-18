@@ -25,7 +25,9 @@ resources:
           spec:
             client: "3"  # serverless env client version — CONFIRM via live `bundle validate`
             dependencies:
-              - ./dist/*.whl  # wheel from artifacts.wheel — CONFIRM glob interpolation via live validate
+              # Glob is resolved relative to THIS file (resources/), so reach up to the
+              # bundle-root dist/ where artifacts.wheel (`uv build --wheel`) writes it.
+              - ../dist/*.whl
       schedule:
         quartz_cron_expression: ${var.index_schedule}
         timezone_id: UTC

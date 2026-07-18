@@ -202,7 +202,11 @@ def main() -> None:
         endpoint=args.endpoint,
         database=args.database,
     )
-    sys.exit(exit_code)
+    # A serverless python_wheel_task entry point signals success by returning
+    # normally; any raised SystemExit (even code 0) is reported as a workload
+    # failure. So only exit non-zero to fail the task when a repo failed.
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
