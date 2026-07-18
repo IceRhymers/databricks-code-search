@@ -1,0 +1,35 @@
+# Serverless indexing job (#7). Runs the `code-search-index` wheel entry point on a
+# schedule, fetching each configured repo as a tarball (no git binary) and upserting
+# repos/files/symbols with SHA-stamped mark-and-sweep.
+#
+# The wheel is built by the top-level `artifacts.wheel` target in databricks.yml
+# (`uv build --wheel`) and attached via the serverless environment `dependencies`.
+resources:
+  jobs:
+    code_search_index:
+      name: code-search-index
+      tasks:
+        - task_key: index
+          environment_key: default
+          python_wheel_task:
+            package_name: databricks-code-search
+            entry_point: code-search-index
+            named_parameters:
+              repos: ${var.repos_to_index}
+              scope: ${var.github_token_secret_scope}
+              key: ${var.github_token_secret_key}
+              endpoint: projects/${var.lakebase_project_name}/branches/production/endpoints/${var.lakebase_endpoint_name}
+              database: ${var.database_name}
+      environments:
+        - environment_key: default
+          spec:
+            client: "3"  # serverless env client version — CONFIRM via live `bundle validate`
+            dependencies:
+              # Glob is resolved relative to THIS file (resources/), so reach up to the
+              # bundle-root dist/ where artifacts.wheel (`uv build --wheel`) writes it.
+              - ../dist/*.whl
+      schedule:
+        quartz_cron_expression: ${var.index_schedule}
+        timezone_id: UTC
+      queue:
+        enabled: true

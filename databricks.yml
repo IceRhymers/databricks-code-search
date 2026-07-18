@@ -45,6 +45,14 @@ variables:
 include:
   - resources/*.yml
 
+# The wheel consumed by the serverless indexing job's environment `dependencies`.
+# Built with uv (matches the repo's uv-based toolchain); DABs runs `build` itself.
+artifacts:
+  wheel:
+    type: whl
+    build: uv build --wheel
+    path: .
+
 targets:
   dev:
     mode: development
@@ -70,3 +78,9 @@ targets:
           postgres_role: ${var.job_run_as_sp}
           identity_type: SERVICE_PRINCIPAL
           auth_method: LAKEBASE_OAUTH_V1
+      # Prod runs the indexing job as the pre-created writer SP (dev uses the
+      # developer identity, so this overlay is prod-only).
+      jobs:
+        code_search_index:
+          run_as:
+            service_principal_name: ${var.job_run_as_sp}
