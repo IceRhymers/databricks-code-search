@@ -169,6 +169,14 @@ def seeded() -> Iterator[Seeded]:
             content="# handler mentioned here in beta too",
         )
 
+        # Separate repo so this NULL-content/NULL-lang row perturbs no repo-scoped
+        # exact-set assertion (ACME_PATHS / BETA_PATHS / lang:go); it exists only to
+        # prove content predicates exclude a NULL-content row.
+        gamma_id = _insert_repo(conn, "gamma/misc")
+        files["gamma/null_content.txt"] = _insert_file(
+            conn, gamma_id, "gamma/null_content.txt", lang=None, content=None
+        )
+
         _insert_symbol(conn, files["src/handler.go"], acme_id, "Handler")
         _insert_symbol(conn, files["src/handler.go"], acme_id, "parseRequest")
         _insert_symbol(conn, files["src/util.go"], acme_id, "helperFn")
@@ -303,6 +311,16 @@ def test_substring_escapes_literal_underscore_not_a_wildcard(seeded: Seeded) -> 
     # `_` is a LIKE/ILIKE single-char wildcard; escaped so `foo_bar` matches only the
     # literal underscore file and NOT `fooXbar` (which an unescaped `_` would match).
     assert _paths(seeded.conn, "foo_bar") == {"src/escape1.go"}
+
+
+@pytest.mark.integration
+def test_null_content_row_excluded_by_content_predicates(seeded: Seeded) -> None:
+    # `gamma/null_content.txt` has content=NULL. `NULL ILIKE ...` and `NULL ~* ...`
+    # both evaluate to NULL (not true), so a content term never returns the row --
+    # even though it is reachable via a path predicate (path is NOT NULL).
+    assert "gamma/null_content.txt" in _paths(seeded.conn, "file:^gamma/")
+    assert "gamma/null_content.txt" not in _paths(seeded.conn, "handler")  # ILIKE path
+    assert "gamma/null_content.txt" not in _paths(seeded.conn, "/./")  # regex ~* path
 
 
 # --------------------------------------------------------------- case override / resolve_case

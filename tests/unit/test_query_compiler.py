@@ -185,9 +185,12 @@ def test_case_sensitive_override_true_flips_filter_only() -> None:
 
 @pytest.mark.unit
 def test_case_sensitive_override_false_forces_insensitive() -> None:
+    # Regex uses its OWN stamped flag (case:yes -> `~`), NOT the override: the
+    # `case_sensitive=` arg only steers filter atoms (path/sym), never content/regex.
     sql, _ = _render("case:yes /foo/", case_sensitive=False)
-    # Regex uses its OWN stamped flag (still `~`), but path/symbol would honor override.
-    # Prove override reaches a filter: symbol stays insensitive despite case:yes.
+    assert "files.content ~ " in sql
+    assert "files.content ~*" not in sql
+    # Prove the override reaches a filter: symbol stays insensitive despite case:yes.
     sql2, _ = _render("case:yes sym:y", case_sensitive=False)
     assert "symbols.name ~*" in sql2
 
@@ -230,6 +233,13 @@ def test_explicit_limit() -> None:
 def test_negative_limit_raises() -> None:
     with pytest.raises(ValueError, match="non-negative"):
         compile_query(parse("foo"), limit=-1)
+
+
+@pytest.mark.unit
+def test_zero_limit_is_allowed() -> None:
+    # 0 is a valid non-negative cap (LIMIT 0 -> empty page); only < 0 is rejected.
+    _, params = _render("foo", limit=0)
+    assert 0 in params.values()
 
 
 @pytest.mark.unit
