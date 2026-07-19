@@ -310,6 +310,9 @@ def test_semantic_ceiling_exceeded_degrades_but_still_indexes_the_core() -> None
     assert code == 0  # the repo is NOT failed by a semantic-only problem
     assert idx.calls == ["acme/widgets"]  # core index still ran
     assert idx.chunk_writer is None  # ...with chunks skipped
+    # Proves the core index got the real work, not an empty items generator: "not skipped"
+    # and "correctly indexed" are different claims, and only the latter is the contract.
+    assert idx.counts[0] == IndexCounts(files=2, symbols=1, swept=0)
 
 
 @pytest.mark.unit

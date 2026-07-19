@@ -82,10 +82,13 @@ def test_rrf_sql_shared_wrapper(backend: str) -> None:
     # change each row's 1/(k+rank) contribution, so the same query over the same corpus
     # could otherwise fuse to a different order (issues #9/#13 determinism rule).
     assert sql.count("row_number() OVER (ORDER BY metric, id)") == 2
-    # The ANN leg's INNER order stays single-expression -- adding `, id` there would defeat
-    # the lakebase_ann/pgvector index ordering, and approximate-index set membership is
-    # nondeterministic regardless. The BM25 leg (scores plateau hard) does get the tiebreak.
+    # NEITHER leg's inner ORDER BY may carry a second sort key. Postgres cannot build an
+    # ordered-index path when one follows an ORDER BY-operator key, and the fallback is not
+    # cost-based -- it seq-scans and full-sorts even with enable_seqscan=off. This guard is
+    # the ONLY thing protecting the BM25 leg: CI's stand-in metric (ts_rank_cd) is never
+    # index-ordered, so a regression here is invisible to any EXPLAIN test.
     assert "ORDER BY embedding <=> (:qvec)::vector LIMIT :topk" in sql
+    assert ", id LIMIT :topk" not in sql
     # NULL embeddings never earn RRF credit.
     assert "WHERE embedding IS NOT NULL" in sql
     # Each leg's candidate cap lives in an INNER subquery whose ORDER BY repeats the metric

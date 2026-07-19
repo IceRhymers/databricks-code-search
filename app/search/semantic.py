@@ -84,29 +84,36 @@ def format_vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(x) for x in vec) + "]"
 
 
-def _leg_cte(name: str, metric: str, *, where: str = "", tiebreak_inner: bool = False) -> str:
+def _leg_cte(name: str, metric: str, *, where: str = "") -> str:
     """One rank CTE: rank the top ``:topk`` rows by ``metric`` (ASC = best) as 1..topk.
 
     The ``ORDER BY metric LIMIT :topk`` lives in an INNER subquery so the ANN / BM25 index is
     usable; ``row_number()`` then ranks only those candidates (never a full-table sort).
 
-    Determinism (issues #9/#13) applies at BOTH levels, but asymmetrically:
+    Determinism (issues #9/#13) is enforced ONLY where it does not cost the index:
 
-    * ``row_number()`` ALWAYS breaks ties on ``id``. Scores plateau (BM25 especially), and
-      arbitrary rank assignment among equals changes each row's ``1/(k+rank)`` contribution --
-      so the same query over the same corpus could otherwise fuse to a different order. This
-      is free: the window sorts an already-materialized <= topk-row set, no index involved.
-    * The INNER ``ORDER BY`` adds ``, id`` only when ``tiebreak_inner`` is set (the BM25 leg).
-      It is deliberately NOT added on the ANN leg: a second sort expression there would defeat
-      the ``lakebase_ann`` / pgvector index ordering, and an approximate index's candidate-set
-      membership is inherently nondeterministic anyway, so the cost buys nothing.
+    * ``row_number()`` breaks ties on ``id``. Scores plateau (BM25 especially), and arbitrary
+      rank assignment among equals changes each row's ``1/(k+rank)`` contribution, so the same
+      query over the same corpus could otherwise fuse to a different order. This is free: the
+      window sorts an already-materialized <= topk-row set, no index involved.
+    * The INNER ``ORDER BY`` stays a SINGLE expression on BOTH legs. This is load-bearing:
+      Postgres cannot build an ordered-index path when a second sort key follows an
+      ``ORDER BY``-operator key, and the fallback is not cost-based -- it will seq-scan and
+      full-sort the table even with ``enable_seqscan = off``. Both ``lakebase_ann``'s ``<=>``
+      and ``lakebase_bm25``'s ``<@>`` are such operators, so adding ``, id`` here would
+      silently collapse the leg to a full scan in production. It would also buy nothing:
+      an approximate index's candidate-set membership is nondeterministic regardless, so
+      there is no tie-stability to win at that level.
+
+    NOTE: CI cannot catch a regression here on the BM25 leg -- the stand-in metric
+    (``ts_rank_cd``) is never index-ordered, so its plan is seq-scan + sort either way. The
+    unit test therefore asserts the SQL SHAPE (no inner tiebreak) rather than a plan.
     """
-    inner_order = f"{metric}, id" if tiebreak_inner else metric
     return (
         f"{name} AS ("
         f"SELECT id, row_number() OVER (ORDER BY metric, id) AS rank "
         f"FROM (SELECT id, {metric} AS metric FROM chunks{where} "
-        f"ORDER BY {inner_order} LIMIT :topk) s)"
+        f"ORDER BY {metric} LIMIT :topk) s)"
     )
 
 
@@ -125,8 +132,9 @@ def build_hybrid_rrf_sql(backend: str) -> TextClause:
     # sorts NULLs LAST in ASC, so they stay hidden until the corpus is smaller than :topk --
     # at which point they would take real ranks and earn real RRF credit for not matching.
     ann = _leg_cte("ann", _ANN_METRIC, where=" WHERE embedding IS NOT NULL")
-    # BM25 scores plateau hard, so its candidate SET (not just the ranking) needs a tiebreak.
-    bm = _leg_cte("bm", _BM_METRIC[backend], tiebreak_inner=True)
+    # No inner tiebreak on this leg either -- see _leg_cte: a second sort key after the
+    # `<@>` ORDER BY-operator key would make the lakebase_bm25 index path unavailable.
+    bm = _leg_cte("bm", _BM_METRIC[backend])
     sql = (
         f"WITH {ann}, {bm}, "
         "fused AS ("

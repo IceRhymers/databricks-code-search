@@ -108,6 +108,9 @@ def _signals(payload: dict[str, Any]) -> dict[str, Any]:
         "truncated": payload.get("truncated"),
         "query_too_broad": payload.get("query_too_broad"),
         "query_parse_error": payload.get("query_parse_error"),
+        # Without this, a flag-on-before-migrate misconfiguration is invisible in logs: every
+        # semantic query returns empty and reads identically to a genuine zero-result query.
+        "semantic_schema_missing": payload.get("semantic_schema_missing"),
     }
 
 
