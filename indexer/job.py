@@ -34,7 +34,7 @@ import httpx
 from app.config import Settings, get_settings
 from app.db.client import create_db_engine
 from indexer.chunk_store import write_chunks
-from indexer.embed import EmbedFn, get_embedder
+from indexer.embed import EmbeddingCountMismatchError, EmbedFn, get_embedder
 from indexer.fetch import download_tarball, extract_tarball, resolve_ref
 from indexer.languages import Chunk, IndexCounts, ParsedFile
 from indexer.parse import iter_chunks, iter_source_files
@@ -145,8 +145,21 @@ def run(
 
     # Lazy embedder: built (and databricks-sdk imported) only when semantic
     # search is enabled and no fake was injected (issue #14 A1).
+    #
+    # Degrade rather than abort: get_embedder raises when semantic_embedding_endpoint is
+    # unset, and letting that propagate would kill the WHOLE indexing run -- including every
+    # repo that has nothing to do with semantic search. Semantic is an additive layer, so a
+    # semantic misconfiguration must not cost us the core index.
     if cfg.semantic_enabled and embed_fn is None:
-        embed_fn = get_embedder(cfg)
+        try:
+            embed_fn = get_embedder(cfg)
+        except Exception:
+            logger.warning(
+                "semantic enabled but the embedder could not be built; indexing the core "
+                "corpus WITHOUT chunks (semantic results will be stale until fixed)",
+                exc_info=True,
+            )
+            embed_fn = None
 
     failures = 0
     try:
@@ -201,6 +214,14 @@ def _precompute_chunk_writer(
 
     all_texts = [c.content for chunks in per_file.values() for c in chunks]
     all_vectors = embed_fn(all_texts) if all_texts else []
+    # Re-checked HERE, not just inside databricks_embedder: embed_fn is a public injection
+    # point on run(), and the positional re-slicing below is what actually depends on the
+    # invariant. A short result would raise IndexError further down; a long one would
+    # silently attach the wrong file's vectors. Guard where the assumption is used.
+    if len(all_vectors) != len(all_texts):
+        raise EmbeddingCountMismatchError(
+            f"embedder returned {len(all_vectors)} vectors for {len(all_texts)} chunk texts"
+        )
 
     by_path: dict[str, list[tuple[int, str, list[float]]]] = {}
     i = 0
@@ -243,9 +264,23 @@ def _index_one(
             # lazy items generator below, it cannot stream through index_repo's
             # open transaction (A4).
             files = list(iter_source_files(root))
-            chunk_writer = _precompute_chunk_writer(
-                files, embed_fn, cfg.semantic_max_chunks_per_repo
-            )
+            try:
+                chunk_writer = _precompute_chunk_writer(
+                    files, embed_fn, cfg.semantic_max_chunks_per_repo
+                )
+            except Exception:
+                # The semantic layer is ADDITIVE: a chunk-ceiling breach, a downed embedder,
+                # or a dim/count mismatch must not cost this repo its core index. Letting it
+                # propagate would skip files/symbols AND the mark-and-sweep, silently leaving
+                # the repo stale -- a worse outcome than stale chunks. Chunks catch up on the
+                # next successful run; the failure is logged with a traceback, never swallowed
+                # silently.
+                logger.warning(
+                    "semantic precompute failed for %s; indexing core corpus without chunks",
+                    name,
+                    exc_info=True,
+                )
+                chunk_writer = None
             items = ((pf, extract_symbols(pf)) for pf in files)
         else:
             # Lazy generator: files stream through the open transaction (bounded memory).

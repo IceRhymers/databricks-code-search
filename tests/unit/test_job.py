@@ -295,13 +295,51 @@ def test_semantic_enabled_builds_and_wires_a_chunk_writer() -> None:
 
 
 @pytest.mark.unit
-def test_semantic_ceiling_exceeded_fails_only_that_repo() -> None:
+def test_semantic_ceiling_exceeded_degrades_but_still_indexes_the_core() -> None:
+    """A semantic failure must not cost the repo its CORE index.
+
+    The semantic layer is additive. If the ceiling (or the embedder, or a dim/count
+    mismatch) blows up, propagating would skip files/symbols AND the mark-and-sweep,
+    leaving the repo silently stale -- strictly worse than stale chunks, which simply
+    catch up on the next run.
+    """
     idx = _RecordingIndex()
     # main.py + README.md each yield 1 chunk -> total 2, over a ceiling of 1.
     cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=1)
     code = _run("acme/widgets", idx, cfg=cfg, embed_fn=lambda texts: [[0.0] for _ in texts])
-    assert code == 1
-    assert idx.calls == []  # the ceiling raises before index_fn is ever called
+    assert code == 0  # the repo is NOT failed by a semantic-only problem
+    assert idx.calls == ["acme/widgets"]  # core index still ran
+    assert idx.chunk_writer is None  # ...with chunks skipped
+
+
+@pytest.mark.unit
+def test_embedder_failure_degrades_but_still_indexes_the_core() -> None:
+    """Same contract for a downed embedder, which is the likelier production failure."""
+
+    def _down(_texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("serving endpoint unavailable")
+
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True)
+    code = _run("acme/widgets", idx, cfg=cfg, embed_fn=_down)
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+    assert idx.chunk_writer is None
+
+
+@pytest.mark.unit
+def test_unbuildable_embedder_does_not_abort_the_whole_run() -> None:
+    """semantic_enabled with no configured endpoint must not kill every repo.
+
+    get_embedder raises when semantic_embedding_endpoint is unset; letting that
+    propagate out of run() would abort indexing for repos unrelated to semantic.
+    """
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True, semantic_embedding_endpoint=None)
+    code = _run("acme/widgets", idx, cfg=cfg)  # no embed_fn injected -> real get_embedder
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+    assert idx.chunk_writer is None
 
 
 # --- main() exit semantics --------------------------------------------------

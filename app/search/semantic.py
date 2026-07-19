@@ -84,16 +84,29 @@ def format_vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(x) for x in vec) + "]"
 
 
-def _leg_cte(name: str, metric: str) -> str:
+def _leg_cte(name: str, metric: str, *, where: str = "", tiebreak_inner: bool = False) -> str:
     """One rank CTE: rank the top ``:topk`` rows by ``metric`` (ASC = best) as 1..topk.
 
     The ``ORDER BY metric LIMIT :topk`` lives in an INNER subquery so the ANN / BM25 index is
     usable; ``row_number()`` then ranks only those candidates (never a full-table sort).
+
+    Determinism (issues #9/#13) applies at BOTH levels, but asymmetrically:
+
+    * ``row_number()`` ALWAYS breaks ties on ``id``. Scores plateau (BM25 especially), and
+      arbitrary rank assignment among equals changes each row's ``1/(k+rank)`` contribution --
+      so the same query over the same corpus could otherwise fuse to a different order. This
+      is free: the window sorts an already-materialized <= topk-row set, no index involved.
+    * The INNER ``ORDER BY`` adds ``, id`` only when ``tiebreak_inner`` is set (the BM25 leg).
+      It is deliberately NOT added on the ANN leg: a second sort expression there would defeat
+      the ``lakebase_ann`` / pgvector index ordering, and an approximate index's candidate-set
+      membership is inherently nondeterministic anyway, so the cost buys nothing.
     """
+    inner_order = f"{metric}, id" if tiebreak_inner else metric
     return (
         f"{name} AS ("
-        f"SELECT id, row_number() OVER (ORDER BY metric) AS rank "
-        f"FROM (SELECT id, {metric} AS metric FROM chunks ORDER BY {metric} LIMIT :topk) s)"
+        f"SELECT id, row_number() OVER (ORDER BY metric, id) AS rank "
+        f"FROM (SELECT id, {metric} AS metric FROM chunks{where} "
+        f"ORDER BY {inner_order} LIMIT :topk) s)"
     )
 
 
@@ -108,8 +121,12 @@ def build_hybrid_rrf_sql(backend: str) -> TextClause:
     """
     if backend not in _BM_METRIC:
         raise ValueError(f"unknown semantic backend {backend!r}; expected 'lakebase' or 'standin'")
-    ann = _leg_cte("ann", _ANN_METRIC)
-    bm = _leg_cte("bm", _BM_METRIC[backend])
+    # ANN leg skips NULL embeddings: `embedding <=> :qvec` is NULL for them and Postgres
+    # sorts NULLs LAST in ASC, so they stay hidden until the corpus is smaller than :topk --
+    # at which point they would take real ranks and earn real RRF credit for not matching.
+    ann = _leg_cte("ann", _ANN_METRIC, where=" WHERE embedding IS NOT NULL")
+    # BM25 scores plateau hard, so its candidate SET (not just the ranking) needs a tiebreak.
+    bm = _leg_cte("bm", _BM_METRIC[backend], tiebreak_inner=True)
     sql = (
         f"WITH {ann}, {bm}, "
         "fused AS ("
@@ -185,6 +202,28 @@ def _semantic_disabled_payload(query: str) -> dict[str, Any]:
     }
 
 
+def _semantic_not_migrated_payload(query: str, backend: str) -> dict[str, Any]:
+    """The flag is on but the gated migration has not run -- recoverable, not a fault.
+
+    ``detect_backend`` probes ``pg_am``, which says whether the BETA EXTENSIONS are loaded --
+    it cannot say whether ``chunks`` exists. Both orderings are reachable (an operator can set
+    the flag before running ``make migrate-semantic``, and the runbook's step list does not
+    forbid it), and in both the query would hit ``UndefinedTable``. A missing migration is an
+    operator-fixable condition in the same class as ``query_too_broad``, so it surfaces as a
+    payload field rather than an exception -- see ``app/main.py``'s dispatch contract.
+    """
+    return {
+        "query": query,
+        "semantic_enabled": True,
+        "backend": backend,
+        "results": [],
+        "count": 0,
+        "semantic_schema_missing": True,
+        "reason": "semantic schema not present; run `make migrate-semantic` (see "
+        "docs/runbooks/semantic-enablement.md)",
+    }
+
+
 def _semantic_search_payload(
     engine: Engine, cfg: Settings, query: str, limit: int
 ) -> dict[str, Any]:
@@ -205,6 +244,20 @@ def _semantic_search_payload(
     if not cfg.semantic_enabled:
         return _semantic_disabled_payload(query)
 
+    # Capability probe FIRST, in its own short transaction: if the gated migration has not
+    # run there is nothing to search, and discovering that should not cost a paid embedding
+    # call. Kept separate from the query transaction so the embed below still happens with no
+    # transaction open (no lock held across a network call).
+    with engine.connect() as conn:
+        with conn.begin():
+            # SET LOCAL (int-coerced -> injection-safe) is transaction-scoped, matching the
+            # other builders; it never leaks a statement_timeout onto the pooled connection.
+            conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(cfg.statement_timeout_ms)}")
+            backend = detect_backend(conn)
+            chunks_present = conn.execute(text("SELECT to_regclass('chunks')")).scalar() is not None
+    if not chunks_present:
+        return _semantic_not_migrated_payload(query, backend)
+
     # Embed OUTSIDE the connection/transaction: no network call inside the lock window.
     qvec = get_embedder(cfg)([query])[0]
     params = {
@@ -217,10 +270,7 @@ def _semantic_search_payload(
 
     with engine.connect() as conn:
         with conn.begin():
-            # SET LOCAL (int-coerced -> injection-safe) is transaction-scoped, matching the
-            # other builders; it never leaks a statement_timeout onto the pooled connection.
             conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(cfg.statement_timeout_ms)}")
-            backend = detect_backend(conn)
             rows = conn.execute(build_hybrid_rrf_sql(backend), params).all()
 
     results = [

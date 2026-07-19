@@ -78,7 +78,16 @@ def test_rrf_sql_shared_wrapper(backend: str) -> None:
 
     # Shared fusion wrapper: two rank CTEs, index-friendly inner LIMIT, FULL OUTER JOIN, RRF sum.
     assert "ann AS (" in sql and "bm AS (" in sql
-    assert sql.count("row_number() OVER (ORDER BY metric)") == 2
+    # Both legs break rank ties on id: arbitrary rank assignment among equal scores would
+    # change each row's 1/(k+rank) contribution, so the same query over the same corpus
+    # could otherwise fuse to a different order (issues #9/#13 determinism rule).
+    assert sql.count("row_number() OVER (ORDER BY metric, id)") == 2
+    # The ANN leg's INNER order stays single-expression -- adding `, id` there would defeat
+    # the lakebase_ann/pgvector index ordering, and approximate-index set membership is
+    # nondeterministic regardless. The BM25 leg (scores plateau hard) does get the tiebreak.
+    assert "ORDER BY embedding <=> (:qvec)::vector LIMIT :topk" in sql
+    # NULL embeddings never earn RRF credit.
+    assert "WHERE embedding IS NOT NULL" in sql
     # Each leg's candidate cap lives in an INNER subquery whose ORDER BY repeats the metric
     # EXPRESSION (not the alias) -- that is what lets the ANN/BM25 index serve the ordering.
     assert sql.count("LIMIT :topk) s)") == 2
@@ -131,12 +140,15 @@ class _FakeResult:
     def first(self) -> Any:
         return self._rows[0] if self._rows else None
 
+    def scalar(self) -> Any:
+        return self._rows[0] if self._rows else None
+
     def all(self) -> list[Any]:
         return self._rows
 
 
 class _FakeConn:
-    """Returns canned results by call order: [backend probe, RRF rows]."""
+    """Returns canned results by call order: [backend probe, chunks probe, RRF rows]."""
 
     def __init__(self, results: list[Any]) -> None:
         self._results = list(results)
@@ -178,6 +190,7 @@ def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _FakeEngine(
         [
             _FakeResult([]),  # detect_backend probe: no lakebase_bm25 -> standin
+            _FakeResult(["chunks"]),  # to_regclass('chunks') -> schema present
             _FakeResult(
                 [
                     _Row(
@@ -207,14 +220,56 @@ def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
             "rrf_score": 0.5,
         }
     ]
-    # Transaction-local timeout was set (matches the other builders).
-    assert engine._conn.driver_sql == ["SET LOCAL statement_timeout = 5000"]
+    # Transaction-local timeout set on BOTH transactions (capability probe, then the query),
+    # matching the other builders; it never leaks onto the pooled connection.
+    assert engine._conn.driver_sql == [
+        "SET LOCAL statement_timeout = 5000",
+        "SET LOCAL statement_timeout = 5000",
+    ]
+
+
+@pytest.mark.unit
+def test_enabled_but_not_migrated_returns_structured_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag on before `make migrate-semantic` is recoverable, not a 500.
+
+    A missing gated migration is operator-fixable and belongs in the same class as
+    query_too_broad -- a payload field, never an exception (app/main.py's contract).
+    It must also short-circuit BEFORE the embedder is called, so discovering the
+    misconfiguration costs no embedding spend.
+    """
+
+    def _never(_cfg: Any) -> Any:
+        raise AssertionError("embedder must not be built when the schema is absent")
+
+    monkeypatch.setattr(semantic, "get_embedder", _never)
+    engine = _FakeEngine(
+        [
+            _FakeResult([]),  # no lakebase_bm25 -> standin
+            _FakeResult([]),  # to_regclass('chunks') -> NULL: migration not run
+        ]
+    )
+
+    payload = semantic._semantic_search_payload(engine, _cfg(enabled=True), "auth flow", 50)
+
+    assert payload["semantic_enabled"] is True
+    assert payload["semantic_schema_missing"] is True
+    assert payload["results"] == []
+    assert payload["count"] == 0
+    assert "migrate-semantic" in payload["reason"]
 
 
 @pytest.mark.unit
 def test_enabled_payload_detects_lakebase_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(semantic, "get_embedder", lambda cfg: lambda texts: [[0.1, 0.2]])
-    engine = _FakeEngine([_FakeResult([_Row(x=1)]), _FakeResult([])])  # probe hit -> lakebase
+    engine = _FakeEngine(
+        [
+            _FakeResult([_Row(x=1)]),  # pg_am probe hit -> lakebase
+            _FakeResult(["chunks"]),  # schema present
+            _FakeResult([]),  # RRF: no rows
+        ]
+    )
 
     payload = semantic._semantic_search_payload(engine, _cfg(enabled=True), "auth", 50)
     assert payload["backend"] == "lakebase"
