@@ -6,9 +6,12 @@ Lakebase and plain PG* for local), injects the live connection into Alembic, and
 runs ``upgrade head``. The same script works locally when ``PGHOST`` is set.
 
 Grants are opt-in via ``--apply-grants`` and default OFF, so a routine migration
-never touches role privileges. When enabled, the app (read-only) and job (write)
-roles named by ``APP_SP_ROLE`` / ``JOB_WRITER_ROLE`` are validated, checked for
-existence in ``pg_roles``, and granted least privilege on the target schema.
+never touches role privileges. When enabled, the app (read-only) role named by
+``APP_SP_ROLE`` and the job (write) role named by ``JOB_WRITER_ROLE`` are applied
+*independently*: each provided role is validated, checked for existence in
+``pg_roles``, and granted least privilege on the target schema. At least one of the
+two must be set (dev grants the app only; prod grants both); it is an error to pass
+``--apply-grants`` with neither set.
 
 No Databricks SDK import happens at module scope; credential handling stays inside
 ``app.db.client``. Role tokens/passwords are never logged.
@@ -58,23 +61,20 @@ def _assert_role_exists(connection: Connection, role: str) -> None:
 def _apply_grants(connection: Connection, schema: str) -> None:
     app_env = os.environ.get("APP_SP_ROLE")
     job_env = os.environ.get("JOB_WRITER_ROLE")
-    if not app_env or not job_env:
-        raise RuntimeError(
-            "APP_SP_ROLE and JOB_WRITER_ROLE must be set when --apply-grants is used"
-        )
-    app_role = validate_role(app_env)
-    job_role = validate_role(job_env)
-
-    _assert_role_exists(connection, app_role)
-    _assert_role_exists(connection, job_role)
-
-    for stmt in build_app_grants(schema, app_role):
-        connection.execute(text(stmt))
-    logger.info("grants: applied to role %s", app_role)
-
-    for stmt in build_job_grants(schema, job_role):
-        connection.execute(text(stmt))
-    logger.info("grants: applied to role %s", job_role)
+    if not app_env and not job_env:
+        raise RuntimeError("--apply-grants requires at least one of APP_SP_ROLE / JOB_WRITER_ROLE")
+    if app_env:
+        app_role = validate_role(app_env)
+        _assert_role_exists(connection, app_role)
+        for stmt in build_app_grants(schema, app_role):
+            connection.execute(text(stmt))
+        logger.info("grants: applied app read-only grants to role %s", app_role)
+    if job_env:
+        job_role = validate_role(job_env)
+        _assert_role_exists(connection, job_role)
+        for stmt in build_job_grants(schema, job_role):
+            connection.execute(text(stmt))
+        logger.info("grants: applied job write grants to role %s", job_role)
 
 
 def run(apply_grants: bool) -> None:
