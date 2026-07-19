@@ -61,9 +61,8 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NoReturn, assert_never
+from typing import assert_never
 
-import psycopg
 from sqlalchemy import Connection, select, text
 from sqlalchemy.exc import OperationalError
 
@@ -82,6 +81,7 @@ from app.query.parser import (
     parse,
     resolve_case,
 )
+from app.search.errors import reraise_or_query_too_broad
 
 # 8 MiB of content pulled/scanned per request (aggregate across files).
 DEFAULT_MAX_CONTENT_BYTES = 8 * 1024 * 1024
@@ -121,10 +121,6 @@ class GrepResult:
     truncated: bool  # byte cap OR row cap tripped
     truncation_reason: str | None  # "byte_cap" | "row_cap" | None
     regex_incompatible: bool  # some Regex atom failed Python re.compile
-
-
-class QueryTooBroadError(Exception):
-    """The per-request statement_timeout cancelled the candidate/content query."""
 
 
 # ----------------------------------------------------------------------- pure helpers
@@ -235,16 +231,6 @@ def extract_line_matches(content: str, patterns: Sequence[re.Pattern[str]]) -> l
 # ------------------------------------------------------------------------ entry point
 
 
-def _reraise_or_query_too_broad(error: OperationalError) -> NoReturn:
-    """Map a Postgres statement_timeout cancellation to :class:`QueryTooBroadError`."""
-    if isinstance(error.orig, psycopg.errors.QueryCanceled):
-        raise QueryTooBroadError(
-            "the per-request statement_timeout cancelled a query (candidate or content "
-            "fetch) -- the query is too broad for the time budget"
-        ) from error
-    raise error
-
-
 def grep_search(
     conn: Connection,
     query: str,
@@ -286,7 +272,7 @@ def grep_search(
         try:
             rows = conn.execute(stmt).all()
         except OperationalError as error:
-            _reraise_or_query_too_broad(error)
+            reraise_or_query_too_broad(error)
 
         # `>=` deliberately over-warns on an exact fit (row_limit files that are exactly all
         # of them still report truncated -- an accepted, conservative false-positive).
@@ -317,7 +303,7 @@ def grep_search(
                 if line_matches:
                     files.append(FileMatches(row.repo_id, row.path, row.lang, tuple(line_matches)))
         except OperationalError as error:
-            _reraise_or_query_too_broad(error)
+            reraise_or_query_too_broad(error)
         finally:
             result.close()
 

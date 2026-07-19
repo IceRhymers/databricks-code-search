@@ -19,7 +19,9 @@ import pytest
 from app import main
 from app.config import Settings
 from app.query.parser import QueryParseError
-from app.search.grep import FileMatches, GrepResult, LineMatch, QueryTooBroadError
+from app.search.errors import QueryTooBroadError
+from app.search.grep import FileMatches, GrepResult, LineMatch
+from app.search.symbols import SymbolMatch, SymbolResult
 
 
 def _cfg() -> Settings:
@@ -190,6 +192,141 @@ def test_search_code_truncation_and_regex_incompatible_passthrough(
     assert payload["truncation_reason"] == "byte_cap"
     assert payload["regex_incompatible"] is True
     assert payload["files"] == []
+
+
+# ----------------------------------------------------------------- sym: fold into search_code
+
+
+def _sym_result(*matches: SymbolMatch, truncated: bool = False) -> SymbolResult:
+    return SymbolResult(
+        symbols=tuple(matches),
+        truncated=truncated,
+        truncation_reason="row_cap" if truncated else None,
+        no_symbol_atom=False,
+    )
+
+
+@pytest.mark.unit
+def test_sym_matches_merge_into_same_file_ordered_by_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    # grep finds a content match on line 3; symbol search finds a Handler def on line 2 of the
+    # SAME file. They fold into one file entry, matches ordered by line (symbol first).
+    monkeypatch.setattr(main, "grep_search", lambda *a, **k: _grep_result())
+    monkeypatch.setattr(
+        main,
+        "symbol_search",
+        lambda *a, **k: _sym_result(
+            SymbolMatch(
+                repo_id=7,
+                path="src/handler.go",
+                lang="go",
+                name="Handler",
+                kind="function",
+                start_line=2,
+            )
+        ),
+    )
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "sym:Handler foo", 50)
+
+    assert payload["file_count"] == 1
+    # 2 content spans + 1 symbol definition.
+    assert payload["match_count"] == 3
+    (file,) = payload["files"]
+    assert file["repo"] == "acme/widgets"
+    assert file["matches"] == [
+        {
+            "line": 2,
+            "text": "",
+            "byte_ranges": [],
+            "symbols": [{"name": "Handler", "kind": "function"}],
+        },
+        {
+            "line": 3,
+            "text": "// foo lives here and foo again",
+            "byte_ranges": [[3, 6], [24, 27]],
+        },
+    ]
+
+
+@pytest.mark.unit
+def test_sym_only_query_returns_symbol_file_grep_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A sym:-only query: grep is highlight-driven and returns nothing; the symbol leg carries it.
+    empty_grep = GrepResult(
+        files=(), truncated=False, truncation_reason=None, regex_incompatible=False
+    )
+    monkeypatch.setattr(main, "grep_search", lambda *a, **k: empty_grep)
+    monkeypatch.setattr(
+        main,
+        "symbol_search",
+        lambda *a, **k: _sym_result(
+            SymbolMatch(
+                repo_id=7,
+                path="src/handler.go",
+                lang="go",
+                name="Handler",
+                kind="function",
+                start_line=2,
+            )
+        ),
+    )
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "sym:Handler", 50)
+
+    assert payload["file_count"] == 1
+    assert payload["match_count"] == 1
+    (file,) = payload["files"]
+    assert file["file"] == "src/handler.go"
+    assert file["matches"][0]["symbols"] == [{"name": "Handler", "kind": "function"}]
+    assert payload["query_too_broad"] is False
+
+
+@pytest.mark.unit
+def test_sym_leg_timeout_flags_query_too_broad_keeps_grep(monkeypatch: pytest.MonkeyPatch) -> None:
+    # grep succeeds but the symbol leg times out: flag query_too_broad + truncated, keep content.
+    monkeypatch.setattr(main, "grep_search", lambda *a, **k: _grep_result())
+
+    def _raise(*_a: object, **_k: object) -> SymbolResult:
+        raise QueryTooBroadError("symbol leg too broad")
+
+    monkeypatch.setattr(main, "symbol_search", _raise)
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "sym:Handler foo", 50)
+
+    assert payload["query_too_broad"] is True
+    assert payload["truncated"] is True
+    assert payload["file_count"] == 1  # grep's content match is still returned
+    assert payload["match_count"] == 2
+
+
+@pytest.mark.unit
+def test_sym_truncation_sets_row_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    empty_grep = GrepResult(
+        files=(), truncated=False, truncation_reason=None, regex_incompatible=False
+    )
+    monkeypatch.setattr(main, "grep_search", lambda *a, **k: empty_grep)
+    monkeypatch.setattr(
+        main,
+        "symbol_search",
+        lambda *a, **k: _sym_result(
+            SymbolMatch(
+                repo_id=7,
+                path="src/handler.go",
+                lang="go",
+                name="Handler",
+                kind="function",
+                start_line=2,
+            ),
+            truncated=True,
+        ),
+    )
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "sym:Handler", 50)
+    assert payload["truncated"] is True
+    assert payload["truncation_reason"] == "row_cap"
 
 
 # ---------------------------------------------------------------------- list_repos shape

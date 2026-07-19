@@ -23,7 +23,8 @@ from sqlalchemy import Connection, insert, text
 
 from app.db.client import create_db_engine
 from app.db.models import Base, File, Repo
-from app.search.grep import GrepResult, QueryTooBroadError, grep_search
+from app.search.errors import QueryTooBroadError
+from app.search.grep import GrepResult, grep_search
 
 SCHEMA_PREFIX = "test_grep"
 

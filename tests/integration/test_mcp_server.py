@@ -38,7 +38,7 @@ from sqlalchemy import insert, text
 
 from app import main
 from app.db.client import create_db_engine
-from app.db.models import Base, File, Repo
+from app.db.models import Base, File, Repo, Symbol
 
 SCHEMA_PREFIX = "test_mcp"
 BASE_URL = "http://localhost:8000"  # port-bearing: clears FastMCP DNS-rebinding protection
@@ -98,12 +98,24 @@ def seeded_schema() -> Iterator[str]:
             .returning(Repo.id)
         ).scalar_one()
         conn.execute(insert(Repo).values(name="beta/tools", default_branch="main"))
-        conn.execute(
-            insert(File).values(
+        handler_file_id = conn.execute(
+            insert(File)
+            .values(
                 repo_id=acme_id,
                 path="src/handler.go",
                 lang="go",
                 content="package main\nfunc Handler() {}\n// foo lives here and foo again\n",
+            )
+            .returning(File.id)
+        ).scalar_one()
+        # A symbol row so a sym: query exercises the folded symbol-search leg end-to-end.
+        conn.execute(
+            insert(Symbol).values(
+                file_id=handler_file_id,
+                repo_id=acme_id,
+                name="Handler",
+                kind="function",
+                start_line=2,
             )
         )
         conn.commit()
@@ -201,6 +213,14 @@ async def test_streamable_http_tools_and_health(seeded_schema: str) -> None:
                 assert m["line"] == 3
                 for start, end in m["byte_ranges"]:
                     assert m["text"].encode("utf-8")[start:end] == b"foo"
+
+                # sym: folds into search_code (zoekt parity): a sym:-only query the
+                # highlight-driven grep path cannot answer returns symbol definitions.
+                sym = _tool_json(await session.call_tool("search_code", {"query": "sym:Handler"}))
+                assert sym["file_count"] == 1
+                (sm,) = sym["files"][0]["matches"]
+                assert sm["line"] == 2
+                assert sm["symbols"] == [{"name": "Handler", "kind": "function"}]
 
                 repos = _tool_json(await session.call_tool("list_repos", {}))
                 assert repos["count"] == 2

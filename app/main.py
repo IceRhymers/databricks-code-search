@@ -52,7 +52,9 @@ from app.config import Settings, get_settings
 from app.db.client import create_db_engine
 from app.db.models import File, Repo
 from app.query.parser import QueryParseError
-from app.search.grep import QueryTooBroadError, grep_search
+from app.search.errors import QueryTooBroadError
+from app.search.grep import grep_search
+from app.search.symbols import SymbolResult, symbol_search
 
 logger = logging.getLogger("app.tools")
 
@@ -182,12 +184,17 @@ def _search_envelope(
 
 
 def _search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -> dict[str, Any]:
-    """Run grep off a fresh connection and shape the result to the zoekt parity envelope.
+    """Run grep + symbol search and shape the merged result to the zoekt parity envelope.
 
-    ``QueryParseError`` -> ``query_parse_error`` field + empty files; ``QueryTooBroadError``
-    -> ``query_too_broad`` + ``truncated`` + empty files. ``repo_id`` is resolved to
-    ``Repo.name`` on the same connection. ``byte_ranges`` are our UTF-8 line-local half-open
-    offsets (documented divergence from zoekt's char ``start_col``/``end_col``).
+    Content matches (grep) and ``sym:`` definition matches (:func:`symbol_search`) are folded
+    into one ``files`` -> ``matches`` list grouped by ``(repo_id, path)``, matching zoekt's
+    single-tool model where ``sym:`` results ride the normal envelope. A symbol match carries
+    ``symbols: [{name, kind}]`` and ``line`` = the definition's first line (no highlight ``text``
+    in V1, so ``grep_search("sym:X")`` -- which returns nothing highlight-driven -- is answered
+    here). ``QueryParseError`` -> ``query_parse_error`` + empty files; ``QueryTooBroadError``
+    (either leg) -> ``query_too_broad`` + ``truncated``. ``repo_id`` is resolved to ``Repo.name``.
+    ``byte_ranges`` are our UTF-8 line-local half-open offsets (documented divergence from
+    zoekt's char ``start_col``/``end_col``).
     """
     with engine.connect() as conn:
         t0 = time.monotonic()
@@ -213,6 +220,7 @@ def _search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) 
                 query_parse_error=str(error),
             )
         except QueryTooBroadError:
+            # The whole query is over the time budget; the symbol leg would time out too.
             return _search_envelope(
                 query,
                 files=[],
@@ -225,51 +233,104 @@ def _search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) 
                 query_too_broad=True,
                 query_parse_error=None,
             )
+
+        # Symbol leg: sym: definitions the highlight-driven grep path cannot return. A timeout
+        # here flags query_too_broad but still returns whatever grep found (partial, not a lie).
+        query_too_broad = False
+        try:
+            sym_result: SymbolResult | None = symbol_search(
+                conn,
+                query,
+                row_limit=limit,
+                statement_timeout_ms=cfg.statement_timeout_ms,
+            )
+        except QueryTooBroadError:
+            sym_result = None
+            query_too_broad = True
+
         duration_ns = int((time.monotonic() - t0) * 1e9)
-        # Only resolve repo names when there are files to name, and bound the lookup with the
-        # same transaction-local statement_timeout the other raw SELECTs use (grep's own
-        # SET LOCAL committed with its transaction, so this lookup would otherwise run uncapped).
+
+        # Resolve names for every repo present across BOTH legs, bounded by the same
+        # transaction-local statement_timeout the other raw SELECTs use (each leg's own SET LOCAL
+        # committed with its transaction, so this lookup would otherwise run uncapped).
+        repo_ids = {fm.repo_id for fm in result.files}
+        if sym_result is not None:
+            repo_ids |= {sm.repo_id for sm in sym_result.symbols}
         name_map: dict[int, str] = {}
-        if result.files:
+        if repo_ids:
             with conn.begin():
                 conn.exec_driver_sql(
                     f"SET LOCAL statement_timeout = {int(cfg.statement_timeout_ms)}"
                 )
                 name_map = _repo_name_map(conn)
 
-    files: list[dict[str, Any]] = []
+    # Merge content + symbol matches into one file list grouped by (repo_id, path).
+    merged: dict[tuple[int, str], dict[str, Any]] = {}
+
+    def _entry(repo_id: int, path: str, lang: str | None) -> dict[str, Any]:
+        entry = merged.get((repo_id, path))
+        if entry is None:
+            entry = {"repo_id": repo_id, "path": path, "lang": lang, "matches": []}
+            merged[(repo_id, path)] = entry
+        return entry
+
     match_count = 0
     for fm in result.files:
-        matches = [
-            {
-                "line": lm.line_number,
-                "text": lm.line_text,
-                "byte_ranges": [[start, end] for start, end in lm.byte_ranges],
-            }
-            for lm in fm.line_matches
-        ]
-        # match_count is the total number of matched spans (byte_ranges), not lines: the
-        # golden zoekt fixture reports 2 for one line carrying two ranges.
+        entry = _entry(fm.repo_id, fm.path, fm.lang)
+        for lm in fm.line_matches:
+            entry["matches"].append(
+                {
+                    "line": lm.line_number,
+                    "text": lm.line_text,
+                    "byte_ranges": [[start, end] for start, end in lm.byte_ranges],
+                }
+            )
+        # match_count counts matched spans (byte_ranges), not lines: the golden zoekt fixture
+        # reports 2 for one line carrying two ranges.
         match_count += sum(len(lm.byte_ranges) for lm in fm.line_matches)
+
+    if sym_result is not None:
+        for sm in sym_result.symbols:
+            entry = _entry(sm.repo_id, sm.path, sm.lang)
+            entry["matches"].append(
+                {
+                    "line": sm.start_line,
+                    "text": "",  # V1: line + name + kind, no def-line text (documented follow-up)
+                    "byte_ranges": [],
+                    "symbols": [{"name": sm.name, "kind": sm.kind}],
+                }
+            )
+            match_count += 1  # each symbol definition is one match (its byte_ranges is empty)
+
+    files: list[dict[str, Any]] = []
+    for entry in sorted(merged.values(), key=lambda e: (e["repo_id"], e["path"])):
+        # Order matches within a file by line; NULL symbol lines sort last.
+        entry["matches"].sort(key=lambda m: (m["line"] is None, m["line"] or 0))
         files.append(
             {
-                "repo": name_map.get(fm.repo_id, str(fm.repo_id)),
-                "file": fm.path,
-                "language": fm.lang,
+                "repo": name_map.get(entry["repo_id"], str(entry["repo_id"])),
+                "file": entry["path"],
+                "language": entry["lang"],
                 "branches": ["HEAD"],  # durable core has no per-branch content
-                "matches": matches,
+                "matches": entry["matches"],
             }
         )
+
+    sym_truncated = sym_result.truncated if sym_result is not None else False
+    truncated = result.truncated or sym_truncated or query_too_broad
+    truncation_reason = result.truncation_reason or (
+        sym_result.truncation_reason if sym_result is not None else None
+    )
     return _search_envelope(
         query,
         files=files,
         file_count=len(files),
         match_count=match_count,
         duration_ns=duration_ns,
-        truncated=result.truncated,
-        truncation_reason=result.truncation_reason,
+        truncated=truncated,
+        truncation_reason=truncation_reason,
         regex_incompatible=result.regex_incompatible,
-        query_too_broad=False,
+        query_too_broad=query_too_broad,
         query_parse_error=None,
     )
 
