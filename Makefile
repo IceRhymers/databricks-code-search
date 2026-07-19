@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migrate-local migration set-secrets deploy deploy-prod smoke index destroy
+.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migrate-semantic migrate-local migration set-secrets deploy deploy-prod smoke index destroy
 
 # Secret scope/key for `set-secrets`. These MUST match the bundle variables
 # `github_token_secret_scope` / `github_token_secret_key` in databricks.yml
@@ -41,6 +41,20 @@ migrate: ## Apply migrations to the TARGET's Lakebase (TARGET=dev|prod, default 
 	DB="$$(printf '%s' "$$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["variables"]["database_name"]["value"])')"; \
 	echo "-> migrating target '$(TARGET)' against $$EP (db=$$DB)"; \
 	LAKEBASE_ENDPOINT="$$EP" LAKEBASE_DATABASE="$$DB" uv run python scripts/migrate.py $(ARGS)
+
+migrate-semantic: ## Apply the GATED semantic revision to TARGET's Lakebase (issue #14; separate version table). IRREVERSIBLE prerequisite: the Databricks-managed shared_preload_libraries MUST already include lakebase_vector,lakebase_text.
+	@test -z "$$PGHOST" || (echo "PGHOST is set -> migrate-semantic would hit local Postgres. The gated lakebase_* DDL only runs against an enabled Lakebase project; unset PGHOST to target the bundle's Lakebase." && exit 1)
+	@echo "!! migrate-semantic creates the 'chunks' table with the BETA lakebase_vector/lakebase_text extensions."
+	@echo "!! PREREQUISITE (irreversible, project-level, out-of-band): the Databricks-managed"
+	@echo "!! shared_preload_libraries for this Lakebase project MUST already include lakebase_vector,lakebase_text."
+	@echo "!! Without it, CREATE EXTENSION fails loudly. See docs/runbooks/semantic-enablement.md."
+	@printf 'Type "enable-semantic" to proceed: '; read ack; test "$$ack" = "enable-semantic" || { echo "aborted."; exit 1; }
+	@JSON="$$(databricks bundle validate -t $(TARGET) -o json 2>/dev/null)" || true; \
+	test -n "$$JSON" || { echo "could not read bundle target '$(TARGET)' (try: databricks bundle validate -t $(TARGET))"; exit 1; }; \
+	EP="$$(printf '%s' "$$JSON" | python3 -c 'import json,sys;v=json.load(sys.stdin)["variables"];print("projects/%s/branches/production/endpoints/%s"%(v["lakebase_project_name"]["value"],v["lakebase_endpoint_name"]["value"]))')"; \
+	DB="$$(printf '%s' "$$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["variables"]["database_name"]["value"])')"; \
+	echo "-> semantic migrating target '$(TARGET)' against $$EP (db=$$DB)"; \
+	LAKEBASE_ENDPOINT="$$EP" LAKEBASE_DATABASE="$$DB" CODE_SEARCH_SEMANTIC_ACK=1 uv run python scripts/migrate.py --semantic
 
 migrate-local: ## Apply migrations against local Postgres (run under PGHOST; grants skipped)
 	uv run python scripts/migrate.py

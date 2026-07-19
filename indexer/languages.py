@@ -15,6 +15,12 @@ from dataclasses import dataclass
 # next mark-and-sweep run.
 MAX_FILE_BYTES = 1_000_000
 
+# Char budget for one embedding chunk (issue #14). V1 uses a char-based
+# approximation rather than a real tokenizer: ~4 characters per token, so this
+# maps to the default `semantic_chunk_max_tokens` (512) in app.config. Document
+# this in one place; `indexer.parse.iter_chunks` is the sole consumer.
+SEMANTIC_CHUNK_MAX_CHARS = 2000
+
 # Lowercase file suffix (including the dot) -> tree_sitter_language_pack language.
 EXT_TO_LANG: dict[str, str] = {
     ".py": "python",
@@ -76,6 +82,16 @@ class ParsedFile:
     lang: str | None
     size: int
     content: str
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """One embeddable slice of a file's content (issue #14). 1-based, inclusive lines."""
+
+    chunk_index: int
+    content: str
+    start_line: int
+    end_line: int
 
 
 @dataclass(frozen=True)

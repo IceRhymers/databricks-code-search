@@ -1,0 +1,104 @@
+# Integration tests against a REAL Lakebase branch (issue #14 follow-up).
+#
+# ==========================================================================
+# DISABLED. There is no CI Lakebase project yet. Enabling requires BOTH:
+#   1. the `code-search-ci` project provisioned, with its managed
+#      shared_preload_libraries including lakebase_vector,lakebase_text, and
+#   2. repository variable CI_LAKEBASE_ENABLED set to "true".
+# See docs/runbooks/ci-lakebase.md. Until then this workflow cannot run: it has
+# no automatic trigger, and a manual dispatch no-ops on the variable guard.
+# ==========================================================================
+#
+# WHY this exists alongside ci.yml's `integration` job rather than replacing it:
+# the semantic layer's production query path uses `lakebase_ann`'s `<=>` ordered-index
+# scan and `lakebase_bm25`'s `ts <@> to_bm25query(...)` scorer. Neither exists in
+# pgvector, so the container job runs a stand-in whose BM25 leg (`ts_rank_cd`) is
+# never index-ordered -- it can prove the RRF fusion plumbing, but it cannot prove
+# BM25 RANKING and it cannot reveal a query-plan collapse on that leg (a real
+# regression of exactly that kind was caught in review, not by CI). This job closes
+# that gap. Once it is green and trusted, ci.yml's `integration` job becomes
+# redundant and should be removed in favour of this one.
+#
+# ISOLATION: each run forks a throwaway Lakebase branch (copy-on-write, so it is
+# cheap) and purges it in an `always()` step. The suite creates and drops extensions
+# and tables, so a shared database would let concurrent PRs corrupt each other. The
+# branch also carries a TTL, so a cancelled run cannot leak a branch indefinitely.
+
+name: CI (Lakebase)
+
+on:
+  # No push/pull_request trigger by design -- see the DISABLED banner above.
+  # When enabling, add:
+  #   pull_request:
+  #   push:
+  #     branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  # One CI branch per git ref: a re-run must not race the previous run's teardown
+  # for the same branch id.
+  group: ci-lakebase-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-lakebase:
+    runs-on: ubuntu-latest
+    # Second, independent guard: even a manual dispatch is inert until the project
+    # exists and the repo variable is flipped.
+    if: vars.CI_LAKEBASE_ENABLED == 'true'
+    env:
+      # Service-principal auth; the SDK reads these directly. Prefer OIDC federation
+      # over a long-lived secret once the workspace is configured for it.
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      CI_LAKEBASE_PROJECT: ${{ vars.CI_LAKEBASE_PROJECT || 'code-search-ci' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f  # v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Derive branch id
+        id: branch
+        # Lakebase branch ids are slugs: lowercase, no slashes. Keep it stable per ref so
+        # a re-run replaces its own branch rather than accumulating new ones.
+        run: |
+          slug="$(printf '%s' "ci-${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}" \
+            | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-48)"
+          echo "id=${slug%-}" >> "$GITHUB_OUTPUT"
+
+      - name: Create ephemeral Lakebase branch
+        run: |
+          uv run python scripts/ci_branch.py up \
+            --project "$CI_LAKEBASE_PROJECT" \
+            --branch "${{ steps.branch.outputs.id }}" >> "$GITHUB_ENV"
+
+      - name: Apply core migrations
+        # PGHOST must stay unset so app/db/client.py takes the Lakebase OAuth path.
+        run: uv run python scripts/migrate.py
+
+      - name: Apply gated semantic migration
+        # The whole point of this job: real lakebase_vector / lakebase_text DDL.
+        # CODE_SEARCH_SEMANTIC_ACK is the non-interactive form of the irreversibility
+        # acknowledgement -- safe here because the target is a throwaway branch.
+        env:
+          CODE_SEARCH_SEMANTIC_ACK: "1"
+        run: uv run python scripts/migrate.py --semantic
+
+      - name: Integration tests (real Lakebase engine)
+        env:
+          CODE_SEARCH_SEMANTIC_ENABLED: "1"
+        run: make test-integration
+
+      - name: Purge ephemeral Lakebase branch
+        # always(): a leaked branch costs money, and teardown must run even when the
+        # tests fail (which is exactly when it is most likely to be skipped).
+        if: always()
+        run: |
+          uv run python scripts/ci_branch.py down \
+            --project "$CI_LAKEBASE_PROJECT" \
+            --branch "${{ steps.branch.outputs.id }}"

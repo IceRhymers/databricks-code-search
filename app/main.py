@@ -54,6 +54,7 @@ from app.db.models import File, Repo
 from app.query.parser import QueryParseError
 from app.search.errors import QueryTooBroadError
 from app.search.grep import grep_search
+from app.search.semantic import _semantic_search_payload
 from app.search.symbols import SymbolResult, symbol_search
 
 logger = logging.getLogger("app.tools")
@@ -107,6 +108,9 @@ def _signals(payload: dict[str, Any]) -> dict[str, Any]:
         "truncated": payload.get("truncated"),
         "query_too_broad": payload.get("query_too_broad"),
         "query_parse_error": payload.get("query_parse_error"),
+        # Without this, a flag-on-before-migrate misconfiguration is invisible in logs: every
+        # semantic query returns empty and reads identically to a genuine zero-result query.
+        "semantic_schema_missing": payload.get("semantic_schema_missing"),
     }
 
 
@@ -419,6 +423,25 @@ async def search_code(query: str, ctx: Context, limit: int = 200) -> str:
     return await _dispatch("search_code", lambda: _search_code_payload(engine, cfg, query, limit))
 
 
+async def semantic_search(query: str, ctx: Context, limit: int = 50) -> str:
+    """Semantic + BM25 hybrid search: rank indexed chunks by relevance to a free-text query.
+
+    Unlike :func:`search_code` (zoekt grammar over lines), this takes a natural-language
+    ``query`` and returns chunk-level results fused from a vector-ANN leg and a BM25 leg via
+    reciprocal-rank fusion. ``limit`` caps the number of ranked chunks returned (clamped to a
+    server maximum). Registered unconditionally, but gated at runtime: when semantic search is
+    disabled (the default) it returns a clean ``semantic_enabled: false`` payload -- never a
+    500/503 -- and touches neither the database nor the embedder. Each result carries ``repo``,
+    ``file``, ``chunk_index``, ``content``, and ``rrf_score`` (no precise line range in V1).
+    """
+    lc = ctx.request_context.lifespan_context
+    engine, cfg = lc["engine"], lc["config"]
+    limit = _clamp_limit(limit, cfg)
+    return await _dispatch(
+        "semantic_search", lambda: _semantic_search_payload(engine, cfg, query, limit)
+    )
+
+
 async def list_repos(ctx: Context) -> str:
     """List every indexed repository with its branch and last-indexed metadata."""
     lc = ctx.request_context.lifespan_context
@@ -478,6 +501,7 @@ def create_app() -> Starlette:
     call this per test so each gets an unspent session manager (see the tools comment above)."""
     mcp = FastMCP("code-search", lifespan=lifespan)
     mcp.tool()(search_code)
+    mcp.tool()(semantic_search)
     mcp.tool()(list_repos)
     mcp.tool()(get_file)
     mcp.custom_route("/health", methods=["GET"])(health)

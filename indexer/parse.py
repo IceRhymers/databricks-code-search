@@ -10,7 +10,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
-from indexer.languages import EXT_TO_LANG, MAX_FILE_BYTES, ParsedFile
+from indexer.languages import (
+    EXT_TO_LANG,
+    MAX_FILE_BYTES,
+    SEMANTIC_CHUNK_MAX_CHARS,
+    Chunk,
+    ParsedFile,
+)
 
 _BINARY_SNIFF_BYTES = 8192
 
@@ -51,3 +57,48 @@ def iter_source_files(root: Path) -> Iterator[ParsedFile]:
         rel_path = entry.relative_to(root).as_posix()
         lang = EXT_TO_LANG.get(entry.suffix.lower())
         yield ParsedFile(path=rel_path, lang=lang, size=size, content=content)
+
+
+def iter_chunks(pf: ParsedFile, *, max_chars: int = SEMANTIC_CHUNK_MAX_CHARS) -> Iterator[Chunk]:
+    """Split ``pf.content`` into line-aligned :class:`Chunk`\\ s bounded by ``max_chars``.
+
+    Deterministic, line-based splitting (no tree-sitter, no overlap): lines are
+    accumulated into the current chunk until the next line would push it past
+    ``max_chars``, at which point the chunk is emitted and a new one starts. A
+    single line longer than ``max_chars`` still gets its own chunk rather than
+    being split mid-line. ``max_chars`` is a char-per-token approximation
+    (~4 chars/token; see ``SEMANTIC_CHUNK_MAX_CHARS``), not an exact tokenizer
+    count -- acceptable for V1 embedding-chunk sizing. ``chunk_index`` starts at
+    0 and is monotonic; ``start_line``/``end_line`` are 1-based and inclusive.
+    An empty file yields no chunks.
+    """
+    lines = pf.content.splitlines(keepends=True)
+    if not lines:
+        return
+
+    chunk_index = 0
+    buf: list[str] = []
+    buf_chars = 0
+    start_line = 1
+    for lineno, line in enumerate(lines, start=1):
+        if buf and buf_chars + len(line) > max_chars:
+            yield Chunk(
+                chunk_index=chunk_index,
+                content="".join(buf),
+                start_line=start_line,
+                end_line=lineno - 1,
+            )
+            chunk_index += 1
+            buf = []
+            buf_chars = 0
+            start_line = lineno
+        buf.append(line)
+        buf_chars += len(line)
+
+    if buf:
+        yield Chunk(
+            chunk_index=chunk_index,
+            content="".join(buf),
+            start_line=start_line,
+            end_line=len(lines),
+        )

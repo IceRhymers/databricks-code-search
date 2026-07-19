@@ -30,6 +30,13 @@ jobs:
       - name: Unit tests
         run: make test
 
+  # Container-based integration coverage. This is a STAND-IN for the real engine: the
+  # semantic path's `lakebase_ann` ordered-index scan and `lakebase_bm25` scorer exist in
+  # no Postgres image, so this job substitutes pgvector `<=>` + `ts_rank_cd`. It proves the
+  # RRF plumbing and the ANN leg, but NOT BM25 ranking and NOT the BM25 leg's query plan.
+  # `ci-lakebase.yml` closes that gap against a real Lakebase branch; it is disabled until
+  # a CI project exists (docs/runbooks/ci-lakebase.md). Remove this job once that one is
+  # green -- until then it is the only integration coverage that actually runs.
   integration:
     runs-on: ubuntu-latest
     needs: [lint, unit]

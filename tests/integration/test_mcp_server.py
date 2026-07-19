@@ -202,7 +202,14 @@ async def test_streamable_http_tools_and_health(seeded_schema: str) -> None:
                 await session.initialize()
 
                 names = {t.name for t in (await session.list_tools()).tools}
-                assert {"search_code", "list_repos", "get_file"} <= names
+                assert {"search_code", "semantic_search", "list_repos", "get_file"} <= names
+
+                # semantic_search is registered UNCONDITIONALLY; with the flag off (the default)
+                # it returns the clean feature-absent payload rather than 500/503 (issue #14 P2).
+                sem = _tool_json(await session.call_tool("semantic_search", {"query": "auth flow"}))
+                assert sem["semantic_enabled"] is False
+                assert sem["results"] == []
+                assert sem["count"] == 0
 
                 search = _tool_json(await session.call_tool("search_code", {"query": "foo"}))
                 assert search["file_count"] == 1

@@ -58,6 +58,26 @@ targets:
     mode: development
     default: true
 
+  # CI target: a dedicated Lakebase project the integration suite runs against, so CI
+  # exercises the REAL engine instead of a `pgvector` stand-in. The beta surface this
+  # repo depends on -- lakebase_ann's `<=>` ordered-index path and lakebase_bm25's
+  # `ts <@> to_bm25query(...)` scorer -- exists in no Postgres image, so a container can
+  # prove the fusion plumbing but never the ranking or the query plan.
+  #
+  # NOT YET PROVISIONED. `.github/workflows/ci-lakebase.yml` is disabled until this
+  # project exists and its managed shared_preload_libraries includes
+  # lakebase_vector,lakebase_text (see docs/runbooks/ci-lakebase.md).
+  #
+  # Deliberately a SEPARATE project from dev/prod: each CI run forks a throwaway branch
+  # and freely creates/drops extensions and tables, which must never touch a
+  # data-bearing project. Keep its `production` branch un-migrated -- forks inherit
+  # installed extensions, and test_no_vector_extension_installed asserts the core
+  # migration leaves none.
+  ci:
+    mode: development
+    variables:
+      lakebase_project_name: code-search-ci
+
   prod:
     mode: production
     workspace:

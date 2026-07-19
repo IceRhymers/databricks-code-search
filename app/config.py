@@ -21,6 +21,11 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Single source of truth for the embedding vector width. Imported by
+# app/db/semantic.py (the chunks.embedding column type) and by the gated
+# migration's DDL, so a model change never lets the two drift apart.
+SEMANTIC_EMBEDDING_DIM = 1024
+
 
 class Settings(BaseSettings):
     """Server configuration, read from the environment once per process."""
@@ -43,8 +48,46 @@ class Settings(BaseSettings):
     row_limit: int = 200
     max_row_limit: int = 1000
 
-    # Declared but unwired this issue; a later semantic issue owns its code path.
+    # Gates the semantic_search code path (issue #14). Default False: flag-off is a true
+    # no-op (no DB/engine/chunks/embedding/SDK access). Enabling requires the beta
+    # lakebase_vector/lakebase_text extensions to already be reachable (see
+    # docs/runbooks/semantic-enablement.md) -- this is an irreversible, project-level step.
     semantic_enabled: bool = False
+
+    # Databricks model-serving endpoint name for query/index-time embeddings, e.g.
+    # "databricks-gte-large-en". None on the flag-off path (never read).
+    semantic_embedding_endpoint: str | None = None
+
+    # Embedding model identifier, recorded alongside the endpoint for traceability.
+    semantic_embedding_model: str = "databricks-gte-large-en"
+
+    # Embedding vector width. Must match SEMANTIC_EMBEDDING_DIM (single source of truth);
+    # a unit test ties the two together so a model swap with a different dim fails loudly.
+    semantic_embedding_dim: int = SEMANTIC_EMBEDDING_DIM
+
+    # Texts per embedding request, bounded by the serving endpoint's per-request input cap.
+    semantic_embedding_batch_size: int = 64
+
+    # Per-request embedding call timeout (seconds); kept low so a degraded endpoint fails
+    # fast rather than holding a lock window open.
+    semantic_embedding_timeout_s: float = 20.0
+
+    # Hard ceiling on chunks embedded per repo per index run. Embeddings are buffered
+    # outside the index transaction (no network call inside conn.begin()), so this bounds
+    # in-process memory rather than a DB lock; exceeding it fails loudly.
+    #
+    # Sized against the ACTUAL buffer cost, not a round number: the vectors are held as
+    # Python float lists, ~32 B per element (24 B float object + 8 B list pointer), so at
+    # dim=1024 each chunk costs ~32 KB -- 8000 chunks is ~260 MB of vectors plus ~16 MB of
+    # chunk text. A larger ceiling (e.g. 50k -> ~1.6 GB) would OOM the job container before
+    # this loud check could ever fire, which would defeat the point of having a ceiling.
+    # A repo that legitimately exceeds this needs the temp-table staging path (follow-up),
+    # not a bigger buffer.
+    semantic_max_chunks_per_repo: int = 8000
+
+    # Chunk size bound (tokens) fed to the embedding model. Distinct from MAX_FILE_BYTES,
+    # which bounds file ingestion, not embedding-chunk granularity.
+    semantic_chunk_max_tokens: int = 512
 
 
 @lru_cache(maxsize=1)

@@ -60,9 +60,10 @@ pythonpath = ["."]
 [tool.mypy]
 python_version = "3.12"
 files = ["app", "indexer"]
-# Digit-named migration scripts (e.g. app/alembic/versions/0001_*.py) are not
-# importable module paths and are exercised by tests, not type-checked.
-exclude = ["^app/alembic/versions/"]
+# Digit-named migration scripts (e.g. app/alembic/versions/0001_*.py and the gated
+# app/alembic/versions_semantic/0002sem_*.py) are not importable module paths and are
+# exercised by tests, not type-checked.
+exclude = ["^app/alembic/versions"]
 
 [[tool.mypy.overrides]]
 module = [

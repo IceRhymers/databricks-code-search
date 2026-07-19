@@ -84,7 +84,13 @@ class _FakeEngine:
 
 
 def _index_fn(
-    conn: Any, *, name: str, default_branch: Any, head_sha: str, items: Any
+    conn: Any,
+    *,
+    name: str,
+    default_branch: Any,
+    head_sha: str,
+    items: Any,
+    chunk_writer: Any = None,
 ) -> IndexCounts:
     files = len(list(items))
     return IndexCounts(files=files, symbols=0, swept=0)

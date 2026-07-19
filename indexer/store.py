@@ -10,13 +10,18 @@ opens its own engine.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from sqlalchemy import Connection, delete, func, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.models import File, Repo, Symbol
 from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+
+# Called as chunk_writer(conn, repo_id, file_id, pf) once per file, inside the
+# same conn.begin() as the rest of that file's row (issue #14 Phase 2). Vectors
+# must already be computed -- this seam never calls an embedder itself (A4).
+ChunkWriter = Callable[[Connection, int, int, ParsedFile], None]
 
 
 def index_repo(
@@ -26,6 +31,7 @@ def index_repo(
     default_branch: str | None,
     head_sha: str,
     items: Iterable[tuple[ParsedFile, list[ExtractedSymbol]]],
+    chunk_writer: ChunkWriter | None = None,
 ) -> IndexCounts:
     """Upsert one repo's files/symbols and sweep rows not stamped with ``head_sha``.
 
@@ -33,13 +39,18 @@ def index_repo(
 
     1. Upsert the ``repos`` row (keyed on ``name``) -> ``repo_id``.
     2. Per file: upsert the ``files`` row (stamp ``commit=head_sha``), then
-       delete-and-reinsert its ``symbols`` (symbols have no natural key).
+       delete-and-reinsert its ``symbols`` (symbols have no natural key), then
+       call ``chunk_writer`` (if given) so chunk writes commit/roll back with
+       the rest of that file's row.
     3. ``DELETE FROM files WHERE repo_id=:r AND commit<>:head_sha`` (cascade drops
-       orphan symbols) -> ``swept``.
+       orphan symbols and, in production, orphan chunks) -> ``swept``.
     4. Stamp ``repos.last_indexed_commit`` / ``last_indexed_at``.
 
     ``items`` may be a lazy generator; it is consumed inside the open transaction
-    so memory stays bounded.
+    so memory stays bounded. ``chunk_writer`` defaults to ``None``, which makes
+    this byte-identical to the core (semantic-off) path (issue #14 AC-1); when
+    given, it must write PRECOMPUTED chunks -- embeddings are computed outside
+    this transaction (issue #14 A4), so no network call ever happens here.
     """
     file_count = 0
     symbol_count = 0
@@ -98,6 +109,9 @@ def index_repo(
                     ],
                 )
                 symbol_count += len(syms)
+
+            if chunk_writer is not None:
+                chunk_writer(conn, repo_id, file_id, pf)
 
         sweep = conn.execute(delete(File).where(File.repo_id == repo_id, File.commit != head_sha))
         swept = sweep.rowcount
