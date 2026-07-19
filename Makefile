@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migrate-local migration set-secrets deploy deploy-prod
+.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migrate-local migration set-secrets deploy deploy-prod smoke index destroy
 
 # Secret scope/key for `set-secrets`. These MUST match the bundle variables
 # `github_token_secret_scope` / `github_token_secret_key` in databricks.yml
@@ -50,19 +50,36 @@ migration: ## Autogenerate a revision (local only): make migration MSG="message"
 	@test -n "$$PGHOST" || (echo "migration requires PGHOST (local); never autogenerate against live Lakebase" && exit 1)
 	uv run alembic revision --autogenerate -m "$(MSG)"
 
-deploy: ## Deploy the bundle to the dev target
-	databricks bundle deploy -t dev
+deploy: ## Deploy + activate the app on TARGET via the full ordered pipeline (scripts/deploy.sh)
+	bash scripts/deploy.sh full $(TARGET)
 
-deploy-prod: ## Deploy to prod (requires JOB_RUN_AS_SP=<job run-as SP client id>)
+deploy-prod: ## Deploy + activate on prod (requires JOB_RUN_AS_SP=<job run-as SP client id>)
 	@test -n "$$JOB_RUN_AS_SP" || (echo "deploy-prod requires JOB_RUN_AS_SP=<client-id> (the job run-as SP); an empty value creates a broken NO-LOGIN role" && exit 1)
-	databricks bundle deploy -t prod --var job_run_as_sp="$$JOB_RUN_AS_SP"
+	TARGET=prod bash scripts/deploy.sh full prod
+
+smoke: ## Smoke-test the deployed app (TARGET=dev|prod; ARGS=--expect-indexed/--enable-mcp)
+	@test -z "$$PGHOST" || (echo "PGHOST is set -> smoke would hit local Postgres. Unset PGHOST to target the bundle's Lakebase." && exit 1)
+	@JSON="$$(databricks bundle validate -t $(TARGET) -o json 2>/dev/null)" || true; \
+	test -n "$$JSON" || { echo "could not read bundle target '$(TARGET)' (try: databricks bundle validate -t $(TARGET))"; exit 1; }; \
+	APP="$$(printf '%s' "$$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["variables"]["app_name"]["value"])')"; \
+	EP="$$(printf '%s' "$$JSON" | python3 -c 'import json,sys;v=json.load(sys.stdin)["variables"];print("projects/%s/branches/production/endpoints/%s"%(v["lakebase_project_name"]["value"],v["lakebase_endpoint_name"]["value"]))')"; \
+	DB="$$(printf '%s' "$$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["variables"]["database_name"]["value"])')"; \
+	URL="$$(databricks apps get "$$APP" -o json | jq -er '.url')" || { echo "could not resolve app URL for '$$APP' (is it deployed?)"; exit 1; }; \
+	echo "-> smoke '$(TARGET)' against $$URL (endpoint=$$EP db=$$DB)"; \
+	LAKEBASE_ENDPOINT="$$EP" LAKEBASE_DATABASE="$$DB" uv run python scripts/smoke.py --app-url "$$URL" $(ARGS)
+
+index: ## Run the indexing job on TARGET (populates repos/files/symbols from configured repos)
+	databricks bundle run code_search_index -t $(TARGET)
+
+destroy: ## Tear down the whole bundle for TARGET (typed-confirm; irreversible Lakebase data loss)
+	bash scripts/deploy.sh destroy $(TARGET)
 
 set-secrets: ## Write the GitHub token into the bundle's secret scope (run after deploy). Requires GITHUB_TOKEN; scope/key via SECRET_SCOPE/SECRET_KEY.
 	@test -n "$$GITHUB_TOKEN" || (echo "set-secrets requires GITHUB_TOKEN in env" && exit 1)
-	databricks secrets put-secret $(SECRET_SCOPE) $(SECRET_KEY) --string-value "$$GITHUB_TOKEN"
+	databricks secrets put-secret "$(SECRET_SCOPE)" "$(SECRET_KEY)" --string-value "$$GITHUB_TOKEN"
 
-requirements: ## Export production requirements.txt for the app
-	uv export --no-dev --no-hashes -o app/requirements.txt
+requirements: ## Export production requirements.txt for the app (no `-e .`: the app runs from shipped source, not an installed package)
+	uv export --no-dev --no-hashes --no-emit-project -o app/requirements.txt
 
 clean: ## Remove caches and build artifacts
 	rm -rf .pytest_cache .ruff_cache .mypy_cache dist build *.egg-info

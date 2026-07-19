@@ -1,12 +1,16 @@
-# Databricks App runtime config (committed fallback if inline bundle `config` is rejected
-# on the deploying CLI version — see resources/app.yml).
+# Databricks App runtime config. This is the ONLY place command/env are declared (the bundle
+# resource carries no inline `config` — matching the working uc-catalog-mcp pattern).
 #
-# Databricks Apps inject the bind port via DATABRICKS_APP_PORT (default 8000; never 8080).
-# The shell form is REQUIRED so the injected value is honored — an exec-array `--port 8000`
-# would ignore it.
-command: ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"]
+# `source_code_path: ../app` uploads the CONTENTS of app/ to the working-dir root (main.py,
+# config.py, db/, query/, search/), so the `app.` package prefix our imports use does not
+# resolve on its own. `ln -sf . app` symlinks `app -> .` so `app.main` / `app.db.*` import
+# correctly (same fix uc-catalog-mcp uses). The shell form is REQUIRED so the injected
+# DATABRICKS_APP_PORT (default 8000; never 8080) is honored — an exec-array `--port` would not
+# expand it.
+command: ["bash", "-c", "ln -sf . app && uvicorn app.main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"]
 env:
+  # Only LAKEBASE_ENDPOINT is set here; DATABRICKS_HOST and the app SP OAuth creds are
+  # auto-injected by the Apps runtime (WorkspaceClient() self-configures). Setting
+  # DATABRICKS_HOST explicitly produced an env entry with no resolvable value at deploy.
   - name: LAKEBASE_ENDPOINT
     value: "projects/code-search/branches/production/endpoints/primary"
-  - name: DATABRICKS_HOST
-    value: "${DATABRICKS_HOST}"

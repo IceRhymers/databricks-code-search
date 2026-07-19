@@ -5,11 +5,15 @@ deviation (Autoscaling ``w.postgres.generate_database_credential``) is confined
 to this module, so a future fallback to the Provisioned ``w.database.*`` API is a
 one-file change.
 
-Dual-mode selection is driven by ``PGHOST``:
+Dual-mode selection: a configured Lakebase endpoint wins over ``PGHOST``.
 
-* ``PGHOST`` set  -> plain local Postgres (CI, ``migrate-local``, unit tests).
+* Lakebase endpoint set (``endpoint=`` / ``LAKEBASE_ENDPOINT``) -> Lakebase mode, even if
+  ``PGHOST`` is also present. The deployed app's Lakebase ``postgres`` binding injects
+  ``PGHOST``/``PGUSER``/... at runtime, but those are not paired with a usable password, so
+  the endpoint's presence — not the absence of ``PGHOST`` — is what selects Lakebase.
+* ``PGHOST`` set and NO endpoint -> plain local Postgres (CI, ``migrate-local``, unit tests).
   The Databricks SDK is never imported on this path.
-* otherwise       -> Lakebase mode: a single ``WorkspaceClient`` is closed over
+* Lakebase mode: a single ``WorkspaceClient`` is closed over
   by a ``do_connect`` event handler that injects a fresh OAuth token as the
   connection password on every physical connect (tokens live ~1h; the pool is
   recycled well under that).
@@ -80,7 +84,14 @@ def create_db_engine(
     ``endpoint`` is the Lakebase endpoint identifier as expected by the Lakebase
     Autoscaling API (a name or resource path); it is passed through to the SDK as-is.
     """
-    if os.environ.get("PGHOST"):
+    # PGHOST alone means plain local Postgres (CI, migrate-local, unit tests) — but a deployed
+    # Databricks App with the Lakebase `postgres` resource binding ALSO gets PGHOST/PGUSER/...
+    # injected, so PGHOST is no longer sufficient to distinguish local from Lakebase. When a
+    # Lakebase endpoint is configured (endpoint arg or LAKEBASE_ENDPOINT), take the Lakebase
+    # OAuth path even if the binding injected PGHOST: that injected PGHOST is NOT paired with a
+    # usable password (Lakebase needs a freshly minted OAuth token as the password, not PGPASSWORD).
+    lakebase_configured = bool(endpoint or os.environ.get("LAKEBASE_ENDPOINT"))
+    if os.environ.get("PGHOST") and not lakebase_configured:
         return create_engine(_local_url(), echo=echo, **pool_kwargs)
     return _create_lakebase_engine(
         endpoint=endpoint,

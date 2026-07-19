@@ -9,9 +9,15 @@
 # reader grant (SELECT on repos/files, schema USAGE) from #5; `/ready`'s
 # `SELECT 1 FROM repos LIMIT 1` surfaces a missing grant post-deploy as a 503.
 #
-# The Autoscaling `database` binding shape, `compute_size` key, and whether inline `config`
-# is accepted are CLI-version-sensitive — verify against a live `databricks bundle validate
-# -t dev`; if inline `config` is rejected, the committed app/app.yaml is the fallback.
+# The app binds Lakebase via a `postgres` resource (Autoscaling projects), NOT a `database`
+# resource. A `database` binding resolves `instance_name` against the provisioned Database
+# Instance namespace, which an Autoscaling `postgres_projects` project is NOT part of — that
+# binding fails `bundle deploy` with "Database instance <name> does not exist". The `postgres`
+# binding targets the project's branch/database directly. Like the instance binding, it
+# CAN_CONNECT_AND_CREATE-provisions the app SP's Postgres role and injects PG* at runtime.
+# The `compute_size` key and whether inline `config` is accepted are CLI-version-sensitive —
+# verify against a live `databricks bundle validate -t dev`; if inline `config` is rejected,
+# the committed app/app.yaml is the fallback.
 resources:
   apps:
     code_search:
@@ -22,17 +28,21 @@ resources:
       compute_size: MEDIUM
       resources:
         - name: lakebase
-          database:
-            database_name: ${var.database_name}
-            instance_name: ${var.lakebase_project_name}
-            # CAN_CONNECT_AND_CREATE is the only enum the App database resource accepts
-            # (live `bundle validate` rejects CAN_CONNECT); still Postgres login-level only —
-            # the app SP's SELECT reader grant on repos/files comes from #5.
+          postgres:
+            # `branch`/`database` are resource-path strings under the project. Building them
+            # from the project's `.id` reference (not a literal `projects/<name>` path) creates
+            # the DABs dependency edge so the project is created BEFORE the app; the
+            # `production` branch + its default database are auto-provisioned with the project.
+            branch: ${resources.postgres_projects.pg_project.id}/branches/production
+            # The database RESOURCE id is the hyphenated default `databricks-postgres`, which
+            # differs from the Postgres database NAME `databricks_postgres` (var.database_name)
+            # used for connections. The default DB is auto-created with the branch.
+            database: ${resources.postgres_projects.pg_project.id}/branches/production/databases/databricks-postgres
+            # CAN_CONNECT_AND_CREATE is Postgres login-level only (and the sole enum the App
+            # binding accepts); the app SP's SELECT reader grant on repos/files comes from #5.
             permission: CAN_CONNECT_AND_CREATE
-      config:
-        command: ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"]
-        env:
-          - name: LAKEBASE_ENDPOINT
-            value: projects/${var.lakebase_project_name}/branches/production/endpoints/${var.lakebase_endpoint_name}
-          - name: DATABRICKS_HOST
-            value: ${workspace.host}
+      # No inline `config` here (command/env live only in app/app.yaml, matching the working
+      # uc-catalog-mcp pattern). Declaring config in BOTH places risks a merge conflict, and
+      # `${workspace.host}`-style bundle interpolation can resolve empty in app config env
+      # ("Must specify environment variable source"). The app needs only LAKEBASE_ENDPOINT
+      # (set in app.yaml); DATABRICKS_HOST + the app SP OAuth creds are auto-injected at runtime.
