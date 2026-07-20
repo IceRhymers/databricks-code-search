@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import io
+import logging
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 import pytest
 
 import indexer.fetch as fetch
-from indexer.fetch import download_tarball, extract_tarball, resolve_ref
+from indexer.fetch import (
+    RateLimitError,
+    RepoMeta,
+    download_tarball,
+    extract_tarball,
+    list_org_repos,
+    list_user_repos,
+    resolve_ref,
+)
 
 ORG = "acme"
 REPO = "widgets"
@@ -120,3 +130,265 @@ def test_extract_tarball_neutralizes_path_traversal(tmp_path: Path) -> None:
     with pytest.raises(tarfile.OutsideDestinationError):
         extract_tarball(tar_path, dest)
     assert not (dest.parent / "evil.txt").exists()
+
+
+# --- Enumeration (AC 14-21) -------------------------------------------------
+
+
+def _repo_json(
+    full_name: str, *, fork: bool = False, archived: bool = False, size: int = 1
+) -> dict[str, object]:
+    return {"full_name": full_name, "fork": fork, "archived": archived, "size": size}
+
+
+def _recording_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> tuple[httpx.Client, list[httpx.Request]]:
+    """A client whose every outbound request is appended to the returned list."""
+    seen: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
+
+    return httpx.Client(transport=httpx.MockTransport(record)), seen
+
+
+@pytest.mark.unit
+def test_list_org_repos_hits_org_endpoint_with_pagination_params() -> None:
+    """AC 14: /orgs/{org}/repos with parsed per_page=100 and page=1."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[_repo_json("acme/widgets")])
+
+    client, seen = _recording_client(handler)
+    with client:
+        repos = list_org_repos(client, ORG)
+
+    assert [r.full_name for r in repos] == ["acme/widgets"]
+    assert len(seen) == 1
+    assert seen[0].url.path == "/orgs/acme/repos"
+    # Assert PARSED params — ordering is not part of the contract.
+    assert seen[0].url.params["per_page"] == "100"
+    assert seen[0].url.params["page"] == "1"
+
+
+@pytest.mark.unit
+def test_list_user_repos_hits_user_endpoint_with_pagination_params() -> None:
+    """AC 15: /users/{user}/repos with the same parsed params."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[_repo_json("u/thing")])
+
+    client, seen = _recording_client(handler)
+    with client:
+        repos = list_user_repos(client, "u")
+
+    assert [r.full_name for r in repos] == ["u/thing"]
+    assert len(seen) == 1
+    assert seen[0].url.path == "/users/u/repos"
+    assert seen[0].url.params["per_page"] == "100"
+    assert seen[0].url.params["page"] == "1"
+
+
+@pytest.mark.unit
+def test_list_repos_follows_link_rel_next() -> None:
+    """AC 16: 100 + Link rel=next, then 50 without -> 150 repos in 2 requests."""
+    page1 = [_repo_json(f"acme/r{i}") for i in range(100)]
+    page2 = [_repo_json(f"acme/r{i}") for i in range(100, 150)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["page"] == "1":
+            return httpx.Response(
+                200,
+                json=page1,
+                headers={
+                    "Link": '<https://api.github.com/orgs/acme/repos?page=2>; rel="next", '
+                    '<https://api.github.com/orgs/acme/repos?page=2>; rel="last"'
+                },
+            )
+        return httpx.Response(200, json=page2)
+
+    client, seen = _recording_client(handler)
+    with client:
+        repos = list_org_repos(client, ORG)
+
+    assert len(repos) == 150
+    assert len(seen) == 2
+    assert seen[1].url.params["page"] == "2"
+
+
+@pytest.mark.unit
+def test_list_repos_terminates_without_rel_next() -> None:
+    """AC 17: a Link header carrying only prev/last stops after one request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[_repo_json("acme/widgets")],
+            headers={
+                "Link": '<https://api.github.com/orgs/acme/repos?page=1>; rel="prev", '
+                '<https://api.github.com/orgs/acme/repos?page=3>; rel="last"'
+            },
+        )
+
+    client, seen = _recording_client(handler)
+    with client:
+        repos = list_org_repos(client, ORG)
+
+    assert len(repos) == 1
+    assert len(seen) == 1
+
+
+@pytest.mark.unit
+def test_list_repos_propagates_404() -> None:
+    """AC 18: a 404 stays an ordinary HTTPStatusError (raise_for_status convention)."""
+    client, _ = _recording_client(lambda request: httpx.Response(404))
+    with client:
+        with pytest.raises(httpx.HTTPStatusError):
+            list_org_repos(client, "nope")
+
+
+@pytest.mark.unit
+def test_repo_meta_maps_github_fields() -> None:
+    """AC 19: full_name/fork/archived/size_kb map from full_name/fork/archived/size."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[_repo_json("acme/widgets", fork=True, archived=True, size=1234)],
+        )
+
+    client, _ = _recording_client(handler)
+    with client:
+        repos = list_org_repos(client, ORG)
+
+    assert repos == [RepoMeta(full_name="acme/widgets", fork=True, archived=True, size_kb=1234)]
+
+
+@pytest.mark.unit
+def test_rate_limit_429_raises_rate_limit_error() -> None:
+    """AC 20a: 429 is always a RateLimitError, naming the selector."""
+    client, _ = _recording_client(lambda request: httpx.Response(429))
+    with client:
+        with pytest.raises(RateLimitError, match="acme"):
+            list_org_repos(client, ORG)
+
+
+@pytest.mark.unit
+def test_rate_limit_403_with_retry_after_raises_rate_limit_error() -> None:
+    """AC 20b: 403 + Retry-After -> RateLimitError quoting the derived wait."""
+    client, _ = _recording_client(
+        lambda request: httpx.Response(403, headers={"Retry-After": "60"})
+    )
+    with client:
+        with pytest.raises(RateLimitError) as excinfo:
+            list_org_repos(client, ORG)
+
+    message = str(excinfo.value)
+    assert "60" in message
+    assert ORG in message
+
+
+@pytest.mark.unit
+def test_rate_limit_403_with_zero_remaining_quotes_reset_time() -> None:
+    """AC 20c: 403 + X-RateLimit-Remaining: 0 -> RateLimitError from X-RateLimit-Reset."""
+    client, _ = _recording_client(
+        lambda request: httpx.Response(
+            403,
+            headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1700000000"},
+        )
+    )
+    with client:
+        with pytest.raises(RateLimitError) as excinfo:
+            list_org_repos(client, ORG)
+
+    message = str(excinfo.value)
+    assert "2023-11-14T22:13:20Z" in message
+    assert ORG in message
+
+
+@pytest.mark.unit
+def test_bare_403_is_http_status_error_not_rate_limit() -> None:
+    """AC 20d: the org-scope permission failure must NOT be mislabeled as a quota failure."""
+    client, _ = _recording_client(
+        lambda request: httpx.Response(403, headers={"X-RateLimit-Remaining": "4999"})
+    )
+    with client:
+        with pytest.raises(httpx.HTTPStatusError):
+            list_org_repos(client, ORG)
+
+
+@pytest.mark.unit
+def test_retry_after_takes_precedence_over_reset() -> None:
+    """AC 20: with both headers present, Retry-After wins."""
+    client, _ = _recording_client(
+        lambda request: httpx.Response(
+            403,
+            headers={
+                "Retry-After": "42",
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1700000000",
+            },
+        )
+    )
+    with client:
+        with pytest.raises(RateLimitError) as excinfo:
+            list_org_repos(client, ORG)
+
+    message = str(excinfo.value)
+    assert "42" in message
+    assert "2023-11-14T22:13:20Z" not in message
+
+
+@pytest.mark.unit
+def test_rate_limit_remaining_logged_once_per_selector(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC 21: two selectors -> exactly two INFO records, each with its own remaining.
+
+    The org selector deliberately spans TWO pages. With single-page selectors a
+    per-page implementation would also emit exactly two records and pass; three
+    pages total means a per-page logger emits three and the count assertion fails.
+    """
+    remaining_by_selector = {"acme": "4321", "u": "1234"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        selector = request.url.path.split("/")[2]
+        headers = {"X-RateLimit-Remaining": remaining_by_selector[selector]}
+        if selector == "acme" and request.url.params["page"] == "1":
+            headers["Link"] = f'<{request.url}&page=2>; rel="next"'
+        return httpx.Response(
+            200,
+            json=[_repo_json(f"{selector}/thing")],
+            headers=headers,
+        )
+
+    client, seen = _recording_client(handler)
+    with caplog.at_level(logging.INFO, logger="indexer.fetch"):
+        with client:
+            list_org_repos(client, "acme")
+            list_user_repos(client, "u")
+
+    # 3 HTTP pages, 2 log records: the record is per SELECTOR, not per page.
+    assert len(seen) == 3
+    records = [r for r in caplog.records if r.name == "indexer.fetch"]
+    assert len(records) == 2
+    assert "acme" in records[0].getMessage() and "4321" in records[0].getMessage()
+    assert "u" in records[1].getMessage() and "1234" in records[1].getMessage()
+
+
+@pytest.mark.unit
+def test_size_cap_error_names_overage_and_config_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 43: the size-cap ValueError carries the byte-exact overage and exclude.size_mb."""
+    monkeypatch.setattr(fetch, "MAX_TARBALL_BYTES", 4)
+    with _client() as client:
+        with pytest.raises(ValueError) as excinfo:
+            download_tarball(client, ORG, REPO, SHA, tmp_path)
+
+    message = str(excinfo.value)
+    assert "exclude.size_mb" in message
+    # The stream aborts on the first chunk, so the overage is that chunk minus the cap.
+    assert f"by {len(CLEAN_TARBALL) - 4} bytes" in message

@@ -1,6 +1,13 @@
 """Serverless indexing job entry point (``code-search-index``).
 
-Orchestrates, per configured repo: resolve HEAD -> download the tarball by that
+The repo set comes from the central ``config.yaml``, read from the workspace at
+``--config`` on every run and resolved to canonical ``org/repo`` names by
+:func:`indexer.resolve.resolve_repos`. Resolution completes in full -- config
+read, enumeration, filtering, dedup, ceiling -- before the first tarball is
+fetched, so a bad config exits non-zero having indexed nothing and without ever
+opening a database connection.
+
+Orchestrates, per resolved repo: resolve HEAD -> download the tarball by that
 immutable SHA -> extract -> parse text files -> extract symbols -> atomic upsert +
 mark-and-sweep via :func:`indexer.store.index_repo`. Each repo is isolated; the
 process exits non-zero if any repo fails.
@@ -22,7 +29,6 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
-import re
 import sys
 import tempfile
 from collections.abc import Callable
@@ -38,51 +44,12 @@ from indexer.embed import EmbeddingCountMismatchError, EmbedFn, get_embedder
 from indexer.fetch import download_tarball, extract_tarball, resolve_ref
 from indexer.languages import Chunk, IndexCounts, ParsedFile
 from indexer.parse import iter_chunks, iter_source_files
+from indexer.repo_config import RepoConfig, load_config, normalize_repo
+from indexer.resolve import MAX_REPOS, resolve_repos
 from indexer.store import ChunkWriter, index_repo
 from indexer.symbols import extract_symbols
 
 logger = logging.getLogger("indexer.job")
-
-_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
-_GITHUB_HOSTS = {"github.com", "www.github.com"}
-
-
-def normalize_repo(entry: str) -> str:
-    """Normalize a repo entry to canonical ``org/repo`` (the ``repos.name`` key).
-
-    Accepts ``https://github.com/org/repo(.git)``, ``git@github.com:org/repo.git``,
-    and bare ``org/repo``. Rejects other hosts, empty input, and anything that is
-    not exactly two ``org/repo`` segments.
-    """
-    raw = entry.strip()
-    if not raw:
-        raise ValueError("empty repo entry")
-
-    slug = raw
-    if slug.startswith("git@"):
-        # git@github.com:org/repo.git
-        host, _, path = slug[len("git@") :].partition(":")
-        if host not in _GITHUB_HOSTS:
-            raise ValueError(f"unsupported host in repo entry: {entry!r}")
-        slug = path
-    elif "://" in slug:
-        # https://github.com/org/repo(.git)
-        scheme_host, _, path = slug.partition("://")[2].partition("/")
-        if scheme_host not in _GITHUB_HOSTS:
-            raise ValueError(f"unsupported host in repo entry: {entry!r}")
-        slug = path
-
-    if slug.endswith(".git"):
-        slug = slug[: -len(".git")]
-    slug = slug.strip("/")
-
-    if not _REPO_RE.match(slug):
-        raise ValueError(f"could not parse a github org/repo from {entry!r}")
-    # Reject degenerate `.`/`..` segments GitHub itself rejects; keeps them out of
-    # the API URL path and the tarball dest even though the host is fixed.
-    if any(part in {".", ".."} for part in slug.split("/")):
-        raise ValueError(f"invalid org/repo segment in {entry!r}")
-    return slug
 
 
 def read_github_token(client: Any, scope: str, key: str) -> str:
@@ -95,14 +62,9 @@ def read_github_token(client: Any, scope: str, key: str) -> str:
     return base64.b64decode(secret.value).decode()
 
 
-def _split_repos(repos: str) -> list[str]:
-    """Split the ``--repos`` value on commas/whitespace (matches ``repos_to_index``)."""
-    return [tok for tok in re.split(r"[,\s]+", repos.strip()) if tok]
-
-
 def run(
     *,
-    repos: str,
+    config_path: str,
     scope: str,
     key: str,
     endpoint: str | None,
@@ -113,19 +75,22 @@ def run(
     index_fn: Callable[..., IndexCounts] = index_repo,
     cfg: Settings | None = None,
     embed_fn: EmbedFn | None = None,
+    config_loader: Callable[[Any, str], RepoConfig] = load_config,
+    max_repos: int = MAX_REPOS,
 ) -> int:
     """Index every configured repo and return a process exit code (0 = all ok).
 
-    Boundaries are injectable for tests: ``workspace_client`` (secret read),
-    ``http_client`` (GitHub HTTP), ``engine`` (DB), ``index_fn`` (the store), and
-    ``embed_fn`` (issue #14 semantic chunking; a fake in tests). ``cfg`` defaults
-    to the process-cached :func:`app.config.get_settings`.
-    """
-    entries = _split_repos(repos)
-    if not entries:
-        logger.info("no repos configured; nothing to index")
-        return 0
+    Boundaries are injectable for tests: ``workspace_client`` (secret + config
+    read), ``http_client`` (GitHub HTTP), ``engine`` (DB), ``index_fn`` (the
+    store), ``embed_fn`` (issue #14 semantic chunking), and ``config_loader``
+    (so orchestration tests need no SDK fake). ``cfg`` defaults to the
+    process-cached :func:`app.config.get_settings`.
 
+    ``resolve_repos`` is deliberately **not** injectable: the existing
+    ``httpx.MockTransport`` seam already lets tests drive enumeration outcomes
+    through the real resolver, and a fake one would let the fail-fast contract
+    pass without exercising the wiring it exists to prove.
+    """
     if cfg is None:
         cfg = get_settings()
 
@@ -133,11 +98,42 @@ def run(
         from databricks.sdk import WorkspaceClient
 
         workspace_client = WorkspaceClient()
+
+    try:
+        config = config_loader(workspace_client, config_path)
+    except Exception:
+        # Broad by design, matching the resolution handler below.
+        # read_workspace_config wraps every SDK failure in ConfigError, but
+        # parse_config only converts UnicodeDecodeError, yaml.YAMLError, and
+        # ValidationError -- anything else out of yaml.safe_load would otherwise
+        # escape as a raw traceback, degrading diagnosability at exactly the
+        # point that motivated loading the config through the SDK.
+        # exc_info is load-bearing, not stylistic: the chained SDK exception
+        # carries the 403/404 that distinguishes "never synced" from "no read
+        # permission". The message stays load-phase-specific so this and the
+        # resolution failure below remain distinguishable in the log.
+        logger.error("could not load config from %s", config_path, exc_info=True)
+        return 1
+
     token = read_github_token(workspace_client, scope, key)
 
     owns_http = http_client is None
     if http_client is None:
         http_client = httpx.Client(headers={"Authorization": f"Bearer {token}"}, timeout=60.0)
+
+    # Resolve BEFORE opening a database connection: a bad config must cost
+    # nothing but the enumeration calls it already made.
+    try:
+        entries = resolve_repos(config, http_client, max_repos=max_repos)
+    except Exception:
+        # Broad by design. normalize_repo raises a bare ValueError, and
+        # enumeration can raise httpx errors, RateLimitError, EmptyConfigError,
+        # or RepoCeilingError; a named tuple would let a ValueError escape and
+        # break main()'s exit-code contract.
+        logger.error("could not resolve repos from %s", config_path, exc_info=True)
+        if owns_http:
+            http_client.close()
+        return 1
 
     owns_engine = engine is None
     if engine is None:
@@ -297,13 +293,33 @@ def _index_one(
             )
 
 
+def _positive_int(raw: str) -> int:
+    """argparse type for ``--max_repos``: an int >= 1.
+
+    ``--max_repos=0`` is well-defined but makes every non-empty resolution raise
+    ``RepoCeilingError``, so reject it at the boundary rather than at 2am.
+    """
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     # Capture the serverless interpreter version in the run log (M2 live gate).
     logger.info("code-search-index starting on Python %s", sys.version)
 
     parser = argparse.ArgumentParser(description="Index GitHub repos into the code search DB.")
-    parser.add_argument("--repos", default="", help="Comma/space-separated org/repo entries.")
+    parser.add_argument("--config", required=True, help="Workspace path to config.yaml.")
+    # Underscore, NOT hyphen: python_wheel_task emits each named_parameters key
+    # verbatim as `--<key>=<value>`, and resources/job.yml spells it max_repos.
+    parser.add_argument(
+        "--max_repos",
+        type=_positive_int,
+        default=MAX_REPOS,
+        help="Safety ceiling on the resolved repo count.",
+    )
     parser.add_argument("--scope", required=True, help="Databricks secret scope for the GH token.")
     parser.add_argument("--key", required=True, help="Secret key within the scope.")
     parser.add_argument("--endpoint", default=None, help="Lakebase endpoint identifier.")
@@ -311,7 +327,8 @@ def main() -> None:
     args = parser.parse_args()
 
     exit_code = run(
-        repos=args.repos,
+        config_path=args.config,
+        max_repos=args.max_repos,
         scope=args.scope,
         key=args.key,
         endpoint=args.endpoint,

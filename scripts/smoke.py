@@ -10,8 +10,9 @@ explicit meaning (see the grant-oracle table in ``.omc/plans/issue-12-deploy-pla
   honest oracle.
 * direct-SQL ``SELECT 1`` as the developer/owner -> connectivity only, NOT a grant assertion.
 * direct-SQL ``SELECT count(*) FROM repos >= 1`` -> corpus populated; only under
-  ``--expect-indexed`` (a fresh deploy has an empty corpus, so this is opt-in and must not
-  false-RED).
+  ``--expect-indexed``. Deploy step 7 always runs the indexing job, so a deploy carrying a
+  GitHub token *does* leave a populated corpus — this stays opt-in solely because the token
+  may be absent (step 3 only warns), and a token-less deploy must not false-RED.
 * MCP ``search_code`` -> end-to-end query returns file-grouped matches with line numbers; only
   under ``--enable-mcp`` (opt-in, since it needs a real query term against a populated corpus).
 

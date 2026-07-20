@@ -15,7 +15,13 @@ resources:
             package_name: databricks-code-search
             entry_point: code-search-index
             named_parameters:
-              repos: ${var.repos_to_index}
+              # Bare `${workspace.file_path}` — it already resolves to an absolute
+              # /Workspace/... path. Writing /Workspace/${workspace.file_path} yields a
+              # doubled, broken path (databricks/cli#2300).
+              config: ${workspace.file_path}/config.yaml
+              # Underscore, NOT hyphen: python_wheel_task emits each key verbatim as
+              # `--<key>=<value>`, so this must match argparse's `--max_repos` exactly.
+              max_repos: ${var.max_repos}
               scope: ${var.github_token_secret_scope}
               key: ${var.github_token_secret_key}
               endpoint: projects/${var.lakebase_project_name}/branches/production/endpoints/${var.lakebase_endpoint_name}

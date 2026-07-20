@@ -8,10 +8,15 @@ never drift from the ``head_sha`` stamped into ``files.commit``.
 
 from __future__ import annotations
 
+import logging
 import tarfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+
+logger = logging.getLogger("indexer.fetch")
 
 _API_BASE = "https://api.github.com"
 _GITHUB_HEADERS = {
@@ -24,6 +29,135 @@ _GITHUB_HEADERS = {
 # gzip bomb or an oversized tracked blob can't exhaust local storage.
 MAX_TARBALL_BYTES = 500_000_000
 MAX_EXTRACTED_BYTES = 2_000_000_000
+
+_PER_PAGE = 100
+
+
+@dataclass(frozen=True)
+class RepoMeta:
+    """The subset of GitHub's list-repos object the resolution layer filters on.
+
+    ``size_kb`` is GitHub's ``size`` field, which reports the **git directory** in
+    KB (history included) — not the size of a tarball of HEAD.
+    """
+
+    full_name: str
+    fork: bool
+    archived: bool
+    size_kb: int
+
+
+class RateLimitError(Exception):
+    """A genuine GitHub rate-limit / secondary-limit response.
+
+    Deliberately narrow: GitHub also answers 403 for permission failures (a PAT
+    without org scope), and mislabeling those as quota failures would send the
+    operator off to wait for a reset that never helps.
+    """
+
+
+def _rate_limit_reason(response: httpx.Response) -> str | None:
+    """Return a human wait/reset description iff this response is a *real* rate limit.
+
+    429 always counts. 403 counts only when ``Retry-After`` is present or
+    ``X-RateLimit-Remaining`` is exactly ``0``; every other 403 is an ordinary
+    permission failure and must fall through to ``raise_for_status()``.
+    ``Retry-After`` takes precedence over ``X-RateLimit-Reset``.
+    """
+    if response.status_code not in (403, 429):
+        return None
+
+    retry_after = response.headers.get("Retry-After")
+    remaining = response.headers.get("X-RateLimit-Remaining")
+    reset = response.headers.get("X-RateLimit-Reset")
+
+    if response.status_code == 403 and retry_after is None and remaining != "0":
+        return None
+
+    if retry_after is not None:
+        return f"retry after {retry_after}s"
+    if reset is not None:
+        try:
+            when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(reset)))
+        except ValueError:
+            return f"rate limit resets at {reset}"
+        return f"rate limit resets at {when}"
+    return "no reset time reported"
+
+
+def _has_next_page(link_header: str | None) -> bool:
+    """True when the ``Link`` header advertises a ``rel="next"`` page.
+
+    Only ``next`` terminates the loop's continuation; ``prev``/``last``/``first``
+    rels are present on GitHub's last page and must not be mistaken for one.
+    """
+    if not link_header:
+        return False
+    for link in link_header.split(","):
+        for param in link.split(";")[1:]:
+            key, _, value = param.strip().partition("=")
+            if key == "rel" and value.strip('"') == "next":
+                return True
+    return False
+
+
+def _list_repos(client: httpx.Client, url: str, *, selector: str) -> list[RepoMeta]:
+    """Page through a GitHub list-repos endpoint, following ``Link`` rel=next.
+
+    ``selector`` is the org/user name being enumerated; it is named in every
+    :class:`RateLimitError` so a quota failure points at its own cause. Request
+    headers are never logged (token-redaction invariant).
+    """
+    repos: list[RepoMeta] = []
+    page = 1
+    remaining: str | None = None
+
+    while True:
+        response = client.get(
+            url,
+            headers=_GITHUB_HEADERS,
+            params={"per_page": _PER_PAGE, "page": page},
+        )
+        reason = _rate_limit_reason(response)
+        if reason is not None:
+            raise RateLimitError(
+                f"GitHub rate limit hit while enumerating {selector} "
+                f"(HTTP {response.status_code}); {reason}"
+            )
+        response.raise_for_status()
+
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        repos.extend(
+            RepoMeta(
+                full_name=str(item["full_name"]),
+                fork=bool(item["fork"]),
+                archived=bool(item["archived"]),
+                size_kb=int(item["size"]),
+            )
+            for item in response.json()
+        )
+
+        if not _has_next_page(response.headers.get("Link")):
+            break
+        page += 1
+
+    logger.info(
+        "enumerated %d repos for %s; GitHub rate limit remaining: %s",
+        len(repos),
+        selector,
+        remaining if remaining is not None else "unknown",
+    )
+    return repos
+
+
+def list_org_repos(client: httpx.Client, org: str) -> list[RepoMeta]:
+    """Every repo visible to the token under organization ``org``."""
+    return _list_repos(client, f"{_API_BASE}/orgs/{org}/repos", selector=org)
+
+
+def list_user_repos(client: httpx.Client, user: str) -> list[RepoMeta]:
+    """Every repo visible to the token owned by ``user``."""
+    return _list_repos(client, f"{_API_BASE}/users/{user}/repos", selector=user)
 
 
 def resolve_ref(client: httpx.Client, org: str, repo: str) -> tuple[str, str]:
@@ -63,7 +197,11 @@ def download_tarball(client: httpx.Client, org: str, repo: str, ref: str, dest: 
             for chunk in resp.iter_bytes():
                 total += len(chunk)
                 if total > MAX_TARBALL_BYTES:
-                    raise ValueError(f"tarball for {org}/{repo} exceeds {MAX_TARBALL_BYTES} bytes")
+                    raise ValueError(
+                        f"tarball for {org}/{repo} exceeds {MAX_TARBALL_BYTES} bytes "
+                        f"by {total - MAX_TARBALL_BYTES} bytes; "
+                        f"consider exclude.size_mb in config.yaml"
+                    )
                 fh.write(chunk)
     return out
 

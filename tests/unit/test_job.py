@@ -1,14 +1,25 @@
-"""Unit tests for indexer.job: normalize_repo, read_github_token, orchestration.
+"""Unit tests for indexer.job: read_github_token and orchestration.
 
 Orchestration runs with every I/O boundary faked: a fake WorkspaceClient (secret
-read), an httpx.MockTransport client (GitHub HTTP), a fake Engine/Connection, and
-a recording ``index_fn`` — so no Databricks creds and no Postgres are needed.
+read), an injected ``config_loader`` (the workspace config read), an
+httpx.MockTransport client (GitHub HTTP), a fake Engine/Connection, and a
+recording ``index_fn`` — so no Databricks creds and no Postgres are needed.
+
+``resolve_repos`` is NOT faked. Resolution runs for real against the mock
+transport, so the fail-fast criteria exercise the actual wiring.
+
+``normalize_repo``'s own tables live in ``tests/unit/test_repo_config.py`` after
+the Decision 0 move; they are not duplicated here.
 """
 
 from __future__ import annotations
 
 import base64
+import inspect
 import io
+import logging
+import subprocess
+import sys
 import tarfile
 from typing import Any
 
@@ -16,49 +27,9 @@ import httpx
 import pytest
 
 from app.config import Settings
-from indexer.job import normalize_repo, read_github_token, run
+from indexer.job import read_github_token, run
 from indexer.languages import IndexCounts, ParsedFile
-
-# --- normalize_repo ---------------------------------------------------------
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    ("entry", "expected"),
-    [
-        ("acme/widgets", "acme/widgets"),
-        ("https://github.com/acme/widgets", "acme/widgets"),
-        ("https://github.com/acme/widgets.git", "acme/widgets"),
-        ("git@github.com:acme/widgets.git", "acme/widgets"),
-        ("  acme/widgets  ", "acme/widgets"),
-        ("https://github.com/acme/widgets/", "acme/widgets"),
-    ],
-)
-def test_normalize_repo_accepts(entry: str, expected: str) -> None:
-    assert normalize_repo(entry) == expected
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "entry",
-    [
-        "",
-        "   ",
-        "acme",
-        "acme/widgets/extra",
-        "https://gitlab.com/acme/widgets",
-        "git@bitbucket.org:acme/widgets.git",
-        "https://evil.com/a/b",
-        "../..",
-        "acme/..",
-        "../widgets",
-        "https://github.com/acme/../secrets",
-    ],
-)
-def test_normalize_repo_rejects(entry: str) -> None:
-    with pytest.raises(ValueError):
-        normalize_repo(entry)
-
+from indexer.repo_config import ConfigError, RepoConfig, load_config
 
 # --- read_github_token ------------------------------------------------------
 
@@ -106,18 +77,67 @@ def _tarball(top_dir: str) -> bytes:
     return buf.getvalue()
 
 
-def _github_handler(request: httpx.Request) -> httpx.Response:
-    parts = request.url.path.strip("/").split("/")
-    # /repos/{org}/{repo}...
-    if len(parts) >= 3 and parts[0] == "repos":
-        org, repo = parts[1], parts[2]
-        if len(parts) == 3:
-            return httpx.Response(200, json={"default_branch": "main"})
-        if parts[3] == "commits":
-            return httpx.Response(200, json={"sha": f"sha_{repo}"})
-        if parts[3] == "tarball":
-            return httpx.Response(200, content=_tarball(f"{org}-{repo}-shashas"))
-    return httpx.Response(404)
+class _GitHub:
+    """A recording GitHub fake covering both enumeration and the index pipeline.
+
+    ``enumerations`` maps a selector name (``orgs``/``users`` entry) to the repo
+    objects that endpoint returns; an unlisted selector 404s, which is how the
+    fail-fast criteria drive a failed enumeration. ``missing`` names repos whose
+    ``resolve_ref`` metadata call 404s, failing them at *index* time only.
+    """
+
+    def __init__(
+        self,
+        *,
+        enumerations: dict[str, list[dict[str, Any]]] | None = None,
+        missing: set[str] | None = None,
+    ) -> None:
+        self.enumerations = enumerations or {}
+        self.missing = missing or set()
+        self.paths: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.paths.append(path)
+        parts = path.strip("/").split("/")
+
+        # /orgs/{x}/repos and /users/{x}/repos — enumeration. Checked FIRST: an
+        # /orgs/acme/repos path also has three segments and would otherwise fall
+        # into the repo-metadata arm below.
+        if len(parts) == 3 and parts[0] in {"orgs", "users"} and parts[2] == "repos":
+            listing = self.enumerations.get(parts[1])
+            if listing is None:
+                return httpx.Response(404)
+            return httpx.Response(200, json=listing)
+
+        # /repos/{org}/{repo}...
+        if len(parts) >= 3 and parts[0] == "repos":
+            org, repo = parts[1], parts[2]
+            if len(parts) == 3:
+                if f"{org}/{repo}" in self.missing:
+                    return httpx.Response(404)
+                return httpx.Response(200, json={"default_branch": "main"})
+            if parts[3] == "commits":
+                return httpx.Response(200, json={"sha": f"sha_{repo}"})
+            if parts[3] == "tarball":
+                return httpx.Response(200, content=_tarball(f"{org}-{repo}-shashas"))
+        return httpx.Response(404)
+
+    @property
+    def tarball_requests(self) -> list[str]:
+        return [p for p in self.paths if "/tarball" in p]
+
+
+def _repo_meta(full_name: str, **overrides: Any) -> dict[str, Any]:
+    """One GitHub list-repos object, defaulting to a repo nothing excludes."""
+    return {"full_name": full_name, "fork": False, "archived": False, "size": 10, **overrides}
+
+
+def _config(**connection: Any) -> RepoConfig:
+    """A single-github-connection RepoConfig from selector kwargs."""
+    return RepoConfig.model_validate(
+        {"version": 1, "connections": [{"type": "github", **connection}]}
+    )
 
 
 class _FakeConn:
@@ -165,12 +185,21 @@ class _RecordingIndex:
         return counts
 
 
-def _run(repos: str, index_fn: Any, *, cfg: Settings | None = None, embed_fn: Any = None) -> int:
+def _run(
+    config: RepoConfig,
+    index_fn: Any,
+    *,
+    cfg: Settings | None = None,
+    embed_fn: Any = None,
+    github: _GitHub | None = None,
+) -> int:
+    """Drive run() with a faked config read but a REAL resolve_repos."""
     wc = _FakeWorkspaceClient("tok")
     engine = _FakeEngine()
-    with httpx.Client(transport=httpx.MockTransport(_github_handler)) as client:
+    handler = github if github is not None else _GitHub()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         return run(
-            repos=repos,
+            config_path="/Workspace/x/config.yaml",
             scope="s",
             key="k",
             endpoint="ep",
@@ -181,52 +210,184 @@ def _run(repos: str, index_fn: Any, *, cfg: Settings | None = None, embed_fn: An
             index_fn=index_fn,
             cfg=cfg,
             embed_fn=embed_fn,
+            config_loader=lambda _client, _path: config,
         )
 
 
 @pytest.mark.unit
 def test_run_indexes_all_repos() -> None:
     idx = _RecordingIndex()
-    code = _run("acme/widgets, acme/gadgets", idx)
+    code = _run(_config(repos=["acme/widgets", "acme/gadgets"]), idx)
     assert code == 0
     assert set(idx.calls) == {"acme/widgets", "acme/gadgets"}
 
 
 @pytest.mark.unit
+def test_run_indexes_enumerated_repos() -> None:
+    """The enumerated path reaches indexing, not just the explicit one."""
+    idx = _RecordingIndex()
+    github = _GitHub(enumerations={"acme": [_repo_meta("acme/widgets")]})
+    code = _run(_config(orgs=["acme"]), idx, github=github)
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+
+
+@pytest.mark.unit
 def test_run_parses_files_and_symbols() -> None:
     idx = _RecordingIndex()
-    code = _run("acme/widgets", idx)
+    code = _run(_config(repos=["acme/widgets"]), idx)
     assert code == 0
     # main.py + README.md both stored; main.py yields one function symbol.
     assert idx.calls == ["acme/widgets"]
     assert idx.counts == [IndexCounts(files=2, symbols=1, swept=0)]
 
 
+# --- AC 33: import health (the Decision 0 circular-import regression guard) ---
+# Deliberately a SUBPROCESS check. This module has already imported indexer.job
+# by the time any test body runs, so an in-process `import indexer.job` would be
+# vacuous. Both directions are checked because a cycle fails in either order.
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "statement",
+    ["from indexer.job import main", "import indexer.resolve"],
+)
+def test_modules_import_in_a_cold_interpreter(statement: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", statement],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+# --- AC 34 ------------------------------------------------------------------
+# Asserted here rather than in test_repo_config.py so the import-light model
+# module's test file never imports indexer.job (Axis B1).
+
+
+@pytest.mark.unit
+def test_run_config_loader_defaults_to_load_config() -> None:
+    assert inspect.signature(run).parameters["config_loader"].default is load_config
+
+
+# --- AC 35 / 36 / 38 / 39 / 40: fail-fast before any indexing ---------------
+
+
+@pytest.mark.unit
+def test_run_fails_fast_when_an_enumeration_fails() -> None:
+    """AC 35: the second org 404s -> nothing is indexed and no tarball is fetched."""
+    idx = _RecordingIndex()
+    github = _GitHub(enumerations={"acme": [_repo_meta("acme/widgets")]})  # "other" 404s
+    code = _run(_config(orgs=["acme", "other"]), idx, github=github)
+    assert code == 1
+    assert idx.calls == []
+    assert github.tarball_requests == []
+
+
+@pytest.mark.unit
+def test_run_returns_1_when_config_resolves_to_zero_repos() -> None:
+    """AC 36: an org that enumerates only excluded repos resolves to nothing."""
+    idx = _RecordingIndex()
+    github = _GitHub(enumerations={"acme": [_repo_meta("acme/f", fork=True)]})
+    code = _run(_config(orgs=["acme"]), idx, github=github)
+    assert code == 1
+    assert idx.calls == []
+    assert github.tarball_requests == []
+
+
 @pytest.mark.unit
 def test_run_isolates_failing_repo() -> None:
+    """AC 37: both repos resolve; the second's resolve_ref 404s at INDEX time.
+
+    Per-repo isolation is a property of the indexing loop, so it can only be
+    exercised by a failure that occurs *after* resolution succeeds. A malformed
+    entry now fails at resolution instead — see AC 38.
+    """
     idx = _RecordingIndex()
-    # Second entry is an unsupported host -> normalize_repo raises inside the
-    # per-repo try/except; the first still indexes and the exit code is 1.
-    code = _run("acme/widgets, https://evil.com/a/b", idx)
+    github = _GitHub(missing={"acme/gadgets"})
+    code = _run(_config(repos=["acme/widgets", "acme/gadgets"]), idx, github=github)
     assert code == 1
     assert idx.calls == ["acme/widgets"]
 
 
 @pytest.mark.unit
-def test_run_empty_repos_is_noop() -> None:
+def test_malformed_explicit_repo_aborts_the_whole_run() -> None:
+    """AC 38: a documented semantic change.
+
+    A bad explicit entry used to be isolated to its own repo, with the others
+    still indexed. It now raises out of resolve_repos, so the run indexes
+    nothing at all. Asserted so the change is a tested contract, not a side
+    effect.
+    """
     idx = _RecordingIndex()
-    code = run(
-        repos="   ",
-        scope="s",
-        key="k",
-        endpoint="ep",
-        database="db",
-        workspace_client=None,
-        http_client=None,
-        engine=None,
-        index_fn=idx,
-    )
-    assert code == 0
+    github = _GitHub()
+    code = _run(_config(repos=["acme/widgets", "https://evil.com/a/b"]), idx, github=github)
+    assert code == 1
+    assert idx.calls == []
+    assert github.tarball_requests == []
+
+
+@pytest.mark.unit
+def test_bare_value_error_from_resolution_returns_1(caplog: pytest.LogCaptureFixture) -> None:
+    """AC 40: normalize_repo's bare ValueError must not escape as a traceback.
+
+    The handler catches `Exception`, not a named tuple — a narrow catch would
+    let this one through and break main()'s exit-code contract.
+
+    Distinct from test_malformed_explicit_repo_aborts_the_whole_run above, which
+    pins the *semantic* change (nothing gets indexed). This one pins the
+    *diagnostic* contract: exit 1 is reached via a logged, traceback-carrying
+    resolve-phase record, not by the exception escaping to the interpreter.
+    """
+    idx = _RecordingIndex()
+    with caplog.at_level(logging.ERROR, logger="indexer.job"):
+        code = _run(_config(repos=["https://evil.com/a/b"]), idx)
+    assert code == 1
+    assert idx.calls == []
+
+    errors = [r for r in caplog.records if r.name == "indexer.job"]
+    assert len(errors) == 1
+    # Names the resolve phase, so it is distinguishable from the config-load
+    # failure point (which now also catches Exception).
+    assert "could not resolve repos" in errors[0].getMessage()
+    assert errors[0].exc_info is not None
+
+
+@pytest.mark.unit
+def test_config_error_returns_1_without_opening_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 39: a failed config read never reaches create_db_engine.
+
+    ``engine=None`` is required: the injected-engine path never calls
+    create_db_engine at all, which would make the assertion vacuous.
+    """
+    import indexer.job as job
+
+    calls: list[Any] = []
+    monkeypatch.setattr(job, "create_db_engine", lambda **kw: calls.append(kw))
+
+    def _boom(_client: Any, _path: str) -> RepoConfig:
+        raise ConfigError("failed to read config from '/Workspace/x/config.yaml' (HTTP 404)")
+
+    idx = _RecordingIndex()
+    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+        code = run(
+            config_path="/Workspace/x/config.yaml",
+            scope="s",
+            key="k",
+            endpoint="ep",
+            database="db",
+            workspace_client=_FakeWorkspaceClient("tok"),
+            http_client=client,
+            engine=None,
+            index_fn=idx,
+            config_loader=_boom,
+        )
+    assert code == 1
+    assert calls == []
     assert idx.calls == []
 
 
@@ -251,7 +412,7 @@ class _FakeChunkConn:
 @pytest.mark.unit
 def test_flag_off_passes_no_chunk_writer() -> None:
     idx = _RecordingIndex()
-    code = _run("acme/widgets", idx, cfg=Settings(semantic_enabled=False))
+    code = _run(_config(repos=["acme/widgets"]), idx, cfg=Settings(semantic_enabled=False))
     assert code == 0
     assert idx.chunk_writer is None
 
@@ -266,7 +427,7 @@ def test_semantic_enabled_builds_and_wires_a_chunk_writer() -> None:
         return [[0.5] for _ in texts]
 
     cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
-    code = _run("acme/widgets", idx, cfg=cfg, embed_fn=fake_embed)
+    code = _run(_config(repos=["acme/widgets"]), idx, cfg=cfg, embed_fn=fake_embed)
     assert code == 0
     assert idx.chunk_writer is not None
     # main.py + README.md's chunk text is embedded in one up-front call, not
@@ -306,7 +467,9 @@ def test_semantic_ceiling_exceeded_degrades_but_still_indexes_the_core() -> None
     idx = _RecordingIndex()
     # main.py + README.md each yield 1 chunk -> total 2, over a ceiling of 1.
     cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=1)
-    code = _run("acme/widgets", idx, cfg=cfg, embed_fn=lambda texts: [[0.0] for _ in texts])
+    code = _run(
+        _config(repos=["acme/widgets"]), idx, cfg=cfg, embed_fn=lambda texts: [[0.0] for _ in texts]
+    )
     assert code == 0  # the repo is NOT failed by a semantic-only problem
     assert idx.calls == ["acme/widgets"]  # core index still ran
     assert idx.chunk_writer is None  # ...with chunks skipped
@@ -324,7 +487,7 @@ def test_embedder_failure_degrades_but_still_indexes_the_core() -> None:
 
     idx = _RecordingIndex()
     cfg = Settings(semantic_enabled=True)
-    code = _run("acme/widgets", idx, cfg=cfg, embed_fn=_down)
+    code = _run(_config(repos=["acme/widgets"]), idx, cfg=cfg, embed_fn=_down)
     assert code == 0
     assert idx.calls == ["acme/widgets"]
     assert idx.chunk_writer is None
@@ -339,7 +502,8 @@ def test_unbuildable_embedder_does_not_abort_the_whole_run() -> None:
     """
     idx = _RecordingIndex()
     cfg = Settings(semantic_enabled=True, semantic_embedding_endpoint=None)
-    code = _run("acme/widgets", idx, cfg=cfg)  # no embed_fn injected -> real get_embedder
+    # No embed_fn injected -> the real get_embedder runs.
+    code = _run(_config(repos=["acme/widgets"]), idx, cfg=cfg)
     assert code == 0
     assert idx.calls == ["acme/widgets"]
     assert idx.chunk_writer is None
@@ -356,17 +520,45 @@ def test_unbuildable_embedder_does_not_abort_the_whole_run() -> None:
 def test_main_returns_normally_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     import indexer.job as job
 
-    monkeypatch.setattr(job.sys, "argv", ["code-search-index", "--scope", "s", "--key", "k"])
+    argv = ["code-search-index", "--config", "/Workspace/x/config.yaml"]
+    monkeypatch.setattr(job.sys, "argv", [*argv, "--scope", "s", "--key", "k"])
     monkeypatch.setattr(job, "run", lambda **_: 0)
     # Must NOT raise SystemExit on the success path.
     assert job.main() is None
 
 
 @pytest.mark.unit
+def test_main_accepts_the_underscored_max_repos_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resources/job.yml spells the key ``max_repos``, and python_wheel_task emits
+    it verbatim as ``--max_repos=<value>``. A hyphenated flag would fail only on a
+    live run, invisibly to every other gate here."""
+    import indexer.job as job
+
+    seen: dict[str, Any] = {}
+    argv = ["code-search-index", "--config", "/c.yaml", "--max_repos=7"]
+    monkeypatch.setattr(job.sys, "argv", [*argv, "--scope", "s", "--key", "k"])
+    monkeypatch.setattr(job, "run", lambda **kw: seen.update(kw) or 0)
+    job.main()
+    assert seen["max_repos"] == 7
+    assert seen["config_path"] == "/c.yaml"
+
+
+@pytest.mark.unit
+def test_main_rejects_a_max_repos_below_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    import indexer.job as job
+
+    argv = ["code-search-index", "--config", "/c.yaml", "--max_repos=0"]
+    monkeypatch.setattr(job.sys, "argv", [*argv, "--scope", "s", "--key", "k"])
+    with pytest.raises(SystemExit):
+        job.main()
+
+
+@pytest.mark.unit
 def test_main_exits_nonzero_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     import indexer.job as job
 
-    monkeypatch.setattr(job.sys, "argv", ["code-search-index", "--scope", "s", "--key", "k"])
+    argv = ["code-search-index", "--config", "/Workspace/x/config.yaml"]
+    monkeypatch.setattr(job.sys, "argv", [*argv, "--scope", "s", "--key", "k"])
     monkeypatch.setattr(job, "run", lambda **_: 1)
     with pytest.raises(SystemExit) as excinfo:
         job.main()

@@ -1,0 +1,31 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ CHANGE THIS FIRST. This ships pointed at the repo author's GitHub        │
+# │ account. If you deploy it unedited you will index someone else's repos   │
+# │ — every 12 hours — and your searches will silently return their code.    │
+# │ Replace `IceRhymers` below with your own org or user, then `make deploy`.│
+# └──────────────────────────────────────────────────────────────────────────┘
+version: 1
+
+connections:
+  - type: github
+    # orgs / users / repos are UNIONED, then deduplicated by canonical org/repo.
+    users:
+      - IceRhymers
+
+    # orgs:
+    #   - acme
+    #   - acme-labs
+
+    # Explicitly listed repos are indexed VERBATIM — no enumeration API call,
+    # and `exclude` below does NOT apply to them. Explicit always wins.
+    # repos:
+    #   - otherorg/specific-repo
+
+    # `exclude` filters ONLY repos discovered via `orgs` / `users`.
+    # exclude:
+    #   forks: true       # default true — forks duplicate their upstream
+    #   archived: true    # default true — re-downloaded every run, never change
+    #   repos:            # fnmatch globs against canonical org/repo
+    #     - "acme/*-deprecated"
+    #     - "acme/test-*"
+    #   size_mb: 500      # GitHub reports size in KB; this is MB. Default: no cap.

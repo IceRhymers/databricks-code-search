@@ -19,7 +19,7 @@ digraph deploy {
       fillcolor="#fffaf0", color="#c05621"];
   s6 [label="6  apply grants\napp SP read · job SP write (prod)",
       fillcolor="#fffaf0", color="#c05621"];
-  s7 [label="7  index\nonly if repos_to_index is non-empty"];
+  s7 [label="7  index\nalways runs; failure warns, does not abort"];
   s8 [label="8  print app URL\n+ OAuth app-connection reminder"];
 
   fallback [label="first-activation fallback\ndatabricks apps deploy --source-code-path\nthen re-run + re-probe",

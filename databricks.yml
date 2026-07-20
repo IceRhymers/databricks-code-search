@@ -2,9 +2,12 @@ bundle:
   name: databricks-code-search
 
 variables:
-  repos_to_index:
-    description: "Comma/space-separated GitHub repos to index (owner/name). Empty = none."
-    default: ""
+  max_repos:
+    description: >-
+      Runaway-config guardrail: resolution fails if config.yaml resolves to more repos
+      than this. Not a wall-clock control (one huge repo outlasts a hundred small ones).
+      Raise it here and redeploy rather than rebuilding the wheel.
+    default: 500
   github_token_secret_scope:
     description: "Databricks secret scope holding the GitHub token."
     default: code-search
@@ -45,6 +48,14 @@ variables:
 include:
   - resources/*.yml
 
+# The indexing job reads config.yaml from ${workspace.file_path} at runtime, so the file
+# MUST reach the workspace. It syncs by default today, but .gitignore exclusions apply
+# *silently* to bundle sync (databricks/cli#3547) — an explicit include is cheap,
+# self-documenting insurance against a future ignore rule quietly breaking every run.
+sync:
+  include:
+    - config.yaml
+
 # The wheel consumed by the serverless indexing job's environment `dependencies`.
 # Built with uv (matches the repo's uv-based toolchain); DABs runs `build` itself.
 artifacts:
@@ -84,6 +95,24 @@ targets:
       # production mode expects a single, stable deploy path (silences the validate
       # recommendation and prevents multiple copies across principals).
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    # Prod-only: the job runs as ${var.job_run_as_sp}, but the bundle syncs to the
+    # DEPLOYER's home (root_path above). Nothing else establishes that the job SP can READ
+    # config.yaml there — secret-scope ACLs are granted separately and do not cover
+    # workspace files — so every prod run would fail at config read with a 403.
+    # Dev never surfaces this because dev runs as the developer.
+    # Target-scoped for the same reason postgres_roles is (see the note at the
+    # job_run_as_sp variable): its "" default would resolve to an empty principal and
+    # break `validate -t dev` if this block sat at top level.
+    # The block is the DECLARED source of truth for the workspace-folder ACL --
+    # DABs reconciles the folder to exactly what is listed here. The deployer entry
+    # is therefore mandatory, not decorative: without it a prod deploy would strip
+    # every human/CI identity from the bundle root and lock out all subsequent
+    # deploys, recoverable only out of band.
+    permissions:
+      - level: CAN_MANAGE
+        user_name: ${workspace.current_user.userName}
+      - level: CAN_VIEW
+        service_principal_name: ${var.job_run_as_sp}
     # Prod-only: the pre-created job run-as SP's Postgres writer role, declared so it
     # exists at `bundle deploy -t prod` BEFORE `scripts/migrate.py --apply-grants` (#5)
     # grants it and BEFORE `bundle run`. Dev uses the developer identity for writes, so

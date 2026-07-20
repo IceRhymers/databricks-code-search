@@ -98,7 +98,7 @@ wait_active() {
 }
 
 cmd_full() {
-	local app_name scope key file_path state app_sp_role url repos
+	local app_name scope key file_path state app_sp_role url
 
 	# 1. Validate — already run above (the JSON derivation is the exit-0 gate).
 	if [ "$TARGET" = prod ]; then
@@ -172,13 +172,16 @@ cmd_full() {
 	retry 5 10 grant_attempt "$app_sp_role" "$job_writer_role" "$TARGET" ||
 		die "grants failed after retries (is the app SP role visible in pg_roles yet?)"
 
-	# 7. First index (optional) — only when repos_to_index is non-empty.
-	echo "deploy: [7/8] first index (optional)"
-	repos=$(jval repos_to_index 2>/dev/null || true)
-	if [ -n "$repos" ] && [ "$repos" != null ]; then
-		databricks bundle run code_search_index -t "$TARGET" "${VAR_ARGS[@]}"
+	# 7. First index — the config is the only source of truth, and only the job can resolve it
+	#    (expanding orgs/users needs the GitHub API + the secret + the pydantic filters).
+	#    Non-fatal: a missing GitHub token (step 3 only warns) must not abort a deploy whose
+	#    app is already ACTIVE and granted.
+	echo "deploy: [7/8] first index"
+	if databricks bundle run code_search_index -t "$TARGET" "${VAR_ARGS[@]}"; then
+		echo "deploy: first index complete"
 	else
-		echo "deploy: no repos configured — set --var repos_to_index and run 'make index'"
+		echo "deploy: WARNING first index failed — check config.yaml and the GitHub token," \
+			"then re-run 'make index TARGET=$TARGET'" >&2
 	fi
 
 	# 8. Final banner.

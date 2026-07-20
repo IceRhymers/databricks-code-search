@@ -146,6 +146,11 @@ requested out-of-band per project, and **it is irreversible**.
 
 ## Deploy
 
+> **Step 1 after cloning: replace `IceRhymers` with your own account.** `config.yaml`
+> ships pointed at the repo author's GitHub user. Deployed unedited it indexes a
+> stranger's repos every 12 hours and your searches return their code — successfully,
+> with no error anywhere. See [Configuring what gets indexed](#configuring-what-gets-indexed).
+
 ```bash
 make install                      # uv sync --all-groups
 export GITHUB_TOKEN=ghp_...       # so deploy can seed the secret scope
@@ -170,7 +175,7 @@ JOB_RUN_AS_SP=<client-id> make deploy-prod
 4. **Migrate** the schema as the deploying identity, *without* grants.
 5. **Activate** the app via `bundle run`, then poll for `ACTIVE` (15s × 10).
 6. **Apply grants** — read-only for the app SP, write for the job SP on prod.
-7. **Index**, if `repos_to_index` is non-empty.
+7. **Index** — always runs; a failure warns without aborting the deploy.
 8. **Print the app URL** and the reminder about the OAuth app connection.
 
 Steps 4 and 6 are split because the app service principal's Postgres role does not exist
@@ -181,12 +186,62 @@ If step 5 never reaches `ACTIVE`, the script falls back to
 `databricks apps deploy <app> --source-code-path`, re-runs `bundle run`, and re-probes. The
 script calls this the first-activation fallback.
 
-Configure which repositories get indexed with the `repos_to_index` bundle variable
-(comma- or space-separated `org/repo`). It defaults to empty, which is why a fresh deploy
-has an empty corpus and `make smoke` does not assert one unless you pass `--expect-indexed`.
+## Configuring what gets indexed
+
+`config.yaml` at the repo root is the single source of truth for the indexed repo set. It
+is git-versioned, edited by hand, and synced to the workspace by `bundle deploy`; the job
+reads it and resolves the concrete repo list on **every run**, so a new repo in a declared
+org appears on the next 12-hour tick with no redeploy. Changing the config itself does need
+a `make deploy` — that is what re-syncs the file.
+
+```yaml
+version: 1
+
+connections:
+  - type: github
+    users:
+      - IceRhymers
+    orgs:
+      - acme
+    repos:
+      - otherorg/specific-repo
+    exclude:
+      forks: true
+      archived: true
+      repos:
+        - "acme/test-*"
+      size_mb: 500
+```
+
+`users`, `orgs`, and `repos` are **unioned**, then deduplicated by canonical `org/repo`.
+`users` and `orgs` are expanded through the GitHub API at runtime; `repos` entries are
+taken verbatim with no enumeration call.
+
+### `exclude` rules
+
+| Key | Default | Semantics |
+|---|---|---|
+| `forks` | `true` | Drops repos GitHub reports as forks. A fork and its upstream are *distinct* dedup keys, so keeping both doubles the corpus and pollutes ranking with duplicate hits. |
+| `archived` | `true` | Drops archived repos. Their SHA never changes, but the indexer re-downloads, re-parses, and (with semantic on) re-embeds them every run regardless — so they cost full price forever. Set `false` if you want them anyway. |
+| `repos` | `[]` | fnmatch globs matched against the canonical `org/repo` string, e.g. `"acme/test-*"` or `"acme/*-deprecated"`. |
+| `size_mb` | `null` (no cap) | Drops repos larger than this. **GitHub reports repo size in KB; this field is MB** (the comparison is `size_kb > size_mb * 1000`). Note it measures the *git directory including history*, not a tarball of HEAD — a repo with long history and a small working tree can exceed a cap its checkout would not. |
+
+> **Explicit always wins.** `exclude` filters **only** repos discovered through `orgs` and
+> `users`. Anything listed by hand under `repos:` bypasses all four rules — an
+> `exclude.repos: ["acme/test-*"]` glob will not remove a hand-listed `acme/test-harness`.
+> Listing a repo explicitly is an unambiguous instruction, and honouring the filters would
+> also force a metadata request per entry purely to apply a rule you did not ask for. To
+> drop an explicit repo, delete its line.
+
+Resolution is fail-fast and happens before anything is fetched: a failed enumeration, a
+config that resolves to zero repos, or one that resolves past the `max_repos` ceiling
+(default 500, raise it via the `max_repos` bundle variable) each exits non-zero having
+indexed nothing. Every run logs a per-connection breakdown and the resolved repo names at
+INFO — the fastest way to confirm you are indexing what you think you are.
+
 Index on demand with `make index TARGET=dev`; otherwise the job runs every 12 hours.
 
-### Smoke test
+## Smoke test
 
 ```bash
 make smoke TARGET=dev                              # health, ready, connectivity

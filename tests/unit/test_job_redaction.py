@@ -27,10 +27,20 @@ import pytest
 
 from indexer.job import read_github_token, run
 from indexer.languages import IndexCounts
+from indexer.repo_config import RepoConfig
 
 SENTINEL = "ghp_SENTINEL_tok_do_not_log_0xDEADBEEF"
 
 _INDEXER_DIR = Path(__file__).resolve().parents[2] / "indexer"
+
+# Explicit repos: the pipeline tests below assert per-repo indexing, which needs a
+# deterministic single repo. The enumeration path gets its own config (AC 41).
+_CONFIG = RepoConfig.model_validate(
+    {"version": 1, "connections": [{"type": "github", "repos": ["acme/widgets"]}]}
+)
+_ORG_CONFIG = RepoConfig.model_validate(
+    {"version": 1, "connections": [{"type": "github", "orgs": ["acme"]}]}
+)
 
 
 class _FakeSecret:
@@ -58,6 +68,13 @@ def _tarball() -> bytes:
 
 def _handler(request: httpx.Request) -> httpx.Response:
     parts = request.url.path.strip("/").split("/")
+    # Enumeration. MUST precede the len(parts) == 3 arm below: /orgs/acme/repos
+    # also has three segments and would otherwise be answered with repo metadata.
+    if len(parts) == 3 and parts[0] in {"orgs", "users"} and parts[2] == "repos":
+        return httpx.Response(
+            200,
+            json=[{"full_name": "acme/widgets", "fork": False, "archived": False, "size": 1}],
+        )
     if len(parts) == 3:
         return httpx.Response(200, json={"default_branch": "main"})
     if parts[3] == "commits":
@@ -106,7 +123,7 @@ def test_token_never_appears_in_debug_logs(caplog: pytest.LogCaptureFixture) -> 
 
     with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
         code = run(
-            repos="acme/widgets",
+            config_path="/Workspace/x/config.yaml",
             scope="scope",
             key="key",
             endpoint="ep",
@@ -115,6 +132,7 @@ def test_token_never_appears_in_debug_logs(caplog: pytest.LogCaptureFixture) -> 
             http_client=client,
             engine=_FakeEngine(),
             index_fn=_index_fn,
+            config_loader=lambda _c, _p: _CONFIG,
         )
     assert code == 0
 
@@ -127,6 +145,13 @@ def _error_handler(request: httpx.Request) -> httpx.Response:
     # Fail the tarball download so run() hits its per-repo `logger.exception` path
     # (an httpx error carries the request, whose headers hold the Authorization token).
     parts = request.url.path.strip("/").split("/")
+    # Enumeration. MUST precede the len(parts) == 3 arm below: /orgs/acme/repos
+    # also has three segments and would otherwise be answered with repo metadata.
+    if len(parts) == 3 and parts[0] in {"orgs", "users"} and parts[2] == "repos":
+        return httpx.Response(
+            200,
+            json=[{"full_name": "acme/widgets", "fork": False, "archived": False, "size": 1}],
+        )
     if len(parts) == 3:
         return httpx.Response(200, json={"default_branch": "main"})
     if parts[3] == "commits":
@@ -140,7 +165,7 @@ def test_token_never_appears_on_error_path(caplog: pytest.LogCaptureFixture) -> 
     wc = _FakeWorkspaceClient()
     with httpx.Client(transport=httpx.MockTransport(_error_handler)) as client:
         code = run(
-            repos="acme/widgets",
+            config_path="/Workspace/x/config.yaml",
             scope="scope",
             key="key",
             endpoint="ep",
@@ -149,11 +174,45 @@ def test_token_never_appears_on_error_path(caplog: pytest.LogCaptureFixture) -> 
             http_client=client,
             engine=_FakeEngine(),
             index_fn=_index_fn,
+            config_loader=lambda _c, _p: _CONFIG,
         )
     assert code == 1  # the repo failed and was isolated
     assert SENTINEL not in caplog.text
     for record in caplog.records:
         assert SENTINEL not in record.getMessage()
+
+
+@pytest.mark.unit
+def test_token_never_appears_during_enumeration(caplog: pytest.LogCaptureFixture) -> None:
+    """AC 41: enumeration is a new HTTP path, and it carries the same header.
+
+    ``indexer.fetch`` logs ``X-RateLimit-Remaining`` per selector; a careless
+    edit that logged the whole request/headers instead would leak the token.
+    ``record.args`` is checked too — lazy %-formatting means a token passed as an
+    argument never reaches ``getMessage()`` unless the record is rendered.
+    """
+    caplog.set_level(logging.DEBUG)
+    wc = _FakeWorkspaceClient()
+    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+        code = run(
+            config_path="/Workspace/x/config.yaml",
+            scope="scope",
+            key="key",
+            endpoint="ep",
+            database="db",
+            workspace_client=wc,
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=_index_fn,
+            config_loader=lambda _c, _p: _ORG_CONFIG,
+        )
+    assert code == 0  # the org enumerated, and its one repo indexed
+
+    assert SENTINEL not in caplog.text
+    for record in caplog.records:
+        assert SENTINEL not in record.getMessage()
+        for arg in record.args or ():
+            assert SENTINEL not in str(arg)
 
 
 @pytest.mark.unit

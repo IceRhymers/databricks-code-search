@@ -20,6 +20,7 @@ dependencies = [
     "tree-sitter>=0.21",
     "tree-sitter-language-pack",
     "pydantic-settings",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -33,6 +34,7 @@ dev = [
     "mypy",
     "httpx",
     "asgi-lifespan",
+    "types-PyYAML",
 ]
 
 [tool.setuptools.packages.find]
