@@ -14,6 +14,8 @@ threads). Shapes are pinned to zoekt parity (``tests/unit/test_main.py``).
 
 from __future__ import annotations
 
+import base64
+import json
 import time
 from typing import Any
 
@@ -22,10 +24,106 @@ from sqlalchemy.engine import Engine
 
 from app.config import Settings
 from app.db.models import File, Repo
-from app.query.parser import QueryParseError
+from app.query.parser import And, Node, Or, QueryParseError, SymbolFilter, parse
 from app.search.errors import QueryTooBroadError
-from app.search.grep import grep_search
+from app.search.grep import FileCursor, grep_search
 from app.search.symbols import SymbolResult, symbol_search
+
+# --------------------------------------------------------------------- pagination cursor
+
+
+class _Unset:
+    """Sentinel type for the ``cursor`` param of :func:`search_code_payload` (issue #35 A2).
+
+    Mirrors :class:`app.search.grep._Unset`: distinguishes "no ``cursor`` argument at all"
+    (every pre-#35 caller, incl. the MCP ``search_code`` tool -- gets today's exact envelope,
+    no ``next_cursor`` key) from "``cursor`` explicitly supplied" (pagination mode, active even
+    when the value is ``None`` for page 1, which the webui API always does).
+    """
+
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+
+_UNSET = _Unset()
+
+_CURSOR_VERSION = 1
+
+
+class CursorError(ValueError):
+    """An invalid, garbled, or version-mismatched pagination cursor.
+
+    Raised by :func:`decode_cursor` and propagated UNCAUGHT out of :func:`search_code_payload`
+    -- never swallowed into a silent restart at page 1. The API layer (``webui/main.py``) maps
+    it to an HTTP 400, mirroring how it already maps ``QueryParseError``.
+    """
+
+
+def encode_cursor(file_cursor: FileCursor) -> str:
+    """Encode a :class:`FileCursor` as an opaque base64url cursor string.
+
+    Wire format: ``{"v": 1, "r": <repo_id>, "p": <path>, "s": <content_sha>}``, compact-JSON then base64url
+    WITHOUT padding (stripped ``=``; :func:`decode_cursor` re-pads before decoding). Opaque to
+    every caller by contract -- callers only ever round-trip it back through
+    :func:`decode_cursor`/``search_code_payload(cursor=...)``, never parse it themselves.
+    """
+    payload = json.dumps(
+        {
+            "v": _CURSOR_VERSION,
+            "r": file_cursor.repo_id,
+            "p": file_cursor.path,
+            "s": file_cursor.content_sha,
+        },
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str) -> FileCursor:
+    """Decode an opaque cursor string produced by :func:`encode_cursor`.
+
+    Raises :class:`CursorError` on anything malformed, garbled (tampered base64/JSON), or
+    version-mismatched -- never falls back to "treat as page 1", which would silently restart
+    a caller's pagination instead of surfacing the problem.
+    """
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception as error:
+        raise CursorError(f"malformed pagination cursor: {cursor!r}") from error
+    if not isinstance(data, dict) or data.get("v") != _CURSOR_VERSION:
+        raise CursorError(f"unsupported or missing cursor version: {cursor!r}")
+    repo_id, path, content_sha = data.get("r"), data.get("p"), data.get("s")
+    # bool is an int subclass; excluded explicitly so a tampered {"r": true, ...} is rejected
+    # rather than silently coerced to repo_id=1.
+    if (
+        not isinstance(repo_id, int)
+        or isinstance(repo_id, bool)
+        or not isinstance(path, str)
+        or not isinstance(content_sha, str)
+    ):
+        raise CursorError(f"malformed pagination cursor payload: {cursor!r}")
+    return FileCursor(repo_id=repo_id, path=path, content_sha=content_sha)
+
+
+def _query_has_symbol_atom(node: Node) -> bool:
+    """Structurally determine whether ``node`` carries a ``sym:`` atom, without a DB round trip.
+
+    Used on pagination continuation pages (issue #35 A2), where the symbol leg does not run
+    (folding is page-1-only -- see :func:`search_code_payload`): mirrors exactly what
+    ``not sym_result.no_symbol_atom`` would report from a live :func:`symbol_search` run (it
+    short-circuits on this identical structural check, ``symbols.py``'s ``if not patterns``),
+    so query-shape suppression (issue #31) stays consistent across every page WITHOUT reusing
+    the ``sym_result is None`` timeout sentinel -- that sentinel proves a different fact (a
+    timed-out DB hit), which is simply false when no DB hit was attempted at all.
+    """
+    match node:
+        case SymbolFilter():
+            return True
+        case And(children=children) | Or(children=children):
+            return any(_query_has_symbol_atom(child) for child in children)
+        case _:
+            return False
 
 
 def clamp_limit(limit: int, cfg: Settings) -> int:
@@ -54,6 +152,7 @@ def _search_envelope(
     query_parse_error: str | None,
     no_content_atom: bool,
     zero_width_only_atoms: bool,
+    next_cursor: str | None | _Unset = _UNSET,
 ) -> dict[str, Any]:
     """Build the pinned ``search_code`` envelope (zoekt fields + additive signal fields).
 
@@ -71,8 +170,14 @@ def _search_envelope(
         empty, so ``files`` comes only from grep -- which is empty by grep's invariant. QED
 
     Additive and permanent: agents may depend on these keys, so they can never be removed.
+
+    ``next_cursor`` (issue #35 A2) is OMITTED from the envelope entirely when left at its
+    sentinel default -- the legacy/non-pagination shape every pre-#35 caller still gets, pinned
+    by ``tests/unit/test_main.py::test_envelope_keys_are_pinned_shape_plus_exactly_two``. Pass
+    an explicit ``str | None`` only when ``search_code_payload`` was itself called with a
+    ``cursor`` kwarg (pagination mode).
     """
-    return {
+    envelope: dict[str, Any] = {
         "query": query,
         "file_count": file_count,
         "match_count": match_count,
@@ -86,9 +191,18 @@ def _search_envelope(
         "no_content_atom": no_content_atom,
         "zero_width_only_atoms": zero_width_only_atoms,
     }
+    if not isinstance(next_cursor, _Unset):
+        envelope["next_cursor"] = next_cursor
+    return envelope
 
 
-def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -> dict[str, Any]:
+def search_code_payload(
+    engine: Engine,
+    cfg: Settings,
+    query: str,
+    limit: int,
+    cursor: str | None | _Unset = _UNSET,
+) -> dict[str, Any]:
     """Run grep + symbol search and shape the merged result to the zoekt parity envelope.
 
     Content matches (grep) and ``sym:`` definition matches (:func:`symbol_search`) are folded
@@ -116,17 +230,42 @@ def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -
     that timed-out ``sym:`` query. Corollary: suppression can never swallow the filter-only
     case this issue exists to signal -- a query like ``file:.md`` has no ``sym:`` atom, so it
     short-circuits before any DB hit and can never reach ``sym_result is None``.
+
+    **Pagination mode (issue #35 A2).** Omitting ``cursor`` entirely (its sentinel default)
+    reproduces every byte of the pre-#35 envelope -- no ``next_cursor`` key, and a row-capped
+    grep result still sets ``truncated=True``/``"row_cap"``. Supplying ``cursor`` at all --
+    INCLUDING ``None`` for page 1, which the webui API always does -- switches to pagination
+    mode: the envelope always carries a ``next_cursor`` (``str | null``), and a grep row-cap
+    fill sets ``truncated=False`` + a non-null ``next_cursor`` instead of an error banner (see
+    :func:`app.search.grep.grep_search`'s own mode gating, which this mirrors exactly). A
+    garbled/tampered/version-mismatched ``cursor`` string raises :class:`CursorError`
+    UNCAUGHT -- never silently restarts at page 1.
+
+    The symbol leg (``sym:`` definitions) folds in ONLY on page 1 (pagination mode with
+    ``cursor=None``); continuation pages (``cursor`` is a real cursor) skip it entirely, so a
+    multi-page ``sym:X foo`` result never repeats a symbol. See :func:`_query_has_symbol_atom`
+    for how shape-flag suppression stays correct on those skipped pages.
     """
+    pagination_mode = not isinstance(cursor, _Unset)
+    decoded_cursor: FileCursor | None = None
+    if isinstance(cursor, str):
+        decoded_cursor = decode_cursor(cursor)  # CursorError propagates uncaught -- see docstring
+
+    # Built as kwargs (rather than always passing `cursor=`) so the legacy/bare call omits the
+    # kwarg entirely -- grep_search's OWN sentinel default is what makes that byte-identical to
+    # a pre-#35 call, mirroring the gating one level up.
+    grep_kwargs: dict[str, Any] = {
+        "row_limit": limit,
+        "max_content_bytes": cfg.max_content_bytes,
+        "statement_timeout_ms": cfg.statement_timeout_ms,
+    }
+    if pagination_mode:
+        grep_kwargs["cursor"] = decoded_cursor
+
     with engine.connect() as conn:
         t0 = time.monotonic()
         try:
-            result = grep_search(
-                conn,
-                query,
-                row_limit=limit,
-                max_content_bytes=cfg.max_content_bytes,
-                statement_timeout_ms=cfg.statement_timeout_ms,
-            )
+            result = grep_search(conn, query, **grep_kwargs)
         except QueryParseError as error:
             return _search_envelope(
                 query,
@@ -141,6 +280,7 @@ def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -
                 query_parse_error=str(error),
                 no_content_atom=False,
                 zero_width_only_atoms=False,
+                next_cursor=(None if pagination_mode else _UNSET),
             )
         except QueryTooBroadError:
             # The whole query is over the time budget; the symbol leg would time out too.
@@ -157,23 +297,32 @@ def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -
                 query_parse_error=None,
                 no_content_atom=False,
                 zero_width_only_atoms=False,
+                next_cursor=(None if pagination_mode else _UNSET),
             )
 
         # Symbol leg: sym: definitions the highlight-driven grep path cannot return. A timeout
         # here flags query_too_broad but still returns whatever grep found (partial, not a lie).
         # Note: a `sym:X foo` query runs the compiler candidate scan twice (once per leg), each
         # under its OWN statement_timeout -- so the DB-time bound is per-leg, not a single budget.
+        #
+        # Page-1-only (issue #35 A2): a continuation page (pagination_mode with a real
+        # decoded_cursor) skips the symbol leg so folded symbols never repeat across pages.
+        run_symbol_leg = not (pagination_mode and decoded_cursor is not None)
         query_too_broad = False
-        try:
-            sym_result: SymbolResult | None = symbol_search(
-                conn,
-                query,
-                row_limit=limit,
-                statement_timeout_ms=cfg.statement_timeout_ms,
-            )
-        except QueryTooBroadError:
+        sym_result: SymbolResult | None
+        if run_symbol_leg:
+            try:
+                sym_result = symbol_search(
+                    conn,
+                    query,
+                    row_limit=limit,
+                    statement_timeout_ms=cfg.statement_timeout_ms,
+                )
+            except QueryTooBroadError:
+                sym_result = None
+                query_too_broad = True
+        else:
             sym_result = None
-            query_too_broad = True
 
         duration_ns = int((time.monotonic() - t0) * 1e9)
 
@@ -243,9 +392,16 @@ def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -
             }
         )
 
-    # `is None or` is load-bearing: an unknown (timed-out) symbol leg counts as answering, and
-    # is provably always the sym-bearing shape. See the docstring.
-    sym_answers = sym_result is None or not sym_result.no_symbol_atom
+    if run_symbol_leg:
+        # `is None or` is load-bearing: an unknown (timed-out) symbol leg counts as answering,
+        # and is provably always the sym-bearing shape. See the docstring.
+        sym_answers = sym_result is None or not sym_result.no_symbol_atom
+    else:
+        # Deliberate page-2+ skip -- NOT the timeout sentinel. `sym_result` is None here too,
+        # but reusing the `is None` proof above would wrongly claim "answers" on every
+        # continuation page regardless of whether the query even has a sym: atom. Determine it
+        # structurally instead (see _query_has_symbol_atom).
+        sym_answers = _query_has_symbol_atom(parse(query))
     no_content_atom = result.no_content_atom and not sym_answers
     zero_width_only_atoms = result.zero_width_only_atoms and not sym_answers
 
@@ -254,6 +410,11 @@ def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -
     truncation_reason = result.truncation_reason or (
         sym_result.truncation_reason if sym_result is not None else None
     )
+    next_cursor_out: str | None | _Unset = _UNSET
+    if pagination_mode:
+        next_cursor_out = (
+            encode_cursor(result.next_cursor) if result.next_cursor is not None else None
+        )
     return _search_envelope(
         query,
         files=files,
@@ -267,6 +428,7 @@ def search_code_payload(engine: Engine, cfg: Settings, query: str, limit: int) -
         query_parse_error=None,
         no_content_atom=no_content_atom,
         zero_width_only_atoms=zero_width_only_atoms,
+        next_cursor=next_cursor_out,
     )
 
 

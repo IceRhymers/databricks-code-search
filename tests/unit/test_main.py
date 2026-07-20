@@ -20,7 +20,7 @@ from app import main, service
 from app.config import Settings
 from app.query.parser import QueryParseError
 from app.search.errors import QueryTooBroadError
-from app.search.grep import FileMatches, GrepResult, LineMatch
+from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
 from app.search.symbols import SymbolMatch, SymbolResult
 
 
@@ -99,6 +99,7 @@ def _grep(
     regex_incompatible: bool = False,
     no_content_atom: bool = False,
     zero_width_only_atoms: bool = False,
+    next_cursor: FileCursor | None = None,
 ) -> GrepResult:
     """Build a fake GrepResult, defaulting every field to its "nothing notable" value.
 
@@ -113,6 +114,7 @@ def _grep(
         regex_incompatible=regex_incompatible,
         no_content_atom=no_content_atom,
         zero_width_only_atoms=zero_width_only_atoms,
+        next_cursor=next_cursor,
     )
 
 

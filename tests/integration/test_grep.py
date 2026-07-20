@@ -24,7 +24,7 @@ from sqlalchemy import Connection, insert, text
 from app.db.client import create_db_engine
 from app.db.models import Base, File, Repo
 from app.search.errors import QueryTooBroadError
-from app.search.grep import GrepResult, grep_search
+from app.search.grep import FileCursor, GrepResult, grep_search
 from indexer.hashing import content_sha
 
 SCHEMA_PREFIX = "test_grep"
@@ -431,3 +431,125 @@ def test_grep_branch_filter_returns_only_named_branch_content(seeded: Seeded) ->
     assert multi.branches == ("feature",)
     (line,) = multi.line_matches
     assert "feature" in line.line_text
+# ------------------------------------------------------------- 11. keyset cursor pagination
+#
+# The `foo` query over the `seeded` corpus, ordered by (repo_id, path), is deterministically
+# ["src/handler.go", "src/util.go", "pkg/note.py"] (both acme files, then the beta file --
+# see test 1). These pin grep_search's own `cursor` kwarg: mode gating (bare call vs
+# `cursor=` supplied at all, including `None`), the row-value WHERE predicate, and the
+# last-CANDIDATE-consumed resume key (issue #35 A2).
+
+
+@pytest.mark.integration
+def test_pagination_bare_call_is_byte_identical_to_legacy(seeded: Seeded) -> None:
+    # No `cursor` kwarg at all: row-capped still means truncated=True/"row_cap", exactly the
+    # pre-#35 contract (see test_row_cap_truncates_result above) -- this pins the SAME
+    # assertion is unaffected by cursor's mere existence as a parameter.
+    result = grep_search(seeded.conn, "foo", row_limit=2)
+    assert result.truncated is True
+    assert result.truncation_reason == "row_cap"
+
+
+@pytest.mark.integration
+def test_pagination_page_one_cursor_none_matches_bare_call_files(seeded: Seeded) -> None:
+    # Page 1 (cursor=None) issues the exact query a bare call does -- same files, same order.
+    bare = grep_search(seeded.conn, "foo")
+    paginated = grep_search(seeded.conn, "foo", cursor=None)
+    assert _paths(bare) == _paths(paginated)
+
+
+@pytest.mark.integration
+def test_pagination_row_cap_page_sets_truncated_false_with_resumable_cursor(seeded: Seeded) -> None:
+    page1 = grep_search(seeded.conn, "foo", row_limit=2, cursor=None)
+    assert _paths(page1) == ["src/handler.go", "src/util.go"]
+    # Row-cap fill in pagination mode: NOT an error banner -- there is a next page.
+    assert page1.truncated is False
+    assert page1.truncation_reason is None
+    assert page1.next_cursor == FileCursor(seeded.acme_id, "src/util.go")
+
+
+@pytest.mark.integration
+def test_pagination_second_page_resumes_after_cursor_with_no_overlap(seeded: Seeded) -> None:
+    page1 = grep_search(seeded.conn, "foo", row_limit=2, cursor=None)
+    page2 = grep_search(seeded.conn, "foo", row_limit=2, cursor=page1.next_cursor)
+    assert _paths(page2) == ["pkg/note.py"]
+    assert set(_paths(page1)) & set(_paths(page2)) == set()  # disjoint
+
+
+@pytest.mark.integration
+def test_pagination_exhaustion_sets_next_cursor_none(seeded: Seeded) -> None:
+    page1 = grep_search(seeded.conn, "foo", row_limit=2, cursor=None)
+    page2 = grep_search(seeded.conn, "foo", row_limit=2, cursor=page1.next_cursor)
+    assert page2.truncated is False
+    assert page2.next_cursor is None  # the candidate set is smaller than row_limit -> exhausted
+
+
+@pytest.mark.integration
+def test_pagination_walk_covers_full_result_set_exactly_once(seeded: Seeded) -> None:
+    # One-candidate-at-a-time walk: exercises every page boundary (three files -> 4 requests,
+    # the last returning zero candidates) and pins the union/order/no-duplicates property.
+    all_paths: list[str] = []
+    cursor: FileCursor | None = None
+    for _ in range(10):  # generous bound; a stuck cursor would fail the assertion below, not hang
+        page = grep_search(seeded.conn, "foo", row_limit=1, cursor=cursor)
+        all_paths.extend(_paths(page))
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+    else:
+        pytest.fail("pagination did not exhaust within 10 pages")
+    assert all_paths == ["src/handler.go", "src/util.go", "pkg/note.py"]
+
+
+@pytest.mark.integration
+def test_pagination_byte_cap_trips_mid_page_cursor_resumes_after_last_consumed() -> None:
+    # A controlled two-file corpus (own throwaway schema, like the byte-cap tests above) so the
+    # cap trips on the SECOND file, not the first: proves next_cursor resumes after the last
+    # candidate actually scanned, not the one that tripped the cap (which is never re-emitted
+    # as "consumed" -- it gets re-fetched on the next page instead).
+    schema = _unique(SCHEMA_PREFIX)
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        conn.commit()
+        Base.metadata.create_all(bind=conn)
+        conn.commit()
+        repo_id = _insert_repo(conn, "solo/repo")
+        small_content = "foo " * 5
+        _insert_file(conn, repo_id, "a.txt", lang=None, content=small_content)
+        _insert_file(conn, repo_id, "b.txt", lang=None, content="foo " * 500)
+        conn.commit()
+
+        cap = len(small_content.encode("utf-8")) + 1  # fits a.txt, not a.txt + b.txt
+        result = grep_search(conn, "foo", max_content_bytes=cap, cursor=None)
+        assert _paths(result) == ["a.txt"]
+        assert result.truncated is True
+        assert result.truncation_reason == "byte_cap"
+        assert result.next_cursor == FileCursor(repo_id, "a.txt")
+    finally:
+        conn.rollback()
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_pagination_page_two_stable_under_interleaved_unrelated_repo_write(seeded: Seeded) -> None:
+    page1 = grep_search(seeded.conn, "foo", row_limit=2, cursor=None)
+    assert _paths(page1) == ["src/handler.go", "src/util.go"]
+
+    # A write to a brand-new (unrelated) repo, interleaved between page fetches. Its serial id
+    # is necessarily greater than every existing repo id, so it sorts AFTER acme/beta in
+    # (repo_id, path) order -- landing on page 2, never page 1.
+    gamma_id = _insert_repo(seeded.conn, "gamma/new")
+    _insert_file(seeded.conn, gamma_id, "z.go", lang="go", content="foo interleaved\n")
+    seeded.conn.commit()
+
+    page2 = grep_search(seeded.conn, "foo", row_limit=2, cursor=page1.next_cursor)
+    assert "src/handler.go" not in _paths(page2)
+    assert "src/util.go" not in _paths(page2)
+    assert _paths(page2) == ["pkg/note.py", "z.go"]

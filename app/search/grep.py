@@ -74,9 +74,9 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import assert_never
+from typing import NamedTuple, assert_never
 
-from sqlalchemy import Connection, select, text
+from sqlalchemy import Connection, select, text, tuple_
 from sqlalchemy.exc import OperationalError
 
 from app.db.models import File
@@ -104,6 +104,37 @@ DEFAULT_STATEMENT_TIMEOUT_MS = 5000
 
 
 # --------------------------------------------------------------------------- contract
+
+
+class _Unset:
+    """Sentinel type for ``grep_search``'s ``cursor`` param (issue #35 A2).
+
+    Distinguishes "no ``cursor`` argument at all" (a legacy/bare call -- byte-identical to
+    pre-pagination behavior) from "``cursor`` explicitly supplied" (pagination mode, active
+    even when the value is ``None`` for page 1). ``app/service.py`` mirrors this sentinel for
+    ``search_code_payload``'s own ``cursor`` param and threads a decoded :class:`FileCursor`
+    down to this one.
+    """
+
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+
+_UNSET = _Unset()
+
+
+class FileCursor(NamedTuple):
+    """The ``(repo_id, path, content_sha)`` of the last candidate consumed on a page.
+
+    This exactly matches the compiler's unique ``(repo_id, path, content_sha)`` ordering.
+    ``content_sha`` is load-bearing after multi-branch content dedup: one path can have more
+    than one indexed content version. The cursor tracks candidates consumed rather than emitted,
+    so files with no Python-side highlights cannot stall or repeat a later page.
+    """
+
+    repo_id: int
+    path: str
+    content_sha: str
 
 
 @dataclass(frozen=True)
@@ -155,11 +186,21 @@ class GrepResult:
     """
 
     files: tuple[FileMatches, ...]  # in (repo_id, path, content_sha) order
-    truncated: bool  # byte cap OR row cap tripped
+    truncated: bool  # byte cap OR (row cap tripped AND no cursor kwarg was supplied)
     truncation_reason: str | None  # "byte_cap" | "row_cap" | None
     regex_incompatible: bool  # some Regex atom failed Python re.compile
     no_content_atom: bool  # no content atom at all (filter-only query), nothing compiled away
     zero_width_only_atoms: bool  # content atoms present, every one provably zero-width
+    next_cursor: FileCursor | None  # last candidate consumed; None when this page exhausts them
+
+    # Pagination-mode note (issue #35 A2): when ``grep_search`` is called WITHOUT a ``cursor``
+    # kwarg (the legacy/bare form every pre-#35 caller uses), a row-capped result still sets
+    # ``truncated=True``/``truncation_reason="row_cap"`` exactly as before -- ``next_cursor`` is
+    # computed regardless but is meaningless to a caller that never asked for it. When ``cursor``
+    # IS supplied (even ``None``, i.e. page 1), a plain row-cap fill sets ``truncated=False`` +
+    # a non-null ``next_cursor`` instead (there is a next page, not an error); a byte-cap trip
+    # still sets ``truncated=True`` in BOTH modes (content was genuinely dropped mid-page) and
+    # may coexist with a non-null ``next_cursor`` resuming after the last row actually consumed.
 
 
 # ----------------------------------------------------------------------- pure helpers
@@ -334,6 +375,7 @@ def grep_search(
     row_limit: int = DEFAULT_ROW_LIMIT,
     max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    cursor: FileCursor | None | _Unset = _UNSET,
 ) -> GrepResult:
     """Run a zoekt-style ``query`` and return file-grouped, per-line matches.
 
@@ -348,16 +390,34 @@ def grep_search(
     scanned (a cap sets ``truncated`` + ``truncation_reason``). See the module docstring for
     the NOT-RE2 and uncapped-Python-CPU caveats. Raises ``QueryParseError`` on a malformed
     query (propagated from :func:`parse`).
+
+    ``cursor`` (issue #35 A2) activates pagination mode when supplied at all, INCLUDING
+    ``None`` (page 1): a plain row-cap fill then reports ``truncated=False`` plus a non-null
+    ``GrepResult.next_cursor`` instead of ``truncated=True`` -- there is a next page, not an
+    error. Omitting the kwarg entirely (every pre-#35 caller) is byte-identical to before: a
+    row-capped result still sets ``truncated=True``/``"row_cap"``. A non-``None`` cursor also
+    adds ``WHERE (files.repo_id, files.path) > (:r, :p)`` (row-value comparison) onto the
+    compiler's own ``ORDER BY (repo_id, path)``, so page 1 (``cursor=None``) issues the exact
+    query this function always has.
     """
+    pagination_mode = not isinstance(cursor, _Unset)
+    resume: FileCursor | None = None if isinstance(cursor, _Unset) else cursor
+
     node = parse(query)
     case_sensitive = resolve_case(query)
     patterns, regex_incompatible = _build_matchers(node, case_sensitive)
     no_content_atom = _no_content_atom(patterns, regex_incompatible)
     zero_width_only_atoms = _zero_width_only_atoms(patterns, regex_incompatible)
     stmt = compile_query(node, limit=row_limit, case_sensitive=case_sensitive)
+    if resume is not None:
+        stmt = stmt.where(
+            tuple_(File.repo_id, File.path, File.content_sha)
+            > (resume.repo_id, resume.path, resume.content_sha)
+        )
 
     files: list[FileMatches] = []
     byte_capped = False
+    last_candidate: FileCursor | None = None
 
     with conn.begin():
         # Injection-safe, transaction-local timeout: SET LOCAL cannot bind the value as a
@@ -377,15 +437,17 @@ def grep_search(
         row_capped = len(rows) >= row_limit
         ids = [row.id for row in rows]
         if not ids:
+            truncated = row_capped and not pagination_mode
             # Keyword form is required, not cosmetic: a future field must not silently
             # mis-bind into `truncated`.
             return GrepResult(
                 files=(),
-                truncated=row_capped,
-                truncation_reason="row_cap" if row_capped else None,
+                truncated=truncated,
+                truncation_reason="row_cap" if truncated else None,
                 regex_incompatible=regex_incompatible,
                 no_content_atom=no_content_atom,
                 zero_width_only_atoms=zero_width_only_atoms,
+                next_cursor=None,
             )
 
         content_stmt = (
@@ -414,6 +476,10 @@ def grep_search(
                     byte_capped = True
                     break
                 running += len(content.encode("utf-8"))
+                # Consumed (scanned), regardless of whether it produces a highlight below --
+                # the resume key tracks candidates CONSUMED, not candidates EMITTED. See
+                # FileCursor's docstring.
+                last_candidate = FileCursor(row.repo_id, row.path, row.content_sha)
                 line_matches = extract_line_matches(content, patterns)
                 if line_matches:
                     files.append(
@@ -431,8 +497,10 @@ def grep_search(
         finally:
             result.close()
 
-    truncated = byte_capped or row_capped
-    reason = "byte_cap" if byte_capped else ("row_cap" if row_capped else None)
+    truncated = byte_capped or (row_capped and not pagination_mode)
+    legacy_row_capped = row_capped and not pagination_mode
+    reason = "byte_cap" if byte_capped else ("row_cap" if legacy_row_capped else None)
+    next_cursor = last_candidate if (row_capped or byte_capped) else None
     return GrepResult(
         files=tuple(files),
         truncated=truncated,
@@ -440,4 +508,5 @@ def grep_search(
         regex_incompatible=regex_incompatible,
         no_content_atom=no_content_atom,
         zero_width_only_atoms=zero_width_only_atoms,
+        next_cursor=next_cursor,
     )
