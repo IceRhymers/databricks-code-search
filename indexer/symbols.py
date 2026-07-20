@@ -3,24 +3,35 @@
 Node-type -> symbol kind comes from :data:`indexer.languages.SYMBOL_KINDS`.
 Parsers are fetched once per language and cached (tree-sitter parser construction
 is relatively expensive; the indexer processes many files of the same language).
+
+The cache is **per-thread**, as insurance against an upstream change, not because
+a shared parser is known to corrupt trees. py-tree-sitter 0.26.0 does not release
+the GIL inside ``parse()``, and a shared parser measured clean under an 8-thread
+torture test — but the GIL-release primitives are linked into that C extension,
+so a future release wrapping ``parse()`` in ``Py_BEGIN_ALLOW_THREADS`` would make
+this a silent data race with no signal at the call site. See
+``.omc/plans/indexing-parallelism.md`` (Step 0) for the measurements.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from tree_sitter_language_pack import get_parser
 
 from indexer.languages import SYMBOL_KINDS, ExtractedSymbol, ParsedFile
 
-_PARSER_CACHE: dict[str, Any] = {}
+_PARSER_CACHE = threading.local()
 
 
 def _parser_for(lang: str) -> Any:
-    parser = _PARSER_CACHE.get(lang)
+    cache: dict[str, Any] | None = getattr(_PARSER_CACHE, "parsers", None)
+    if cache is None:
+        cache = _PARSER_CACHE.parsers = {}
+    parser = cache.get(lang)
     if parser is None:
-        parser = get_parser(lang)
-        _PARSER_CACHE[lang] = parser
+        parser = cache[lang] = get_parser(lang)
     return parser
 
 

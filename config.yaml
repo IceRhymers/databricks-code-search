@@ -6,6 +6,17 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 version: 1
 
+# How many repos the job indexes at once. Default 4, max 8, min 1.
+# This is a DISK bound, not a CPU one: each worker holds its 500 MB tarball and
+# its 2 GB extraction alive at the same time, so budget 2.5 GB per worker —
+# 10 GB at the default 4, 20 GB at the ceiling of 8.
+# Returns at the ceiling are sublinear: symbol extraction does not parallelise
+# (measured 0.95x on 4 threads), so you buy far less than 8x for a hard linear
+# 20 GB of disk. Raise it knowing that.
+# With semantic indexing enabled this is clamped to 2 — a MEMORY bound, since
+# embedding materialises a whole repo's chunks (~0.5-0.8 GB per worker).
+# index_concurrency: 4
+
 connections:
   - type: github
     # orgs / users / repos are UNIONED, then deduplicated by canonical org/repo.

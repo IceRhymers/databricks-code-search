@@ -30,8 +30,13 @@ from sqlalchemy import URL, event
 from sqlalchemy.engine import Engine, create_engine
 
 _DEFAULT_PORT = 5432
-# Small pool: the indexer and MCP server are low-concurrency workloads.
-_POOL_SIZE = 5
+# Default for the SERVER (app/main.py), which pairs it with a CapacityLimiter of
+# the same size. The indexer does NOT use this default: it derives its pool from
+# its worker count and passes pool_size= explicitly (see indexer/job.py), which
+# is the only shape that works in local mode too -- the local branch below
+# forwards **pool_kwargs raw and never reaches the setdefault at the bottom of
+# _create_lakebase_engine.
+_DEFAULT_POOL_SIZE = 5
 # 45 min, comfortably under the ~1h Lakebase OAuth token TTL.
 _POOL_RECYCLE = 2700
 
@@ -152,7 +157,7 @@ def _create_lakebase_engine(
 
     url = _lakebase_url(host=resolved_host, database=database_name, user=user_name)
 
-    pool_kwargs.setdefault("pool_size", _POOL_SIZE)
+    pool_kwargs.setdefault("pool_size", _DEFAULT_POOL_SIZE)
     pool_kwargs.setdefault("pool_pre_ping", True)
     pool_kwargs.setdefault("pool_recycle", _POOL_RECYCLE)
 

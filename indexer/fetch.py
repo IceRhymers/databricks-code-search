@@ -9,6 +9,7 @@ never drift from the ``head_sha`` stamped into ``files.commit``.
 from __future__ import annotations
 
 import logging
+import shutil
 import tarfile
 import time
 from dataclasses import dataclass
@@ -29,6 +30,11 @@ _GITHUB_HEADERS = {
 # gzip bomb or an oversized tracked blob can't exhaust local storage.
 MAX_TARBALL_BYTES = 500_000_000
 MAX_EXTRACTED_BYTES = 2_000_000_000
+
+# One worker's worst-case peak. The two caps SUM rather than max(): the compressed
+# tarball stays on disk inside the worker's TemporaryDirectory while the extracted
+# tree grows beside it, so both are alive simultaneously.
+REQUIRED_FREE_BYTES = MAX_TARBALL_BYTES + MAX_EXTRACTED_BYTES
 
 _PER_PAGE = 100
 
@@ -177,6 +183,29 @@ def resolve_ref(client: httpx.Client, org: str, repo: str) -> tuple[str, str]:
     commit.raise_for_status()
     head_sha = str(commit.json()["sha"])
     return default_branch, head_sha
+
+
+def assert_disk_headroom(path: Path, *, repo: str) -> None:
+    """Raise ``OSError`` unless ``path``'s filesystem can hold one worker's peak.
+
+    Called immediately before the download, on the directory actually being
+    written to, so the measurement is of the right filesystem. The error names
+    the repo AND the config key to lower, because the alternative -- an opaque
+    ENOSPC from somewhere inside tarfile -- says nothing about which of N
+    concurrent workers overcommitted the disk or what to do about it.
+
+    The caller is expected to let this fail ONE repo, not the run: with a
+    too-high ``index_concurrency`` the run then degrades to indexing whatever
+    fits rather than losing everything.
+    """
+    free = shutil.disk_usage(path).free
+    if free < REQUIRED_FREE_BYTES:
+        raise OSError(
+            f"insufficient local disk for {repo}: {free} bytes free at {path}, need "
+            f"{REQUIRED_FREE_BYTES} (a {MAX_TARBALL_BYTES}-byte tarball plus a "
+            f"{MAX_EXTRACTED_BYTES}-byte extraction, both alive at once); "
+            "lower index_concurrency in config.yaml"
+        )
 
 
 def download_tarball(client: httpx.Client, org: str, repo: str, ref: str, dest: Path) -> Path:

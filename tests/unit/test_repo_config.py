@@ -22,6 +22,7 @@ from indexer.repo_config import (
     ExcludeRules,
     GitHubConnection,
     RepoConfig,
+    effective_workers,
     load_config,
     normalize_repo,
     parse_config,
@@ -163,6 +164,62 @@ def test_schema_error_surfaces_as_config_error_through_parse_config() -> None:
     message = str(excinfo.value)
     assert "cfg" in message
     assert "version" in message
+
+
+# --- index_concurrency ------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_index_concurrency_defaults_to_four() -> None:
+    """Omitting the field is the supported shape -- v1 configs predate it."""
+    assert parse_config(_MINIMAL, source="cfg").index_concurrency == 4
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [1, 4, 8])
+def test_index_concurrency_accepts_in_range(value: int) -> None:
+    raw = b"version: 1\nconnections:\n  - type: github\n    users: [u]\nindex_concurrency: %d\n" % (
+        value
+    )
+
+    assert parse_config(raw, source="cfg").index_concurrency == value
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [0, 9])
+def test_index_concurrency_out_of_range_raises_config_error(value: int) -> None:
+    """Both bounds are enforced, and the failure reaches callers as ConfigError."""
+    raw = b"version: 1\nconnections:\n  - type: github\n    users: [u]\nindex_concurrency: %d\n" % (
+        value
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+
+    assert "index_concurrency" in str(excinfo.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("configured", "semantic_enabled", "expected"),
+    [
+        (8, False, 8),
+        (8, True, 2),
+        (4, True, 2),
+        (1, True, 1),  # the clamp is a ceiling, never a floor
+        (1, False, 1),
+    ],
+)
+def test_effective_workers(configured: int, semantic_enabled: bool, expected: int) -> None:
+    cfg = RepoConfig.model_validate(
+        {
+            "version": 1,
+            "connections": [{"type": "github", "users": ["u"]}],
+            "index_concurrency": configured,
+        }
+    )
+
+    assert effective_workers(cfg, semantic_enabled=semantic_enabled) == expected
 
 
 # --- parse failures (AC 7-8) ------------------------------------------------

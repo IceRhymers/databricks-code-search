@@ -38,6 +38,22 @@ def _unique(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def _core_head() -> str:
+    """The current core head, derived -- never hardcoded.
+
+    This assertion used to compare against the literal ``"0001"``, which was merely
+    the core head on the day the test was written. Adding ``0002`` broke it even
+    though the invariant it guards (the SEMANTIC head must never land in the core
+    table) still held perfectly. Deriving the head keeps the test about isolation
+    rather than about whichever revision happens to be newest.
+    """
+    from alembic.script import ScriptDirectory
+
+    config = Config("alembic.ini")
+    config.set_main_option("version_locations", _CORE_VERSIONS)
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
 def _core_config(conn: Connection, schema: str) -> Config:
     """A DEFAULT core Config: version_table unset -> Alembic's 'alembic_version'."""
     config = Config("alembic.ini")
@@ -94,7 +110,9 @@ def test_core_upgrade_head_survives_recorded_semantic_head(
     sem_heads = (
         conn.execute(text("SELECT version_num FROM alembic_version_semantic")).scalars().all()
     )
-    assert core_heads == ["0001"], f"semantic head leaked into core alembic_version: {core_heads}"
+    assert core_heads == [_core_head()], (
+        f"semantic head leaked into core alembic_version: {core_heads}"
+    )
     assert sem_heads == ["0002semtest"]
 
     # (c) The exact core call scripts/migrate.py makes must still succeed -- under the old

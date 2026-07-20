@@ -14,6 +14,19 @@ from datetime import datetime
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+INDEX_SEMANTICS_VERSION = 1
+"""Version of the indexing semantics the current code produces.
+
+Bump this whenever the *meaning* of what gets written changes: any change to
+``indexer/symbols.py``, to ``indexer/parse.py``'s chunking, or to
+``indexer/languages.py``'s extraction contract. A bump forces every repo to
+re-index once, because a repo's stored ``repos.index_semantics_version`` no
+longer matches. The CI tripwire enforces the bump obligation.
+
+Migrations must never import this constant -- see
+``app/alembic/versions/0002_index_semantics_version.py``.
+"""
+
 
 class Base(DeclarativeBase):
     pass
@@ -27,6 +40,8 @@ class Repo(Base):
     default_branch: Mapped[str | None] = mapped_column(Text)
     last_indexed_commit: Mapped[str | None] = mapped_column(Text)
     last_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # NULL means "provenance unknown -> always reindex".
+    index_semantics_version: Mapped[int | None] = mapped_column(Integer)
 
     files: Mapped[list[File]] = relationship(back_populates="repo", cascade="all, delete-orphan")
 

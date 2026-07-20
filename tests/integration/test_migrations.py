@@ -221,6 +221,70 @@ def test_downgrade_drops_tables_but_keeps_extension(migrated: Migrated) -> None:
 
 
 @pytest.mark.integration
+def test_0002_backfill_window_both_branches() -> None:
+    """Seed at 0001, upgrade to 0002: a recent row backfills, a stale row stays NULL.
+
+    Both branches must be asserted or the ``48 hours`` filter is untested -- an
+    unfiltered ``UPDATE`` would pass a recent-row-only assertion.
+    """
+    schema = _unique("test_backfill")
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.commit()
+
+        config = Config("alembic.ini")
+        config.attributes["connection"] = conn
+        config.attributes["version_table_schema"] = schema
+
+        command.upgrade(config, "0001")
+        conn.commit()
+
+        conn.execute(
+            text(
+                "INSERT INTO repos (name, last_indexed_at) VALUES "
+                "('recent', now()), "
+                "('stale', now() - interval '10 days'), "
+                "('never', NULL)"
+            )
+        )
+        conn.commit()
+
+        command.upgrade(config, "0002")
+        conn.commit()
+
+        versions = dict(conn.execute(text("SELECT name, index_semantics_version FROM repos")).all())
+        assert versions["recent"] == 1
+        assert versions["stale"] is None
+        assert versions["never"] is None
+
+        # downgrade returns repos to its exact 0001 shape.
+        command.downgrade(config, "0001")
+        conn.commit()
+        cols = (
+            conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = :s AND table_name = 'repos'"
+                ),
+                {"s": schema},
+            )
+            .scalars()
+            .all()
+        )
+        assert "index_semantics_version" not in cols
+    finally:
+        conn.rollback()
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+@pytest.mark.integration
 def test_no_vector_extension_installed(migrated: Migrated) -> None:
     count = migrated.conn.execute(
         text("SELECT count(*) FROM pg_extension WHERE extname = 'vector'")

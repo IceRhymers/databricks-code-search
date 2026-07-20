@@ -55,15 +55,40 @@ def test_app_grants_reference_both_idents_quoted() -> None:
 def test_job_grants_contains_write_privileges() -> None:
     joined = "\n".join(build_job_grants(SCHEMA, JOB_ROLE))
     assert "GRANT USAGE ON SCHEMA" in joined
-    assert "GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA" in joined
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA" in joined
     assert "GRANT USAGE ON ALL SEQUENCES IN SCHEMA" in joined
     assert "ALTER DEFAULT PRIVILEGES" in joined
-    assert "GRANT INSERT, UPDATE, DELETE ON TABLES" in joined
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES" in joined
     assert "GRANT USAGE ON SEQUENCES" in joined
 
 
 @pytest.mark.unit
+def test_job_grants_include_select_on_existing_and_future_tables() -> None:
+    """The job reads before it writes.
+
+    ``indexer.job._read_stamps`` issues a plain ``SELECT`` on ``repos`` before
+    fan-out, so a job role without ``SELECT`` fails the whole run at its first
+    query. Both halves are asserted: the immediate grant covers tables that
+    exist at grant time, and ``ALTER DEFAULT PRIVILEGES`` covers tables a later
+    migration creates -- without it a new table silently reintroduces the gap.
+    """
+    stmts = build_job_grants(SCHEMA, JOB_ROLE)
+    assert any(
+        s.startswith("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA") for s in stmts
+    ), "job role must receive SELECT on the tables that exist now"
+    assert any(
+        "ALTER DEFAULT PRIVILEGES" in s and "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES" in s
+        for s in stmts
+    ), "job role must receive SELECT on tables created by future migrations"
+
+
+@pytest.mark.unit
 def test_job_grants_has_no_ddl() -> None:
+    """The forbidden token is ``ALTER TABLE``, not bare ``ALTER``.
+
+    ``ALTER DEFAULT PRIVILEGES`` is a grant-management statement, not DDL on a
+    table, so it is deliberately permitted by this list.
+    """
     joined = "\n".join(build_job_grants(SCHEMA, JOB_ROLE)).upper()
     for forbidden in ("CREATE", "ALTER TABLE", "OWNER", "DROP", "TRUNCATE"):
         assert forbidden not in joined, f"job role must never receive {forbidden}"

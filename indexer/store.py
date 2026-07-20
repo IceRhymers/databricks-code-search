@@ -15,8 +15,20 @@ from collections.abc import Callable, Iterable
 from sqlalchemy import Connection, delete, func, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.db.models import File, Repo, Symbol
+from app.db.models import INDEX_SEMANTICS_VERSION, File, Repo, Symbol
 from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+
+
+class StaleIndexError(RuntimeError):
+    """The ``repos`` row changed between this transaction's first and last statement.
+
+    An invariant assertion, not an expected failure path: under the current
+    single-run job model no second writer for one repo can exist. It buys a loud
+    failure the day that property is removed (``for_each_task`` sharding, or a
+    raised ``max_concurrent_runs``). It protects the *stamp* only -- it does not
+    detect a refactor that moves the ``repos`` upsert out of statement 1.
+    """
+
 
 # Called as chunk_writer(conn, repo_id, file_id, pf) once per file, inside the
 # same conn.begin() as the rest of that file's row (issue #14 Phase 2). Vectors
@@ -44,7 +56,9 @@ def index_repo(
        the rest of that file's row.
     3. ``DELETE FROM files WHERE repo_id=:r AND commit<>:head_sha`` (cascade drops
        orphan symbols and, in production, orphan chunks) -> ``swept``.
-    4. Stamp ``repos.last_indexed_commit`` / ``last_indexed_at``.
+    4. Stamp ``repos.last_indexed_commit`` / ``index_semantics_version`` /
+       ``last_indexed_at``, conditional on the row still matching the baseline
+       read by step 1 (raises :class:`StaleIndexError` otherwise).
 
     ``items`` may be a lazy generator; it is consumed inside the open transaction
     so memory stays bounded. ``chunk_writer`` defaults to ``None``, which makes
@@ -56,6 +70,13 @@ def index_repo(
     symbol_count = 0
 
     with conn.begin():
+        # MUST REMAIN STATEMENT 1 of this transaction. It takes the ``repos`` row
+        # lock that is held to commit, and because ``last_indexed_commit`` /
+        # ``index_semantics_version`` are absent from ``set_``, its RETURNING
+        # yields their pre-update values -- the compare-and-set baseline, read
+        # under the lock with no extra round trip and no TOCTOU window. Moving
+        # this statement later silently invalidates the baseline; nothing below
+        # will catch that.
         repo_stmt = (
             pg_insert(Repo)
             .values(name=name, default_branch=default_branch)
@@ -63,9 +84,10 @@ def index_repo(
                 index_elements=[Repo.name],
                 set_={"default_branch": default_branch},
             )
-            .returning(Repo.id)
+            .returning(Repo.id, Repo.last_indexed_commit, Repo.index_semantics_version)
         )
-        repo_id = conn.execute(repo_stmt).scalar_one()
+        # A brand-new repo yields (id, None, None); IS NOT DISTINCT FROM matches.
+        repo_id, baseline_commit, baseline_version = conn.execute(repo_stmt).one()
 
         for pf, syms in items:
             file_stmt = (
@@ -116,10 +138,49 @@ def index_repo(
         sweep = conn.execute(delete(File).where(File.repo_id == repo_id, File.commit != head_sha))
         swept = sweep.rowcount
 
-        conn.execute(
-            update(Repo)
-            .where(Repo.id == repo_id)
-            .values(last_indexed_commit=head_sha, last_indexed_at=func.now())
+        _stamp_repo(
+            conn,
+            name=name,
+            repo_id=repo_id,
+            head_sha=head_sha,
+            baseline_commit=baseline_commit,
+            baseline_version=baseline_version,
         )
 
     return IndexCounts(files=file_count, symbols=symbol_count, swept=swept)
+
+
+def _stamp_repo(
+    conn: Connection,
+    *,
+    name: str,
+    repo_id: int,
+    head_sha: str,
+    baseline_commit: str | None,
+    baseline_version: int | None,
+) -> None:
+    """Compare-and-set the ``repos`` stamp against the statement-1 baseline.
+
+    Raises :class:`StaleIndexError` if the row no longer matches the baseline,
+    which propagates out of ``index_repo``'s ``conn.begin()`` and rolls the whole
+    repo back rather than regressing the index.
+    """
+    result = conn.execute(
+        update(Repo)
+        .where(
+            Repo.id == repo_id,
+            Repo.last_indexed_commit.is_not_distinct_from(baseline_commit),
+            Repo.index_semantics_version.is_not_distinct_from(baseline_version),
+        )
+        .values(
+            last_indexed_commit=head_sha,
+            index_semantics_version=INDEX_SEMANTICS_VERSION,
+            last_indexed_at=func.now(),
+        )
+    )
+    if result.rowcount != 1:
+        raise StaleIndexError(
+            f"{name}: repos row changed since this transaction's first statement "
+            f"(baseline {baseline_commit!r}/{baseline_version!r}); aborting rather "
+            "than regressing the index"
+        )

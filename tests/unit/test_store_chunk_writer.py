@@ -17,23 +17,28 @@ import pytest
 from sqlalchemy import Delete, Insert, Update
 
 from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
-from indexer.store import index_repo
+from indexer.store import StaleIndexError, index_repo
 
 
 class _FakeResult:
-    def __init__(self, *, scalar: Any = None, rowcount: int = 0) -> None:
+    def __init__(self, *, scalar: Any = None, rowcount: int = 0, row: Any = None) -> None:
         self._scalar = scalar
+        self._row = row
         self.rowcount = rowcount
 
     def scalar_one(self) -> Any:
         return self._scalar
 
+    def one(self) -> Any:
+        return self._row
+
 
 class _FakeConn:
     """Just enough of sqlalchemy.Connection for index_repo's fixed statement shape."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, stamp_rowcount: int = 1) -> None:
         self._next_file_id = 1
+        self._stamp_rowcount = stamp_rowcount
 
     def begin(self) -> Any:
         return contextlib.nullcontext()
@@ -41,7 +46,8 @@ class _FakeConn:
     def execute(self, stmt: Any, params: Any = None) -> _FakeResult:
         table = stmt.table.name
         if isinstance(stmt, Insert) and table == "repos":
-            return _FakeResult(scalar=1)
+            # (id, last_indexed_commit, index_semantics_version) -- new-repo shape.
+            return _FakeResult(row=(1, None, None))
         if isinstance(stmt, Insert) and table == "files":
             file_id = self._next_file_id
             self._next_file_id += 1
@@ -53,7 +59,7 @@ class _FakeConn:
         if isinstance(stmt, Delete) and table == "files":
             return _FakeResult(rowcount=0)
         if isinstance(stmt, Update) and table == "repos":
-            return _FakeResult()
+            return _FakeResult(rowcount=self._stamp_rowcount)
         raise AssertionError(f"unexpected statement against {table!r}: {stmt}")
 
 
@@ -106,3 +112,18 @@ def test_no_chunk_writer_means_no_extra_calls() -> None:
         items=items,
         chunk_writer=None,
     )
+
+
+@pytest.mark.unit
+def test_stamp_matching_no_row_raises_stale_index_error() -> None:
+    # The CAS UPDATE matching zero rows means the repos row moved out from under
+    # the statement-1 baseline; index_repo must abort rather than stamp.
+    items = [(_pf("a.py", "x = 1\n"), [])]
+    with pytest.raises(StaleIndexError, match="acme/widgets"):
+        index_repo(
+            _FakeConn(stamp_rowcount=0),
+            name="acme/widgets",
+            default_branch="main",
+            head_sha="sha1",
+            items=items,
+        )

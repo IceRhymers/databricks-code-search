@@ -59,7 +59,9 @@ from app.search.symbols import SymbolResult, symbol_search
 
 logger = logging.getLogger("app.tools")
 
-# Sized to app.db.client._POOL_SIZE (5): the limiter bounds in-flight blocking calls to the
+# Sized to app.db.client._DEFAULT_POOL_SIZE (5) — the SERVER default, which this process takes
+# because it passes no pool_size of its own. It deliberately does NOT track the indexer, which
+# derives its pool from index_concurrency. The limiter bounds in-flight blocking calls to the
 # single process-wide connection pool, so a 6th concurrent call waits (bounded queueing)
 # rather than oversubscribing the pool and hitting pool_timeout. The engine below is also
 # module-global, so the limiter guards exactly the one pool it is sized to.

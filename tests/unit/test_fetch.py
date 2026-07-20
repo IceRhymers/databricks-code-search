@@ -15,6 +15,7 @@ import indexer.fetch as fetch
 from indexer.fetch import (
     RateLimitError,
     RepoMeta,
+    assert_disk_headroom,
     download_tarball,
     extract_tarball,
     list_org_repos,
@@ -392,3 +393,58 @@ def test_size_cap_error_names_overage_and_config_key(
     assert "exclude.size_mb" in message
     # The stream aborts on the first chunk, so the overage is that chunk minus the cap.
     assert f"by {len(CLEAN_TARBALL) - 4} bytes" in message
+
+
+# --- disk headroom guard ----------------------------------------------------
+
+
+@pytest.mark.unit
+def test_required_free_bytes_sums_both_caps() -> None:
+    """Both caps are alive at once, so they SUM.
+
+    The tarball stays on disk inside the worker's TemporaryDirectory while the
+    extracted tree grows beside it; a max() here would under-reserve by 500 MB
+    per worker and silently reintroduce the failure the guard exists to prevent.
+    """
+    assert fetch.REQUIRED_FREE_BYTES == fetch.MAX_TARBALL_BYTES + fetch.MAX_EXTRACTED_BYTES
+
+
+@pytest.mark.unit
+def test_assert_disk_headroom_passes_when_space_is_sufficient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        fetch.shutil, "disk_usage", lambda _p: _Usage(free=fetch.REQUIRED_FREE_BYTES)
+    )
+    # Exactly at the threshold must pass: the comparison is `<`, not `<=`.
+    assert assert_disk_headroom(tmp_path, repo=f"{ORG}/{REPO}") is None
+
+
+@pytest.mark.unit
+def test_assert_disk_headroom_error_names_the_repo_and_the_config_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the guard is diagnosability.
+
+    An opaque ENOSPC from inside tarfile says neither which of N concurrent
+    workers overcommitted the disk nor what to change, so both are asserted.
+    """
+    monkeypatch.setattr(
+        fetch.shutil, "disk_usage", lambda _p: _Usage(free=fetch.REQUIRED_FREE_BYTES - 1)
+    )
+    with pytest.raises(OSError) as excinfo:
+        assert_disk_headroom(tmp_path, repo=f"{ORG}/{REPO}")
+
+    message = str(excinfo.value)
+    assert f"{ORG}/{REPO}" in message
+    assert "index_concurrency" in message
+    assert str(fetch.REQUIRED_FREE_BYTES) in message
+
+
+class _Usage:
+    """Stand-in for ``shutil.disk_usage``'s named tuple (only ``free`` is read)."""
+
+    def __init__(self, *, free: int) -> None:
+        self.total = 100_000_000_000
+        self.used = self.total - free
+        self.free = free

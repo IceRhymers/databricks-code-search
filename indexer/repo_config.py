@@ -111,10 +111,40 @@ Connection = Annotated[GitHubConnection, Field(discriminator="type")]
 
 
 class RepoConfig(BaseModel):
-    """The parsed ``config.yaml`` document."""
+    """The parsed ``config.yaml`` document.
+
+    ``index_concurrency`` is how many repos the indexing job works on at once.
+    **The default of 4 is a disk bound, not a CPU one.** Each in-flight worker
+    holds ``MAX_TARBALL_BYTES`` (500 MB) *and* ``MAX_EXTRACTED_BYTES`` (2 GB)
+    alive simultaneously -- the downloaded tarball stays inside the worker's
+    ``TemporaryDirectory`` while the extraction runs beside it, so peak usage is
+    2.5 GB per worker: 10 GB at the default 4, 20 GB at the ceiling of 8.
+
+    **Returns at the ceiling are sublinear.** Symbol extraction does not
+    parallelise (measured at 0.95x on 4 threads), so Amdahl's law caps the
+    speedup well below 8x while the disk cost stays a hard linear 20 GB. Raise
+    it only knowing that trade.
+
+    When semantic indexing is on, the effective worker count is clamped to 2 by
+    :func:`effective_workers`. That clamp is a **memory** bound, not a CPU one:
+    embedding materialises a whole repo's chunks in memory (~0.5-0.8 GB per
+    worker; 260 MB of vectors alone at the 8000-chunk ceiling).
+    """
 
     version: Literal[1]
     connections: list[Connection] = Field(min_length=1)
+    index_concurrency: int = Field(default=4, ge=1, le=8)
+
+
+def effective_workers(config: RepoConfig, *, semantic_enabled: bool) -> int:
+    """Worker-pool size for a run, applying the semantic memory clamp.
+
+    Takes a plain ``bool`` rather than ``Settings`` so this module keeps its
+    import-light property (see the module docstring).
+    """
+    if semantic_enabled:
+        return min(config.index_concurrency, 2)
+    return config.index_concurrency
 
 
 class ConfigError(Exception):

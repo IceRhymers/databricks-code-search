@@ -14,9 +14,9 @@ import pytest
 from sqlalchemy import Connection, text
 
 from app.db.client import create_db_engine
-from app.db.models import Base
+from app.db.models import INDEX_SEMANTICS_VERSION, Base
 from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
-from indexer.store import index_repo
+from indexer.store import StaleIndexError, _stamp_repo, index_repo
 
 SCHEMA = "test_store"
 
@@ -161,6 +161,97 @@ def test_sweep_is_repo_scoped(conn: Connection) -> None:
         b_files_before
     )
     assert _count(conn, "files", "commit = 'b_first'") == 1  # B's row unchanged
+
+
+@pytest.mark.integration
+def test_stamp_writes_semantics_version(conn: Connection) -> None:
+    index_repo(
+        conn,
+        name="acme/widgets",
+        default_branch="main",
+        head_sha="sha_first",
+        items=_items(MAIN, UTIL),
+    )
+    conn.rollback()
+    # Second run at a new SHA succeeds against its own in-transaction baseline.
+    index_repo(
+        conn, name="acme/widgets", default_branch="main", head_sha="sha_second", items=_items(MAIN)
+    )
+
+    stamp = conn.execute(
+        text(
+            "SELECT last_indexed_commit, index_semantics_version FROM repos "
+            "WHERE name = 'acme/widgets'"
+        )
+    ).one()
+    assert stamp == ("sha_second", INDEX_SEMANTICS_VERSION)
+
+
+@pytest.mark.integration
+def test_legacy_null_semantics_version_is_rewritten(conn: Connection) -> None:
+    index_repo(
+        conn,
+        name="acme/widgets",
+        default_branch="main",
+        head_sha="sha_first",
+        items=_items(MAIN),
+    )
+    conn.execute(text("UPDATE repos SET index_semantics_version = NULL"))
+    conn.commit()
+
+    index_repo(
+        conn, name="acme/widgets", default_branch="main", head_sha="sha_second", items=_items(MAIN)
+    )
+    stamp = conn.execute(
+        text(
+            "SELECT last_indexed_commit, index_semantics_version FROM repos "
+            "WHERE name = 'acme/widgets'"
+        )
+    ).one()
+    assert stamp == ("sha_second", INDEX_SEMANTICS_VERSION)
+
+
+@pytest.mark.integration
+def test_cas_predicate_rejects_wrong_baseline(conn: Connection) -> None:
+    # Direct test of the compare-and-set UPDATE predicate: index normally, then
+    # run the stamp with a deliberately wrong baseline. Zero rows match -> raise.
+    index_repo(
+        conn,
+        name="acme/widgets",
+        default_branch="main",
+        head_sha="sha_a",
+        items=_items(MAIN, UTIL),
+    )
+    files_before = _count(conn, "files")
+    symbols_before = _count(conn, "symbols")
+    repo_id = int(
+        conn.execute(text("SELECT id FROM repos WHERE name = 'acme/widgets'")).scalar_one()
+    )
+    conn.rollback()
+
+    # The raise propagates out of conn.begin(), which rolls the transaction back
+    # exactly as it would inside index_repo.
+    with pytest.raises(StaleIndexError, match="wrong_sha"), conn.begin():
+        conn.execute(text("DELETE FROM files WHERE path = 'util.py'"))
+        _stamp_repo(
+            conn,
+            name="acme/widgets",
+            repo_id=repo_id,
+            head_sha="sha_b",
+            baseline_commit="wrong_sha",
+            baseline_version=INDEX_SEMANTICS_VERSION,
+        )
+
+    # The aborted transaction left the index exactly as the sha_a run wrote it.
+    assert _count(conn, "files") == files_before
+    assert _count(conn, "symbols") == symbols_before
+    assert _count(conn, "files", "commit <> 'sha_a'") == 0
+    assert (
+        conn.execute(
+            text("SELECT last_indexed_commit FROM repos WHERE name = 'acme/widgets'")
+        ).scalar_one()
+        == "sha_a"
+    )
 
 
 @pytest.mark.integration

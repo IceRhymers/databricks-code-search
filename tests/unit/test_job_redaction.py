@@ -84,12 +84,22 @@ def _handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404)
 
 
+class _FakeResult:
+    def all(self) -> list[Any]:
+        return []
+
+
 class _FakeConn:
     def __enter__(self) -> _FakeConn:
         return self
 
     def __exit__(self, *exc: Any) -> bool:
         return False
+
+    def execute(self, stmt: Any) -> _FakeResult:
+        """Answers run()'s pre-fan-out stamp SELECT. No rows = nothing skipped,
+        which keeps every test here on the full fetch->index path."""
+        return _FakeResult()
 
 
 class _FakeEngine:
