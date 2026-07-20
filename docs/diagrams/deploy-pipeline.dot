@@ -1,35 +1,46 @@
-// The 8 steps of `scripts/deploy.sh full`, and why 4 and 6 are split.
+// The 11 steps of `scripts/deploy.sh full` (issue #35 added steps 2, 8, 9 for the second
+// app, webui), and why 5/7 and 8/9 are each split.
 // Regenerate with `make diagrams` (do not hand-edit the PNG).
 digraph deploy {
   rankdir=TB;
   bgcolor="white";
   nodesep=0.35;
-  ranksep=0.32;
+  ranksep=0.28;
 
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
         color="#4a5568", fillcolor="#f7fafc", fontcolor="#1a202c", margin="0.22,0.12"];
   edge [fontname="Helvetica", fontsize=9, color="#4a5568", fontcolor="#2d3748"];
 
   s1 [label="1  validate bundle\n(prod: require JOB_RUN_AS_SP)"];
-  s2 [label="2  bundle deploy\nLakebase · catalog · secret scope · job · app"];
-  s3 [label="3  seed GITHUB_TOKEN\nskipped with a warning if unset"];
-  s4 [label="4  migrate schema\nas deploying identity, NO grants",
+  s2 [label="2  make webui-wheel\nstage webui/wheels/app.whl"];
+  s3 [label="3  bundle deploy\nLakebase · catalog · secret scope · job · both apps"];
+  s4 [label="4  seed GITHUB_TOKEN\nskipped with a warning if unset"];
+  s5 [label="5  migrate schema\nas deploying identity, NO grants",
       fillcolor="#fffaf0", color="#c05621"];
-  s5 [label="5  bundle run — activate app\npoll for ACTIVE (15s × 10)",
+  s6 [label="6  bundle run code_search\npoll for ACTIVE (15s × 10)",
       fillcolor="#fffaf0", color="#c05621"];
-  s6 [label="6  apply grants\napp SP read · job SP write (prod)",
+  s7 [label="7  apply grants — code_search\napp SP read · job SP write (prod)",
       fillcolor="#fffaf0", color="#c05621"];
-  s7 [label="7  index\nalways runs; failure warns, does not abort"];
-  s8 [label="8  print app URL\n+ OAuth app-connection reminder"];
+  s8 [label="8  bundle run webui\npoll for ACTIVE (15s × 10)",
+      fillcolor="#fffaf0", color="#c05621"];
+  s9 [label="9  apply grants — webui\napp SP read only",
+      fillcolor="#fffaf0", color="#c05621"];
+  s10 [label="10  index\nalways runs; failure warns, does not abort"];
+  s11 [label="11  print both app URLs\n+ OAuth app-connection reminder (MCP app only)"];
 
-  fallback [label="first-activation fallback\ndatabricks apps deploy --source-code-path\nthen re-run + re-probe",
+  fallback1 [label="first-activation fallback (code_search)\napps deploy --source-code-path\nthen re-run + re-probe",
+            shape=note, fillcolor="#fff5f5", color="#c53030", fontsize=10];
+  fallback2 [label="first-activation fallback (webui)\napps deploy --source-code-path\nthen re-run + re-probe",
             shape=note, fillcolor="#fff5f5", color="#c53030", fontsize=10];
 
-  // weight pins steps 1-8 to a straight spine so the fallback branch pulls off to
+  // weight pins steps 1-11 to a straight spine so the fallback branches pull off to
   // the side instead of bending the main path.
-  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> s7 -> s8 [weight=100];
-  s5 -> fallback [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
-  fallback -> s6 [style=dashed, color="#c53030"];
+  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> s7 -> s8 -> s9 -> s10 -> s11 [weight=100];
+  s6 -> fallback1 [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
+  fallback1 -> s7 [style=dashed, color="#c53030"];
+  s8 -> fallback2 [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
+  fallback2 -> s9 [style=dashed, color="#c53030"];
 
-  { rank=same; s5; fallback; }
+  { rank=same; s6; fallback1; }
+  { rank=same; s8; fallback2; }
 }

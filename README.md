@@ -140,6 +140,23 @@ Two HTTP routes sit alongside the MCP mount: `GET /health` is liveness and never
 the database, and `GET /ready` runs `SELECT 1 FROM repos LIMIT 1` so that a role holding
 connect-but-not-select fails as 503 instead of shipping green.
 
+## Web UI
+
+`webui` (issue #35) is a second Databricks App, deployed and activated by the same
+`make deploy` pipeline as the MCP server. It is a browser-facing search UI: a FastAPI
+backend that imports the same `app.*` search stack in-process (own engine singleton, same
+`/api/search` → `search_code_payload` path plus keyset-cursor pagination for "load more"),
+and a React/Vite frontend with a committed production build
+(`webui/frontend/dist/` — no Node needed to deploy or run CI). It reads the same Lakebase
+corpus as the MCP app, read-only, via its own service principal and its own least-privilege
+grant.
+
+Auth is plain workspace `CAN_USE` on the app — no OAuth app connection, no MCP client setup;
+open the app URL in a browser. See
+[`docs/runbooks/webui.md`](docs/runbooks/webui.md) for the app URL lookup, the grants detail,
+rebuilding the frontend (`make webui-build`), and the wheel-packaging mechanism that lets
+webui import `app.*` without duplicating it.
+
 ## Out-of-band prerequisites
 
 Four things the bundle cannot create. The first three gate a working MCP endpoint; the
@@ -198,26 +215,32 @@ For prod, the job run-as SP is mandatory:
 JOB_RUN_AS_SP=<client-id> make deploy-prod
 ```
 
-`make deploy` runs `scripts/deploy.sh full`:
+`make deploy` runs `scripts/deploy.sh full`, which deploys and activates **both** Databricks
+Apps in the bundle — the MCP server (`code_search`) and the [web UI](#web-ui) (`webui`):
 
-<img src="docs/diagrams/deploy-pipeline.png" alt="The eight steps of deploy.sh full, with the migrate and grant steps split around app activation" width="720">
+<img src="docs/diagrams/deploy-pipeline.png" alt="The eleven steps of deploy.sh full, with the migrate and grant steps split around each app's activation" width="720">
 
 1. **Validate** the bundle; for prod, assert `JOB_RUN_AS_SP` is non-empty.
-2. **Deploy** resources — Lakebase project, UC catalog, secret scope, job, app. Compute is
-   not started yet.
-3. **Seed the GitHub secret** if it is missing and `GITHUB_TOKEN` is set; otherwise warn
+2. **Build the webui wheel** (`make webui-wheel`) so webui's source sync ships a fresh
+   `app.*` import.
+3. **Deploy** resources — Lakebase project, UC catalog, secret scope, job, both apps.
+   Compute is not started yet.
+4. **Seed the GitHub secret** if it is missing and `GITHUB_TOKEN` is set; otherwise warn
    and continue.
-4. **Migrate** the schema as the deploying identity, *without* grants.
-5. **Activate** the app via `bundle run`, then poll for `ACTIVE` (15s × 10).
-6. **Apply grants** — read-only for the app SP, write for the job SP on prod.
-7. **Index** — always runs; a failure warns without aborting the deploy.
-8. **Print the app URL** and the reminder about the OAuth app connection.
+5. **Migrate** the schema as the deploying identity, *without* grants.
+6. **Activate the MCP app** via `bundle run`, then poll for `ACTIVE` (15s × 10).
+7. **Apply grants — MCP app** — read-only for its app SP, write for the job SP on prod.
+8. **Activate webui** via `bundle run`, then poll for `ACTIVE` (15s × 10).
+9. **Apply grants — webui** — read-only for its app SP.
+10. **Index** — always runs; a failure warns without aborting the deploy.
+11. **Print both app URLs** and the reminder about the MCP app's OAuth app connection.
 
-Steps 4 and 6 are split because the app service principal's Postgres role does not exist
-until the app first activates in step 5. Granting before activation cannot work, so the
-grant pass runs after and retries (5 × 10s) to absorb role-visibility lag.
+Steps 5/7 and 8/9 are split the same way for each app: a service principal's Postgres role
+does not exist until that app first activates, so granting before activation cannot work —
+each grant pass runs after its app's activation step and retries (5 × 10s) to absorb
+role-visibility lag.
 
-If step 5 never reaches `ACTIVE`, the script falls back to
+If step 6 or step 8 never reaches `ACTIVE`, the script falls back to
 `databricks apps deploy <app> --source-code-path`, re-runs `bundle run`, and re-probes. The
 script calls this the first-activation fallback.
 
@@ -432,7 +455,14 @@ Requires Python 3.12+ and `uv`.
 make install
 make test                 # unit + observability; no external dependencies
 make test-integration     # needs Postgres
-make lint                 # ruff check + ruff format --check + mypy
+make lint                 # ruff check + ruff format --check + mypy (incl. webui)
+```
+
+For the webui frontend specifically (requires Node):
+
+```bash
+make webui-build           # npm ci + vite build -> webui/frontend/dist/ (commit the result)
+make webui-test            # vitest; advisory, not a repo gate
 ```
 
 The integration suite needs a Postgres with `pg_trgm`; CI uses `pgvector/pgvector:pg16`
@@ -459,6 +489,8 @@ Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
   on semantic search
 - [`docs/runbooks/ci-lakebase.md`](docs/runbooks/ci-lakebase.md) — running CI against a
   real Lakebase engine
+- [`docs/runbooks/webui.md`](docs/runbooks/webui.md) — the web UI app: auth, grants,
+  rebuilding the frontend, wheel packaging
 - `docs/diagrams/*.dot` — Graphviz sources for the images above. The PNGs are committed;
   edit the `.dot` and run `make diagrams` rather than touching them.
 - `make help` — every target with its flags
