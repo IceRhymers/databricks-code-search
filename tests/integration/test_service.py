@@ -336,3 +336,146 @@ def test_stale_cursor_from_a_different_query_still_decodes_and_resumes(seeded: S
         seeded.engine, seeded.cfg, "foo", 2, cursor=page1["next_cursor"]
     )
     assert isinstance(reused["files"], list)
+
+
+# ------------------------------------------------- permalink_branch selection (issue #46)
+#
+# A dedicated, function-scoped fixture (not the module-scoped `seeded` above): mirrors the
+# divergent-content corpus shape from tests/integration/test_query_compiler.py's
+# `branch_seeded` fixture (src/divergent.go with DIFFERENT content on "main" vs "feature") so
+# a lexical search can hit both content versions of one path in a single query.
+
+
+class BranchSeeded(NamedTuple):
+    engine: Engine
+    cfg: Settings
+    repo_id: int
+
+
+@pytest.fixture
+def branch_seeded() -> Iterator[BranchSeeded]:
+    schema = _unique(f"{SCHEMA_PREFIX}_branch")
+    admin_engine = create_db_engine()
+    admin_conn = admin_engine.connect()
+    prev_pgoptions = os.environ.get("PGOPTIONS")
+    engine: Engine | None = None
+    try:
+        admin_conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        admin_conn.execute(text(f"CREATE SCHEMA {schema}"))
+        admin_conn.execute(text(f"SET search_path TO {schema}, public"))
+        admin_conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        admin_conn.commit()
+
+        Base.metadata.create_all(bind=admin_conn)
+        admin_conn.commit()
+
+        repo_id = admin_conn.execute(
+            insert(Repo).values(name="acme/divergent", default_branch="main").returning(Repo.id)
+        ).scalar_one()
+
+        # Same path, DIFFERENT content on "main" vs "feature" -> two distinct rows (0003
+        # dedup: same repo_id+path, different content_sha), each with a single-element
+        # branches array.
+        main_content = 'package main\nfunc Divergent() { fmt.Println("main") }\n'
+        feature_content = 'package main\nfunc Divergent() { fmt.Println("feature") }\n'
+        admin_conn.execute(
+            insert(File).values(
+                repo_id=repo_id,
+                path="src/divergent.go",
+                lang="go",
+                content=main_content,
+                content_sha=content_sha(main_content),
+                branches=["main"],
+            )
+        )
+        admin_conn.execute(
+            insert(File).values(
+                repo_id=repo_id,
+                path="src/divergent.go",
+                lang="go",
+                content=feature_content,
+                content_sha=content_sha(feature_content),
+                branches=["feature"],
+            )
+        )
+        admin_conn.commit()
+
+        os.environ["PGOPTIONS"] = f"-c search_path={schema},public"
+        engine = create_db_engine()  # fresh engine: every NEW connection honors PGOPTIONS
+        yield BranchSeeded(engine=engine, cfg=_cfg(), repo_id=repo_id)
+    finally:
+        if engine is not None:
+            engine.dispose()
+        if prev_pgoptions is None:
+            os.environ.pop("PGOPTIONS", None)
+        else:
+            os.environ["PGOPTIONS"] = prev_pgoptions
+        admin_conn.rollback()
+        admin_conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        admin_conn.commit()
+        admin_conn.close()
+        admin_engine.dispose()
+
+
+@pytest.mark.integration
+def test_permalink_branch_lexical_search_matches_both_divergent_versions(
+    branch_seeded: BranchSeeded,
+) -> None:
+    # Parenthesized OR of branch: atoms ANDed with a content term (NOT a bare
+    # "branch:main OR branch:feature Divergent", which the grammar would parse as
+    # "branch:main OR (branch:feature AND Divergent)" -- an unbalanced disjunction): both
+    # content versions surface, each carrying a DISTINCT content_sha.
+    payload = service.search_code_payload(
+        branch_seeded.engine, branch_seeded.cfg, "(branch:main OR branch:feature) Divergent", 200
+    )
+    assert payload["file_count"] == 2
+    shas = {f["content_sha"] for f in payload["files"]}
+    assert len(shas) == 2
+
+
+@pytest.mark.integration
+def test_permalink_branch_set_from_explicit_branch_atom(branch_seeded: BranchSeeded) -> None:
+    payload = service.search_code_payload(
+        branch_seeded.engine, branch_seeded.cfg, "branch:feature Divergent", 200
+    )
+    assert payload["file_count"] == 1
+    assert payload["files"][0]["permalink_branch"] == "feature"
+
+
+@pytest.mark.integration
+def test_permalink_branch_none_when_query_has_no_branch_atom(branch_seeded: BranchSeeded) -> None:
+    # No branch: atom anywhere -> the implicit default-branch conjunct scopes to "main" only,
+    # and permalink_branch must be None for every returned entry.
+    payload = service.search_code_payload(branch_seeded.engine, branch_seeded.cfg, "Divergent", 200)
+    assert payload["file_count"] == 1
+    for f in payload["files"]:
+        assert f["permalink_branch"] is None
+
+
+@pytest.mark.integration
+def test_permalink_branch_or_multi_branch_picks_smallest_intersection_and_round_trips(
+    branch_seeded: BranchSeeded,
+) -> None:
+    # An OR of two branch: atoms over a row whose OWN membership contains only ONE of them
+    # still has BOTH values in branch_filters; the intersection with that row's single-element
+    # branches array is exactly that one value, so it is trivially the "smallest".
+    payload = service.search_code_payload(
+        branch_seeded.engine, branch_seeded.cfg, "(branch:feature OR branch:main) Divergent", 200
+    )
+    by_branches = {tuple(f["branches"]): f for f in payload["files"]}
+    feature_entry = by_branches[("feature",)]
+    assert feature_entry["permalink_branch"] == "feature"
+
+    # Round-trip proof: get_file_payload(branch=permalink_branch) returns the SAME content
+    # bytes as the search hit's own version.
+    file_payload = service.get_file_payload(
+        branch_seeded.engine,
+        branch_seeded.cfg,
+        "acme/divergent",
+        "src/divergent.go",
+        branch=feature_entry["permalink_branch"],
+    )
+    assert file_payload["found"] is True
+    content = file_payload["content"] or ""
+    assert 'fmt.Println("feature")' in content
+    assert 'fmt.Println("main")' not in content
