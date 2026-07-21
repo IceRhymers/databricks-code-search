@@ -34,6 +34,21 @@ jobs:
       - name: Unit tests
         run: make test
 
+  webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webui/frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: webui/frontend
+      - name: Frontend tests
+        run: make webui-test
+
   # Container-based integration coverage. This is a STAND-IN for the real engine: the
   # semantic path's `lakebase_ann` ordered-index scan and `lakebase_bm25` scorer exist in
   # no Postgres image, so this job substitutes pgvector `<=>` + `ts_rank_cd`. It proves the

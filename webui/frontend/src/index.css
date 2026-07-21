@@ -165,6 +165,12 @@ input {
   color: var(--accent);
 }
 
+.chip:disabled,
+.chip.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 details.syntax-help {
   margin: 0.75rem 0;
   border: 1px solid var(--border);

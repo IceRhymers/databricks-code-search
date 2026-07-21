@@ -6,21 +6,7 @@ import { ResultsList } from "../components/ResultsList";
 import { SyntaxHelp } from "../components/SyntaxHelp";
 import { replaceRoute } from "../router";
 import { initialSearchState, searchReducer } from "../utils/searchReducer";
-
-/** Replace (or remove) a single `prefix:value` atom in a zoekt-style query string. */
-function setAtom(query: string, prefix: string, value: string | null): string {
-  const withoutAtom = query
-    .replace(new RegExp(`\\b${prefix}:\\S+`, "g"), "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!value) return withoutAtom;
-  return withoutAtom.length > 0 ? `${withoutAtom} ${prefix}:${value}` : `${prefix}:${value}`;
-}
-
-function extractAtom(query: string, prefix: string): string | null {
-  const match = query.match(new RegExp(`\\b${prefix}:(\\S+)`));
-  return match ? match[1] : null;
-}
+import { deriveChips, recognize, setFieldAtom, toggleBranchAtom } from "../utils/queryModel";
 
 export function SearchPage({ initialQuery }: { initialQuery: string }): JSX.Element {
   const [input, setInput] = useState(initialQuery);
@@ -74,16 +60,29 @@ export function SearchPage({ initialQuery }: { initialQuery: string }): JSX.Elem
     void runSearch(input);
   }
 
+  const model = recognize(input);
+  const chips = deriveChips(model, repos);
+
+  // These handlers only ever run from a rendered chip, and chips that mutate a field are
+  // never rendered for an unsafe query (see FilterChips) -- so `model.safe` always holds
+  // here. The guard exists so an unsafe `input` is never silently rewritten.
   function toggleRepo(name: string) {
-    const active = extractAtom(input, "repo");
-    const next = setAtom(input, "repo", active === name ? null : name);
+    if (!model.safe) return;
+    const next = setFieldAtom(model, "repo", chips.repoActive === name ? null : name);
     setInput(next);
     void runSearch(next);
   }
 
   function toggleLanguage(lang: string) {
-    const active = extractAtom(input, "lang");
-    const next = setAtom(input, "lang", active === lang ? null : lang);
+    if (!model.safe) return;
+    const next = setFieldAtom(model, "lang", chips.langActive === lang ? null : lang);
+    setInput(next);
+    void runSearch(next);
+  }
+
+  function toggleBranch(branch: string) {
+    if (!model.safe) return;
+    const next = toggleBranchAtom(model, branch);
     setInput(next);
     void runSearch(next);
   }
@@ -111,10 +110,10 @@ export function SearchPage({ initialQuery }: { initialQuery: string }): JSX.Elem
       <FilterChips
         repos={repos}
         languages={languages}
-        activeRepo={extractAtom(input, "repo")}
-        activeLanguage={extractAtom(input, "lang")}
+        chips={chips}
         onToggleRepo={toggleRepo}
         onToggleLanguage={toggleLanguage}
+        onToggleBranch={toggleBranch}
       />
 
       <SearchBannerList banners={state.banners} />

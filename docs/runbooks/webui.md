@@ -37,6 +37,27 @@ rather than falling back to the repo's default branch. Semantic results are unaf
 `GET /api/file` accepts an optional `branch` query param; omitted, it keeps its existing
 default-branch resolution unchanged.
 
+## Branch filter chips (issue #47)
+
+The Search page's `repo:`/`lang:` chips (`FilterChips.tsx`) compose atoms into the query
+string via a small client-side recognizer (`utils/queryModel.ts`) that classifies the typed
+query as either a flat AND of `field:value`/bareword atoms ("safe" -- the chips can add,
+remove, or replace an atom without touching anything else) or "unsafe" (contains `OR`,
+parens, a quoted string, or a `/regex/` -- any construct a naive atom rewrite could silently
+corrupt). The recognizer is a deliberately narrower single-pass port of
+`app/query/parser.py:tokenize`, not a full parser; `tests/unit/test_query_corpus_parity.py`
+and `webui/frontend/src/utils/queryModel.corpus.test.ts` share one JSON corpus
+(`queryModel.corpus.json`) to keep the TS port's "safe" verdict from drifting out of sync
+with what the real backend parser accepts.
+
+A `branch:name` chip row renders per repository, but only when the query names **exactly
+one** known repository (an exact `repo:` atom match, never a regex/glob repo pattern, and
+never a union across repos) and has at most one existing `branch:` atom -- deliberately
+narrower than the repo/lang chips, which stay visible (disabled, with a tooltip) for any
+unsafe query. This asymmetry exists because a branch chip's option list depends on knowing
+which single repo it applies to; repo/lang toggles do not have that ambiguity. See
+`deriveChips` in `queryModel.ts` for the exact rules.
+
 ## Semantic search (issue #36)
 
 The webui exposes the same hybrid semantic engine (`app/search/semantic.py`) the MCP
@@ -157,8 +178,8 @@ make webui-build   # cd webui/frontend && npm ci && npm run build
 ```
 
 Commit the resulting `webui/frontend/dist/` changes. `npm test` (vitest) is available via
-`make webui-test`, advisory only — it is not wired into `make test` / `make test-integration`
-and is not a repo gate.
+`make webui-test` and is enforced by CI's `webui` job (which runs `npm ci` first); it is not
+wired into `make test` / `make test-integration`.
 
 ## Packaging: the deploy-time wheel
 

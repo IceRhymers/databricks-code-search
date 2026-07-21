@@ -33,6 +33,15 @@ export function SyntaxHelp(): JSX.Element {
           </tr>
           <tr>
             <td>
+              <code>branch:name</code>
+            </td>
+            <td>
+              Limit to files present on a branch (exact membership, not a glob or regex).
+              Omitted, search covers each repo&apos;s default branch.
+            </td>
+          </tr>
+          <tr>
+            <td>
               <code>case:yes</code>
             </td>
             <td>Case-sensitive match (default is case-insensitive).</td>

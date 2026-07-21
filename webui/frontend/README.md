@@ -30,7 +30,11 @@ npm test           # vitest run
 Covers the two pieces of app logic with real correctness risk: the UTF-8 byte-range highlight
 splitter (`src/utils/byteRanges.ts`, exercised with multi-byte/emoji lines) and the
 paginated-search reducer (`src/utils/searchReducer.ts`, cursor-append / banner-per-page
-semantics). Advisory only — not part of `make lint`/`make test`.
+semantics), plus the flat-AND query recognizer (`src/utils/queryModel.ts`) that drives the
+repo/lang/branch filter chips, whose `queryModel.corpus.json` corpus is also asserted against
+the real Python parser by `tests/unit/test_query_corpus_parity.py`. The vitest suite runs in
+CI's `webui` job (`make webui-test`); the Python half of the corpus parity check is a
+`pytest -m unit` test and runs under `make test` in the `unit` job.
 
 ## Notable choices
 

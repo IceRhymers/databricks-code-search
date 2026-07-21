@@ -124,7 +124,7 @@ webui-wheel: ## Build the app wheel + refresh webui/uv.lock and stage under webu
 webui-build: ## Build the webui frontend (npm ci + vite build) into webui/frontend/dist/, which is committed
 	cd webui/frontend && npm ci && npm run build
 
-webui-test: ## Run the webui frontend test suite (vitest; advisory, not a repo gate)
+webui-test: ## Run the webui frontend test suite (vitest; gated in CI's webui job, needs npm ci first)
 	cd webui/frontend && npm test
 
 destroy: ## Tear down the whole bundle for TARGET (typed-confirm; irreversible Lakebase data loss)
