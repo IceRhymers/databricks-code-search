@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { ApiError, getFile, type FileResponse } from "../api/client";
 import { CodeBlock } from "../components/CodeBlock";
+import { replaceRoute } from "../router";
+import { locateNeedleLine } from "../utils/chunkAnchor";
 
 function detectLang(path: string): string | null {
   const ext = path.split(".").pop()?.toLowerCase();
@@ -23,14 +25,50 @@ type FilePageState =
   | { status: "error"; message: string }
   | { status: "loaded"; file: FileResponse };
 
-export function FilePage({ repo, path, line }: { repo: string; path: string; line: number | null }): JSX.Element {
+export function FilePage({
+  repo,
+  path,
+  line,
+  find,
+}: {
+  repo: string;
+  path: string;
+  line: number | null;
+  find: string | null;
+}): JSX.Element {
   const [state, setState] = useState<FilePageState>({ status: "loading" });
   const [copied, setCopied] = useState(false);
+  // Lives in component state, not derived from the URL: the needle-hit rewrite below drops
+  // the `find` param (replaceRoute lands on a plain #L<n> URL), and the fetch effect's deps
+  // are [repo, path] so it won't refire when that happens -- a URL-derived note would vanish
+  // the instant the rewrite occurs.
+  const [anchorNote, setAnchorNote] = useState<string | null>(null);
 
   useEffect(() => {
     setState({ status: "loading" });
+    setAnchorNote(null);
     getFile(repo, path)
-      .then((file) => setState({ status: "loaded", file }))
+      .then((file) => {
+        setState({ status: "loaded", file });
+        // `find` is the chunk's pre-computed needle (ChunkCard already ran extractNeedle);
+        // only resolve it when the URL didn't already carry an explicit #L<n> anchor.
+        if (find && line === null && file.content != null) {
+          const located = locateNeedleLine(file.content, find);
+          if (located === null) {
+            setAnchorNote(
+              "Couldn't locate the chunk in the current file content — content may have been re-indexed."
+            );
+            return;
+          }
+          const params = new URLSearchParams({ repo, path });
+          replaceRoute(`/file?${params.toString()}#L${located.line}`);
+          if (located.occurrences > 1) {
+            setAnchorNote(
+              `This line appears ${located.occurrences} times — showing the first occurrence, which may not be the chunk's exact location.`
+            );
+          }
+        }
+      })
       .catch((err) => {
         // /api/file 404s (not a 200 with found:false) on a miss -- see webui/main.py:api_file.
         if (err instanceof ApiError && err.status === 404) {
@@ -40,6 +78,7 @@ export function FilePage({ repo, path, line }: { repo: string; path: string; lin
         const message = err instanceof ApiError ? err.message : "Failed to load file.";
         setState({ status: "error", message });
       });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repo, path]);
 
   function copyPermalink() {
@@ -82,6 +121,14 @@ export function FilePage({ repo, path, line }: { repo: string; path: string; lin
           {copied ? "Copied!" : "Copy permalink"}
         </button>
       </div>
+      {anchorNote && (
+        <div className="banner warn">
+          {anchorNote}
+          <button type="button" className="theme-toggle" onClick={() => setAnchorNote(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
       <CodeBlock content={state.file.content} lang={detectLang(path)} targetLine={line} />
     </div>
   );
