@@ -1,0 +1,48 @@
+// Overall system: everything the bundle deploys and who talks to what.
+// The simple data-flow chain lives in architecture.dot; this one adds the
+// second app, the identities/grants, the secret scope, and the embedding path.
+// Regenerate with `make diagrams` (do not hand-edit the PNG).
+digraph overall_architecture {
+  rankdir=TB;
+  bgcolor="white";
+  nodesep=0.35;
+  ranksep=0.5;
+  compound=true;
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
+        color="#4a5568", fillcolor="#f7fafc", fontcolor="#1a202c", margin="0.24,0.13"];
+  edge [fontname="Helvetica", fontsize=9, color="#4a5568", fontcolor="#2d3748"];
+
+  github [label="GitHub\norgs · users · repos", fillcolor="#edf2f7"];
+  config [label="config.yaml\nbundle-synced, read every run", fillcolor="#edf2f7"];
+
+  subgraph cluster_workspace {
+    label="Databricks workspace (one bundle)";
+    fontname="Helvetica";
+    fontsize=11;
+    fontcolor="#2d3748";
+    color="#a0aec0";
+    style="rounded";
+
+    secret  [label="secret scope\ncode-search / github_token", fillcolor="#e6f0fa", color="#2b6cb0"];
+    job     [label="indexing job\nserverless · every 12h\nruns as job SP (writer)", fillcolor="#e6f0fa", color="#2b6cb0"];
+    gateway [label="AI Gateway\nembeddings endpoint", fillcolor="#e6f0fa", color="#2b6cb0"];
+    db      [label="Lakebase Postgres\nrepos · files · symbols · chunks",
+             fillcolor="#e6f0fa", color="#2b6cb0"];
+    mcp     [label="MCP server\nDatabricks App · own SP", fillcolor="#e6f0fa", color="#2b6cb0"];
+    webui   [label="web UI\nDatabricks App · own SP", fillcolor="#e6f0fa", color="#2b6cb0"];
+  }
+
+  agent   [label="MCP client\nagent", fillcolor="#edf2f7"];
+  browser [label="browser\nworkspace user", fillcolor="#edf2f7"];
+
+  config -> job    [label=" declares repo set"];
+  secret -> job    [label=" GITHUB_TOKEN"];
+  github -> job    [label=" tarball @ SHA"];
+  job    -> gateway [label=" embed chunks", dir=both];
+  job    -> db     [label=" write · one txn per (repo, branch)"];
+  db     -> mcp    [label=" SELECT · read-only grant"];
+  db     -> webui  [label=" SELECT · read-only grant"];
+  mcp    -> agent  [label=" streamable HTTP /mcp · OAuth", dir=both];
+  webui  -> browser [label=" HTTPS · CAN_USE", dir=both];
+}

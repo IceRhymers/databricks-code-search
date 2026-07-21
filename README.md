@@ -19,12 +19,19 @@ on serverless), parses every source file, extracts symbols with tree-sitter, and
 files and symbols in a single transaction per `(repo, branch)`, stamped with that SHA.
 Content shared byte-for-byte across branches dedupes into one row carrying every branch
 that resolves to it; a branch's stale membership is then swept from rows it no longer
-resolves to, so a failed run rolls back whole rather than leaving the corpus
-half-updated.
+resolves to, so a failure rolls back that `(repo, branch)` update whole rather than
+leaving it half-applied (other repos and branches continue; the run still exits
+non-zero).
 
 The server holds one process-scoped SQLAlchemy engine over a 5-connection pool, minting a
 fresh Lakebase OAuth token on each physical connection. Query work runs off the event loop
 under a 5-token limiter sized to the pool.
+
+The full deployment surface — one bundle carrying the job, the secret scope, and both
+apps, each app reading through its own service principal's least-privilege grant, with
+embeddings flowing through the workspace AI Gateway:
+
+<img src="docs/diagrams/overall-architecture.png" alt="Overall architecture: config.yaml, GitHub, and the secret scope feed the indexing job, which writes to Lakebase Postgres and embeds chunks via the AI Gateway; the MCP server and web UI apps read Lakebase with read-only grants and serve an MCP agent over OAuth and a browser over CAN_USE respectively" width="700">
 
 ## Query language
 
@@ -131,7 +138,7 @@ stall the server. `statement_timeout` bounds the database, not the rescan.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_code` | `query`, `limit=200`, `branch=None` | file-grouped line matches with byte ranges |
+| `search_code` | `query`, `limit=200`, `branch=None`, `commit=None` | file-grouped line matches with byte ranges |
 | `semantic_search` | `query`, `limit=50`, `branch=None` | ranked chunks with `rrf_score` |
 | `list_repos` | — | indexed repos with per-branch last-indexed metadata |
 | `get_file` | `repo`, `path`, `branch=None` | full file content, or `found: false` |
@@ -150,8 +157,11 @@ never the literal string `"HEAD"` unless that is genuinely the resolved branch (
 repo with no `default_branch` recorded).
 
 Recoverable conditions come back as payload fields —
-`query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible` — rather than
-errors, so an agent can react without a failed tool call.
+`query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`,
+`no_content_atom`, `zero_width_only_atoms`, `commit_not_indexed` — rather than errors, so
+an agent can react without a failed tool call. Pagination rides the same envelope as
+`next_cursor`, and the semantic tool adds its own status fields (`semantic_enabled`,
+`semantic_schema_missing`).
 
 `semantic_search` is natural-language hybrid search (vector ANN + BM25 fused by reciprocal
 rank). It is **on by default** — the `chunks` schema rides the core migration chain and
@@ -210,7 +220,7 @@ native per-client OAuth. See [Connecting a client](#connecting-a-client).
 
 `make smoke ARGS=--enable-mcp` is not blocked by this: it authenticates with your own
 Databricks login (`WorkspaceClient().config.authenticate()`), so it needs `CAN_USE` on the
-app but not the app connection. `deploy.sh`'s step-8 reminder says no client can reach
+app but not the app connection. `deploy.sh`'s step-11 reminder says no client can reach
 `/mcp` without the app connection; that holds for external MCP clients but not for
 `make smoke`.
 
@@ -229,13 +239,13 @@ project, and **irreversible**. See
 
 ## Deploy
 
-> **Step 1 after cloning: replace `IceRhymers` with your own account.** `config.yaml`
-> ships pointed at the repo author's GitHub user. Deployed unedited it indexes a
-> stranger's repos every 12 hours and your searches return their code — successfully,
-> with no error anywhere. See [Configuring what gets indexed](#configuring-what-gets-indexed).
+> **Step 1 after cloning: set your own org or user in `config.yaml`.** The template
+> ships with no repositories selected — deployed unedited, the indexer fails fast with
+> `connection selects nothing` and the corpus stays empty. Uncomment `users:`/`orgs:`/
+> `repos:` and fill in your own. See [Configuring what gets indexed](#configuring-what-gets-indexed).
 
 ```bash
-make install                      # uv sync --all-groups
+make install                      # uv sync --all-groups --all-extras
 export GITHUB_TOKEN=ghp_...       # so deploy can seed the secret scope
 make deploy TARGET=dev            # full ordered pipeline
 ```
@@ -289,7 +299,7 @@ version: 1
 connections:
   - type: github
     users:
-      - IceRhymers
+      - your-github-username
     orgs:
       - acme
     repos:
@@ -361,7 +371,7 @@ only, so it will pass even when the app SP is missing its SELECT grant.
 The server speaks streamable HTTP at `https://<app-url>/mcp`. Every caller needs `CAN_USE`
 on the app, whichever path below you take.
 
-Get the URL — `make deploy` prints it at step 8, and afterwards:
+Get the URL — `make deploy` prints it at step 11, and afterwards:
 
 ```bash
 databricks apps get <app-name> -o json | jq -r '.url'
@@ -517,6 +527,8 @@ Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
   query semantics, the grant-coupling this migration introduces)
 - [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md) —
   semantic search (default-on): the preload assumption, opt-out, embeddings, memory notes
+- [`docs/runbooks/indexing-parallelism.md`](docs/runbooks/indexing-parallelism.md) —
+  parallel indexing: worker sizing, skip-if-unchanged, compare-and-set stamping
 - [`docs/runbooks/ci-lakebase.md`](docs/runbooks/ci-lakebase.md) — the integration CI
   gate: ephemeral Lakebase branches, prerequisites
 - [`docs/runbooks/webui.md`](docs/runbooks/webui.md) — the web UI app: auth, grants,

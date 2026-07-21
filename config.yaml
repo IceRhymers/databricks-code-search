@@ -1,9 +1,6 @@
-# ┌──────────────────────────────────────────────────────────────────────────┐
-# │ CHANGE THIS FIRST. This ships pointed at the repo author's GitHub        │
-# │ account. If you deploy it unedited you will index someone else's repos   │
-# │ — every 12 hours — and your searches will silently return their code.    │
-# │ Replace `IceRhymers` below with your own org or user, then `make deploy`.│
-# └──────────────────────────────────────────────────────────────────────────┘
+# Set your GitHub org(s), user(s), or repo(s) under `connections` below, then
+# `make deploy`. This template ships with nothing selected — the indexer fails
+# fast ("connection selects nothing") until you uncomment and fill one in.
 version: 1
 
 # How many repos the job indexes at once. Default 4, max 8, min 1.
@@ -20,8 +17,8 @@ version: 1
 connections:
   - type: github
     # orgs / users / repos are UNIONED, then deduplicated by canonical org/repo.
-    users:
-      - IceRhymers
+    # users:
+    #   - your-github-username
 
     # orgs:
     #   - acme

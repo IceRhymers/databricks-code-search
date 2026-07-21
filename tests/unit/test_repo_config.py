@@ -269,12 +269,13 @@ _SHIPPED_CONFIG = Path(__file__).parents[2] / "config.yaml"
 
 
 @pytest.mark.unit
-def test_shipped_config_parses() -> None:
-    """AC 9 -- located relative to this file, so invocation directory is irrelevant."""
-    cfg = parse_config(_SHIPPED_CONFIG.read_bytes(), source=str(_SHIPPED_CONFIG))
-
-    assert cfg.version == 1
-    assert cfg.connections
+def test_shipped_config_is_a_template_that_fails_fast() -> None:
+    """The shipped config.yaml is a fork-me template with every selector commented
+    out. Deployed unedited it must refuse to load — never silently index someone
+    else's repos. Located relative to this file, so invocation directory is
+    irrelevant."""
+    with pytest.raises(ConfigError, match="connection selects nothing"):
+        parse_config(_SHIPPED_CONFIG.read_bytes(), source=str(_SHIPPED_CONFIG))
 
 
 # --- read seam (AC 11-13) ---------------------------------------------------
