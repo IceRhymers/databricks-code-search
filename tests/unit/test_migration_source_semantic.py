@@ -58,6 +58,16 @@ def test_extensions_are_created_before_dependent_indexes(source: str) -> None:
 
 
 @pytest.mark.unit
+def test_extensions_are_created_with_cascade(source: str) -> None:
+    """CASCADE is load-bearing (ground truth 2026-07-21): lakebase_vector declares a
+    dependency on the base ``vector`` extension, so a bare CREATE EXTENSION fails with
+    'required extension "vector" is not installed' where ``vector`` isn't pre-installed.
+    CASCADE does not mask the preload fail-loud signal."""
+    for ext in ("lakebase_tokenizer", "lakebase_vector", "lakebase_text"):
+        assert f"CREATE EXTENSION IF NOT EXISTS {ext} CASCADE" in source
+
+
+@pytest.mark.unit
 def test_ann_index_uses_lakebase_ann_with_explicit_opclass(source: str) -> None:
     """vector_cosine_ops is NON-default on lakebase_ann and must be explicit."""
     assert "USING lakebase_ann (embedding vector_cosine_ops)" in source

@@ -35,6 +35,13 @@ and the revision's DDL (`vector_cosine_ops` ANN index via `lakebase_ann`,
 `app/alembic/versions/0004_semantic_chunks.py` for the exact DDL and
 access-method/opclass ground truth this depends on.
 
+Additional ground truth (2026-07-21, a second live project): `lakebase_vector`
+declares a dependency on the base `vector` extension, so on a project where `vector`
+is not pre-installed a bare `CREATE EXTENSION lakebase_vector` fails with
+`required extension "vector" is not installed`. The migration therefore uses
+`CREATE EXTENSION ... CASCADE`, which installs declared dependencies — and does
+**not** mask the preload fail-loud signal above.
+
 ## 2. Enablement = deploy
 
 ```

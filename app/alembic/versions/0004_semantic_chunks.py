@@ -71,12 +71,18 @@ def upgrade() -> None:
 
     # Extensions first (tokenizer -> vector -> text), mirroring 0001's ordering so the
     # dependent lakebase_ann / lakebase_bm25 access methods resolve when the indexes
-    # below are built. lakebase_text builds on lakebase_tokenizer. These FAIL LOUDLY
-    # if the managed shared_preload_libraries prerequisite is absent -- that is the
-    # intended signal (see module docstring + the enablement runbook).
-    op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer")
-    op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_vector")
-    op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_text")
+    # below are built. lakebase_text builds on lakebase_tokenizer. CASCADE is load-bearing
+    # (ground truth 2026-07-21, live Lakebase project): lakebase_vector DECLARES a
+    # dependency on the base `vector` extension, so a bare CREATE EXTENSION fails with
+    # 'required extension "vector" is not installed' on a project where `vector` isn't
+    # pre-installed; CASCADE installs declared dependencies. It does NOT weaken the
+    # fail-loud preload check -- when the managed shared_preload_libraries prerequisite
+    # is absent, CREATE EXTENSION still errors with "must be loaded via
+    # shared_preload_libraries", which remains the intended signal (see module
+    # docstring + the enablement runbook).
+    op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer CASCADE")
+    op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_vector CASCADE")
+    op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_text CASCADE")
     # The embedding width is single-sourced from app.config.SEMANTIC_EMBEDDING_DIM so
     # the DDL and the app.db.semantic.chunks Table can never drift apart.
     op.execute(

@@ -52,9 +52,9 @@ def seeded() -> Iterator[Connection]:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         # Same order as 0004: tokenizer -> vector -> text. Fails loudly on a project
         # without the lakebase_vector,lakebase_text preload -- the intended signal.
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer"))
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector"))
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_text"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer CASCADE"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector CASCADE"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_text CASCADE"))
         conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {SCHEMA}"))
         conn.execute(text(f"SET search_path TO {SCHEMA}, public"))

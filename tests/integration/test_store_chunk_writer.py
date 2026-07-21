@@ -37,7 +37,7 @@ def conn() -> Iterator[Connection]:
     connection = engine.connect()
     try:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector"))
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector CASCADE"))
         connection.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         connection.execute(text(f"CREATE SCHEMA {SCHEMA}"))
         connection.execute(text(f"SET search_path TO {SCHEMA}, public"))

@@ -93,9 +93,9 @@ def semantic_engine() -> Iterator[Engine]:
     try:
         with engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_text"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer CASCADE"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector CASCADE"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_text CASCADE"))
             conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
             conn.execute(text(f"CREATE SCHEMA {schema}"))
             conn.execute(text(f"SET search_path TO {schema}, public"))
