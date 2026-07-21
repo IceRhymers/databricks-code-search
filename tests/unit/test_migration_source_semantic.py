@@ -1,10 +1,9 @@
-"""Static source assertions on the GATED semantic revision (no database required).
+"""Static source assertions on the semantic ``0004`` revision (no database required).
 
-The real ``0002sem`` DDL can never run in CI -- the beta ``lakebase_*`` extensions
-are absent from ``pgvector/pgvector:pg16`` -- so a static read of the source is the
-ONLY automated guard on its hand-written invariants. Each assertion below encodes a
-decision that was verified against the live beta database and would be silently
-wrong if edited away.
+The real ``0004`` DDL only runs against a Lakebase branch (unit CI has no database at
+all), so a static read of the source is the fastest automated guard on its hand-written
+invariants. Each assertion below encodes a decision that was verified against the live
+database and would be silently wrong if edited away.
 """
 
 from __future__ import annotations
@@ -15,27 +14,34 @@ import pytest
 
 from app.config import SEMANTIC_EMBEDDING_DIM
 
-_SEMANTIC_VERSIONS = Path(__file__).resolve().parents[2] / "app" / "alembic" / "versions_semantic"
+_VERSIONS = Path(__file__).resolve().parents[2] / "app" / "alembic" / "versions"
 
 
 @pytest.fixture
 def source() -> str:
-    matches = sorted(_SEMANTIC_VERSIONS.glob("0002sem*.py"))
-    assert len(matches) == 1, f"expected exactly one 0002sem*.py, found {matches}"
+    matches = sorted(_VERSIONS.glob("0004*.py"))
+    assert len(matches) == 1, f"expected exactly one 0004*.py, found {matches}"
     return matches[0].read_text()
 
 
 @pytest.mark.unit
-def test_branch_is_self_rooted_and_labelled(source: str) -> None:
-    """down_revision=None + branch_labels, and NO depends_on.
-
-    A depends_on edge to 0001 would try to re-run 0001 into the separate
-    alembic_version_semantic table (which cannot see it as applied).
-    """
-    assert 'revision: str = "0002sem"' in source
-    assert "down_revision: str | None = None" in source
-    assert 'branch_labels: str | Sequence[str] | None = ("semantic",)' in source
+def test_revision_is_core_chained(source: str) -> None:
+    """0004 is a plain core revision: chained off 0003, no branch labels, no depends_on."""
+    assert 'revision: str = "0004"' in source
+    assert 'down_revision: str | None = "0003"' in source
+    assert "branch_labels: str | Sequence[str] | None = None" in source
     assert "depends_on: str | Sequence[str] | None = None" in source
+
+
+@pytest.mark.unit
+def test_idempotency_guard_probes_chunks_first(source: str) -> None:
+    """A project that already ran the old gated migrate-semantic has chunks; the guard
+    must short-circuit the DDL (and clean up the orphaned semantic version table)."""
+    upgrade = source[source.index("def upgrade()") : source.index("def downgrade()")]
+    guard_pos = upgrade.index("to_regclass('chunks')")
+    ddl_pos = upgrade.index("CREATE EXTENSION")
+    assert guard_pos < ddl_pos, "the to_regclass('chunks') guard must precede the DDL"
+    assert "DROP TABLE IF EXISTS alembic_version_semantic" in upgrade
 
 
 @pytest.mark.unit
@@ -83,7 +89,7 @@ def test_chunks_has_a_file_id_leading_unique_constraint(source: str) -> None:
     Postgres does not auto-index a foreign key. chunk_store's per-file DELETE and the
     mark-and-sweep ON DELETE CASCADE both look chunks up by file_id; without a
     file_id-leading index each degrades to a full scan of chunks per file, inside the
-    open transaction. CI cannot catch this (stand-in tables hold a handful of rows).
+    open transaction.
     """
     assert "CONSTRAINT uq_chunks_file_id_chunk_index UNIQUE (file_id, chunk_index)" in source
 

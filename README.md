@@ -130,10 +130,13 @@ Recoverable conditions come back as payload fields —
 errors, so an agent can react without a failed tool call.
 
 `semantic_search` is natural-language hybrid search (vector ANN + BM25 fused by reciprocal
-rank). It is registered unconditionally but gated at runtime: when disabled, which is the
-default, it returns `semantic_enabled: false` and touches neither the database nor the
-embedder. Turning it on means `CODE_SEARCH_SEMANTIC_ENABLED=1` *and* a separate,
-irreversible migration — see
+rank). It is **on by default** — the `chunks` schema rides the core migration chain and
+embeddings go through the workspace AI Gateway, so `make deploy` is the whole enablement
+story. Each result carries the chunk's `start_line`/`end_line` (null for rows indexed
+before line tracking). Opt out with `CODE_SEARCH_SEMANTIC_ENABLED=0` (on both apps and the
+job); disabled, it returns `semantic_enabled: false` and touches neither the database nor
+the embedder. The target Lakebase project's managed preload including
+`lakebase_vector,lakebase_text` is a stated project assumption — see
 [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
 
 Two HTTP routes sit alongside the MCP mount: `GET /health` is liveness and never touches
@@ -160,7 +163,8 @@ webui import `app.*` without duplicating it.
 ## Out-of-band prerequisites
 
 Four things the bundle cannot create. The first three gate a working MCP endpoint; the
-fourth only matters for semantic search.
+fourth gates `make migrate`/`make deploy` (the core chain now creates the semantic
+`chunks` schema).
 
 **1. Pre-created service principals.** An account admin creates the service principals
 once; their client IDs become `app_sp_client_id` and `job_run_as_sp`. The bundle does not
@@ -191,10 +195,13 @@ secret scope (`code-search` / `github_token` by default). `make deploy` will do 
 you if `GITHUB_TOKEN` is exported; without it the deploy still succeeds and the app still
 serves, but indexing has no credential and the corpus stays empty.
 
-**4. Lakebase Search beta.** Semantic search only. The Lakebase project's
+**4. Lakebase Search preload (stated project assumption).** The Lakebase project's
 Databricks-managed `shared_preload_libraries` must already include
-`lakebase_vector,lakebase_text`. This is not settable through the bundle or the API, it is
-requested out-of-band per project, and **it is irreversible**.
+`lakebase_vector,lakebase_text` — semantic search is default-on and its DDL rides
+`make migrate`, which fails loudly (`must be loaded via shared_preload_libraries`) on a
+project without it. Not settable through the bundle or the API; requested out-of-band per
+project, and **irreversible**. See
+[`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
 
 ## Deploy
 
@@ -453,8 +460,8 @@ Requires Python 3.12+ and `uv`.
 
 ```bash
 make install
-make test                 # unit + observability; no external dependencies
-make test-integration     # needs Postgres
+make test                 # unit + observability; no external dependencies, no database
+make test-integration     # needs an ephemeral Lakebase branch (see below)
 make lint                 # ruff check + ruff format --check + mypy (incl. webui)
 ```
 
@@ -465,18 +472,17 @@ make webui-build           # npm ci + vite build -> webui/frontend/dist/ (commit
 make webui-test            # vitest; advisory, not a repo gate
 ```
 
-The integration suite needs a Postgres with `pg_trgm`; CI uses `pgvector/pgvector:pg16`
-with `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE` pointed at it. Do **not** run
-`make migrate-local` first — the fixtures build their own schema, and a pre-migrated
-database fails the suite on a duplicate-key violation against `repos_name_key`.
-`make migrate-local` is for running the app locally, not the tests.
+This project is **Lakebase-only**: there is no local/CI Postgres image. The integration
+suite runs against an ephemeral Lakebase branch — `scripts/ci_branch.py up` (exports
+`LAKEBASE_ENDPOINT`/`LAKEBASE_DATABASE`) → `scripts/migrate.py` → `make test-integration`
+→ `ci_branch.py down`. CI does exactly this on every PR
+([`docs/runbooks/ci-lakebase.md`](docs/runbooks/ci-lakebase.md)); the fixtures build
+their own throwaway schemas, so a pre-migrated branch is fine.
 
 `LAKEBASE_ENDPOINT` and `PGHOST` are precedence-ordered, not exclusive: a configured
 `LAKEBASE_ENDPOINT` always wins; `PGHOST` selects local mode only in its absence. That
 ordering matters because the deployed app's Postgres binding injects `PGHOST` at runtime,
-so both are set in production. Locally the risk runs the other way, which is why
-`make smoke` and `make migrate` refuse to run with `PGHOST` set — otherwise a stale shell
-variable could quietly point them at your laptop instead of the deployment.
+so both are set in production.
 
 Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
 
@@ -485,10 +491,10 @@ Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
 - [`docs/runbooks/multi-branch.md`](docs/runbooks/multi-branch.md) — configuring and
   deploying multi-branch indexing (`branches:` globs, the 20-branch cap, `branch:`
   query semantics, the grant-coupling this migration introduces)
-- [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md) — turning
-  on semantic search
-- [`docs/runbooks/ci-lakebase.md`](docs/runbooks/ci-lakebase.md) — running CI against a
-  real Lakebase engine
+- [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md) —
+  semantic search (default-on): the preload assumption, opt-out, embeddings, memory notes
+- [`docs/runbooks/ci-lakebase.md`](docs/runbooks/ci-lakebase.md) — the integration CI
+  gate: ephemeral Lakebase branches, prerequisites
 - [`docs/runbooks/webui.md`](docs/runbooks/webui.md) — the web UI app: auth, grants,
   rebuilding the frontend, wheel packaging
 - `docs/diagrams/*.dot` — Graphviz sources for the images above. The PNGs are committed;

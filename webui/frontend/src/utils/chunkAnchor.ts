@@ -1,7 +1,8 @@
-// Locates a semantic search chunk's position within a file's full content. The chunk itself
-// carries no line numbers (app/search/semantic.py chunks are token-cut, not line-cut), so
-// ChunkCard picks a "needle" line from the chunk and FilePage re-finds that same text in the
-// file it loads -- an approximate but good-enough anchor (see issue #36 plan, Step 2).
+// Locates a semantic search chunk's position within a file's full content. FALLBACK path
+// (issue #36): chunks indexed since issue #44 carry an exact start_line/end_line and
+// ChunkCard links straight to #L<start>-L<end>; rows indexed before line tracking have
+// nulls, so ChunkCard picks a "needle" line from the chunk and FilePage re-finds that same
+// text in the file it loads -- an approximate but good-enough anchor.
 
 /**
  * The anchor needle for a chunk: its LONGEST non-empty trimmed line (not the first --

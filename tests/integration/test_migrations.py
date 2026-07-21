@@ -1,9 +1,10 @@
-"""Integration tests for the 0001 migration against real local Postgres.
+"""Integration tests for the core migration chain against a Lakebase branch.
 
 Each test runs the migration in its own throwaway schema via an *injected*
-connection (the same path ``scripts/migrate.py`` uses for Lakebase), with the
-Alembic version table pinned to that schema. Requires a running Postgres with the
-standard PG* env set.
+connection (the same path ``scripts/migrate.py`` uses), with the Alembic version
+table pinned to that schema. Requires a Lakebase branch whose project preloads
+``lakebase_vector,lakebase_text`` (``upgrade head`` includes the 0004 semantic
+revision; see docs/runbooks/ci-lakebase.md).
 
 The enforcement test exercises the least-privilege grants on the *same* superuser
 connection via ``SET ROLE`` to a NOLOGIN role; opening a second engine would
@@ -96,7 +97,7 @@ def test_schema_fidelity(migrated: Migrated) -> None:
         .scalars()
         .all()
     )
-    assert {"repos", "files", "symbols", "repo_branches"} <= set(tables)
+    assert {"repos", "files", "symbols", "repo_branches", "chunks"} <= set(tables)
 
     rows = conn.execute(
         text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = :s"),
@@ -291,11 +292,107 @@ def test_0002_backfill_window_both_branches() -> None:
 
 
 @pytest.mark.integration
-def test_no_vector_extension_installed(migrated: Migrated) -> None:
-    count = migrated.conn.execute(
-        text("SELECT count(*) FROM pg_extension WHERE extname = 'vector'")
-    ).scalar()
-    assert count == 0
+def test_semantic_chunks_created_at_head(migrated: Migrated) -> None:
+    """0004 rides the core chain: `upgrade head` creates chunks + both lakebase indexes."""
+    conn, schema = migrated.conn, migrated.schema
+
+    assert conn.execute(text("SELECT to_regclass('chunks')")).scalar() is not None
+
+    rows = conn.execute(
+        text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = :s"),
+        {"s": schema},
+    ).all()
+    by_name = {name: definition for name, definition in rows}
+    assert "ix_chunks_embedding_ann" in by_name
+    assert "lakebase_ann" in by_name["ix_chunks_embedding_ann"]
+    assert "ix_chunks_ts_bm25" in by_name
+    assert "lakebase_bm25" in by_name["ix_chunks_ts_bm25"]
+
+    cols = (
+        conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = :s AND table_name = 'chunks'"
+            ),
+            {"s": schema},
+        )
+        .scalars()
+        .all()
+    )
+    # Line-range columns present from birth (issue #44).
+    assert {"start_line", "end_line"} <= set(cols)
+
+
+@pytest.mark.integration
+def test_0004_guard_preserves_preexisting_chunks() -> None:
+    """AC6/idempotency: a schema that already has chunks (old gated migrate-semantic)
+    upgrades to head without re-running the DDL -- data survives, the line-range
+    columns are added, and the orphaned alembic_version_semantic table is dropped."""
+    schema = _unique("test_0004_guard")
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.commit()
+
+        config = Config("alembic.ini")
+        config.attributes["connection"] = conn
+        config.attributes["version_table_schema"] = schema
+
+        command.upgrade(config, "0003")
+        conn.commit()
+
+        # Simulate the retired gated migration's leftovers: a chunks table with data
+        # (pre-#44 shape, no line columns) and its separate version table.
+        conn.execute(text("INSERT INTO repos (name) VALUES ('r1')"))
+        repo_id = conn.execute(text("SELECT id FROM repos WHERE name = 'r1'")).scalar()
+        conn.execute(
+            text("INSERT INTO files (repo_id, path, content) VALUES (:r, 'a.py', 'x')"),
+            {"r": repo_id},
+        )
+        file_id = conn.execute(text("SELECT id FROM files WHERE path = 'a.py'")).scalar()
+        conn.execute(
+            text(
+                "CREATE TABLE chunks ("
+                "id bigserial PRIMARY KEY, "
+                "file_id integer NOT NULL REFERENCES files(id) ON DELETE CASCADE, "
+                "chunk_index integer NOT NULL, "
+                "content text NOT NULL)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO chunks (file_id, chunk_index, content) VALUES (:f, 0, 'seed')"),
+            {"f": file_id},
+        )
+        conn.execute(text("CREATE TABLE alembic_version_semantic (version_num varchar(32))"))
+        conn.commit()
+
+        command.upgrade(config, "head")
+        conn.commit()
+
+        # Data preserved (guard skipped the CREATE), line columns added, orphan dropped.
+        assert conn.execute(text("SELECT count(*) FROM chunks")).scalar() == 1
+        cols = (
+            conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = :s AND table_name = 'chunks'"
+                ),
+                {"s": schema},
+            )
+            .scalars()
+            .all()
+        )
+        assert {"start_line", "end_line"} <= set(cols)
+        assert conn.execute(text("SELECT to_regclass('alembic_version_semantic')")).scalar() is None
+    finally:
+        conn.rollback()
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
 
 
 @pytest.mark.integration

@@ -11,6 +11,7 @@ export type Route =
       repo: string;
       path: string;
       line: number | null;
+      endLine: number | null;
       find: string | null;
       branch: string | null;
     }
@@ -21,12 +22,14 @@ export function parseLocation(): Route {
   const { pathname, search, hash } = window.location;
   const params = new URLSearchParams(search);
   if (pathname === "/file") {
-    const line = hash.match(/^#L(\d+)$/);
+    // #L12 (single line) or #L12-L24 (inclusive range, issue #44 chunk anchors).
+    const line = hash.match(/^#L(\d+)(?:-L(\d+))?$/);
     return {
       page: "file",
       repo: params.get("repo") ?? "",
       path: params.get("path") ?? "",
       line: line ? Number(line[1]) : null,
+      endLine: line?.[2] ? Number(line[2]) : null,
       find: params.get("find"),
       branch: params.get("branch"),
     };

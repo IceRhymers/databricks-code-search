@@ -225,10 +225,11 @@ async def semantic_search(
     ``query``, since this tool takes natural language rather than zoekt grammar); omitted,
     results are scoped to each repo's default branch. ``limit`` caps the number of ranked
     chunks returned (clamped to a server maximum). Registered unconditionally, but gated at
-    runtime: when semantic search is disabled (the default) it returns a clean
-    ``semantic_enabled: false`` payload -- never a 500/503 -- and touches neither the database
-    nor the embedder. Each result carries ``repo``, ``file``, ``chunk_index``, ``content``, and
-    ``rrf_score`` (no precise line range in V1).
+    runtime: when semantic search is explicitly disabled (``CODE_SEARCH_SEMANTIC_ENABLED=0``)
+    it returns a clean ``semantic_enabled: false`` payload -- never a 500/503 -- and touches
+    neither the database nor the embedder. Each result carries ``repo``, ``file``,
+    ``chunk_index``, ``content``, ``start_line``/``end_line`` (1-based inclusive; null for
+    chunks indexed before line tracking), and ``rrf_score``.
     """
     lc = ctx.request_context.lifespan_context
     engine, cfg = lc["engine"], lc["config"]

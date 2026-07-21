@@ -22,7 +22,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Single source of truth for the embedding vector width. Imported by
-# app/db/semantic.py (the chunks.embedding column type) and by the gated
+# app/db/semantic.py (the chunks.embedding column type) and by the 0004
 # migration's DDL, so a model change never lets the two drift apart.
 SEMANTIC_EMBEDDING_DIM = 1024
 
@@ -48,18 +48,23 @@ class Settings(BaseSettings):
     row_limit: int = 200
     max_row_limit: int = 1000
 
-    # Gates the semantic_search code path (issue #14). Default False: flag-off is a true
-    # no-op (no DB/engine/chunks/embedding/SDK access). Enabling requires the beta
-    # lakebase_vector/lakebase_text extensions to already be reachable (see
-    # docs/runbooks/semantic-enablement.md) -- this is an irreversible, project-level step.
-    semantic_enabled: bool = False
+    # Gates the semantic_search code path (issue #14). Default True: semantic search is
+    # on by default -- the target Lakebase project's managed shared_preload_libraries
+    # including lakebase_vector,lakebase_text is a stated project assumption (see
+    # docs/runbooks/semantic-enablement.md). Opt out with CODE_SEARCH_SEMANTIC_ENABLED=0;
+    # flag-off is a true no-op (no DB/engine/chunks/embedding/SDK access).
+    semantic_enabled: bool = True
 
-    # Databricks model-serving endpoint name for query/index-time embeddings, e.g.
-    # "databricks-gte-large-en". None on the flag-off path (never read).
-    semantic_embedding_endpoint: str | None = None
+    # AI Gateway MLflow embeddings route (a workspace-relative API path, NOT a serving
+    # endpoint name). indexer/embed.py POSTs {"model": ..., "input": ...} to it via the
+    # SDK's raw API client. A working default is required: with the flag on by default,
+    # an unset endpoint would raise at MCP query time.
+    semantic_embedding_endpoint: str | None = "/ai-gateway/mlflow/v1/embeddings"
 
-    # Embedding model identifier, recorded alongside the endpoint for traceability.
-    semantic_embedding_model: str = "databricks-gte-large-en"
+    # Embedding model identifier sent in the gateway request body. The gateway's default
+    # embeddings model, 1024-dim (matches SEMANTIC_EMBEDDING_DIM; a unit test tripwires
+    # a dim-changing model swap).
+    semantic_embedding_model: str = "system.ai.gte-large-en"
 
     # Embedding vector width. Must match SEMANTIC_EMBEDDING_DIM (single source of truth);
     # a unit test ties the two together so a model swap with a different dim fails loudly.

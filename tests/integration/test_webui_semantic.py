@@ -1,10 +1,7 @@
-"""Integration tests for the webui ``/api/semantic`` route against real local Postgres (issue #36).
+"""Integration tests for the webui ``/api/semantic`` route against a Lakebase branch (issue #36).
 
-Runs the ``standin`` backend (pgvector ``<=>`` + ``ts_rank_cd``) that CI's
-``pgvector/pgvector:pg16`` image supports -- the ``lakebase_ann``/``lakebase_bm25`` operators
-are lakebase-only and are proven by the live smoke leg, not here. This suite exercises the ANN
-leg + fusion plumbing with ``ts_rank_cd`` substituting for BM25; the production
-``lakebase_bm25`` leg is proven only by the live smoke leg. It proves the webui **route**
+Runs the production ``lakebase_ann``/``lakebase_bm25`` operators (the suite's Lakebase
+branch preloads them -- see docs/runbooks/ci-lakebase.md). It proves the webui **route**
 (dependency wiring, HTTP status/shape, the not-migrated/disabled payload passthrough), not the
 production ranking -- that is ``tests/integration/test_semantic_rrf.py``'s job.
 
@@ -82,7 +79,7 @@ def _restore_pgoptions(prev: str | None) -> None:
 
 @pytest.fixture
 def semantic_engine() -> Iterator[Engine]:
-    """A throwaway schema with core DDL + a pgvector stand-in ``chunks``, seeded with two
+    """A throwaway schema with core DDL + the real (0004-shaped) ``chunks``, seeded with two
     embedded chunks -- one aligned with the query vector used below, one not.
 
     Mirrors ``test_semantic_rrf.py``'s ``seeded`` fixture's DDL, but the schema/DDL/seed all
@@ -96,7 +93,9 @@ def semantic_engine() -> Iterator[Engine]:
     try:
         with engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_text"))
             conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
             conn.execute(text(f"CREATE SCHEMA {schema}"))
             conn.execute(text(f"SET search_path TO {schema}, public"))
@@ -110,6 +109,8 @@ def semantic_engine() -> Iterator[Engine]:
                     "file_id integer NOT NULL REFERENCES files(id) ON DELETE CASCADE, "
                     "chunk_index integer NOT NULL, "
                     "content text NOT NULL, "
+                    "start_line integer, "
+                    "end_line integer, "
                     f"embedding vector({SEMANTIC_EMBEDDING_DIM}), "
                     "ts tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED, "
                     "CONSTRAINT uq_chunks_file_id_chunk_index UNIQUE (file_id, chunk_index))"
@@ -117,11 +118,11 @@ def semantic_engine() -> Iterator[Engine]:
             )
             conn.execute(
                 text(
-                    "CREATE INDEX ix_chunks_embedding_hnsw ON chunks "
-                    "USING hnsw (embedding vector_cosine_ops)"
+                    "CREATE INDEX ix_chunks_embedding_ann ON chunks "
+                    "USING lakebase_ann (embedding vector_cosine_ops)"
                 )
             )
-            conn.execute(text("CREATE INDEX ix_chunks_ts_gin ON chunks USING gin (ts)"))
+            conn.execute(text("CREATE INDEX ix_chunks_ts_bm25 ON chunks USING lakebase_bm25 (ts)"))
             conn.commit()
 
             repo_id = conn.execute(
@@ -143,8 +144,8 @@ def semantic_engine() -> Iterator[Engine]:
                 conn,
                 file_id=file_id,
                 chunks=[
-                    (0, "user authentication and login", _vec({0: 1.0})),
-                    (1, "database connection pooling and retries", _vec({0: 0.7, 1: 0.7})),
+                    (0, "user authentication and login", 1, 1, _vec({0: 1.0})),
+                    (1, "database connection pooling and retries", 2, 2, _vec({0: 0.7, 1: 0.7})),
                 ],
             )
             conn.commit()
@@ -209,7 +210,6 @@ def test_api_semantic_enabled_returns_deterministic_ordered_results(
     body2 = resp2.json()
 
     assert body1["semantic_enabled"] is True
-    assert body1["backend"] == "standin"
     assert body1["results"] != []
     assert body1["count"] == len(body1["results"])
 
@@ -219,6 +219,10 @@ def test_api_semantic_enabled_returns_deterministic_ordered_results(
     scores = [r["rrf_score"] for r in body1["results"]]
     assert all(isinstance(s, float) for s in scores)
     assert scores == sorted(scores, reverse=True)
+
+    # Line ranges round-trip to the HTTP envelope (issue #44).
+    top = body1["results"][0]
+    assert (top["start_line"], top["end_line"]) == (1, 1)
 
 
 @pytest.mark.integration

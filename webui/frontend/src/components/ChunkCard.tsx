@@ -1,9 +1,18 @@
 import type { SemanticResult } from "../api/client";
 import { extractNeedle } from "../utils/chunkAnchor";
 
-function chunkHref(result: SemanticResult): string {
-  const needle = extractNeedle(result.content);
+export function chunkHref(result: SemanticResult): string {
   const params = new URLSearchParams({ repo: result.repo, path: result.file });
+  // Exact anchor when the chunk carries its line range (issue #44); rows indexed before
+  // line tracking have nulls and keep the needle-match fallback below.
+  if (result.start_line !== null && result.end_line !== null) {
+    const range =
+      result.end_line > result.start_line
+        ? `#L${result.start_line}-L${result.end_line}`
+        : `#L${result.start_line}`;
+    return `/file?${params.toString()}${range}`;
+  }
+  const needle = extractNeedle(result.content);
   if (needle) params.set("find", needle);
   return `/file?${params.toString()}`;
 }

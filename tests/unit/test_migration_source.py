@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 _VERSIONS_DIR = Path(__file__).resolve().parents[2] / "app" / "alembic" / "versions"
-_EXPECTED_REVISIONS = {"0001", "0002", "0003"}
+_EXPECTED_REVISIONS = {"0001", "0002", "0003", "0004"}
 
 
 @pytest.fixture

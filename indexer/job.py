@@ -422,9 +422,9 @@ def _precompute_chunk_writer(
     """Chunk + embed every file up front (issue #14 A4: no network inside conn.begin()).
 
     Returns a :data:`indexer.store.ChunkWriter` closure over the precomputed
-    ``(chunk_index, content, embedding)`` triples, keyed by file path, so
-    ``index_repo`` can write them per file without ever calling the embedder
-    itself. Raises ``ValueError`` if the repo's total chunk count exceeds
+    ``(chunk_index, content, start_line, end_line, embedding)`` tuples, keyed by
+    file path, so ``index_repo`` can write them per file without ever calling the
+    embedder itself. Raises ``ValueError`` if the repo's total chunk count exceeds
     ``max_chunks_per_repo`` (the documented hard ceiling, not a streaming bound
     -- see ``app.config.semantic_max_chunks_per_repo``).
     """
@@ -446,13 +446,14 @@ def _precompute_chunk_writer(
             f"embedder returned {len(all_vectors)} vectors for {len(all_texts)} chunk texts"
         )
 
-    by_path: dict[str, list[tuple[int, str, list[float]]]] = {}
+    by_path: dict[str, list[tuple[int, str, int, int, list[float]]]] = {}
     i = 0
     for path, chunks in per_file.items():
         if not chunks:
             continue
         by_path[path] = [
-            (c.chunk_index, c.content, all_vectors[i + j]) for j, c in enumerate(chunks)
+            (c.chunk_index, c.content, c.start_line, c.end_line, all_vectors[i + j])
+            for j, c in enumerate(chunks)
         ]
         i += len(chunks)
 

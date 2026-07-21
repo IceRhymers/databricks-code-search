@@ -1,8 +1,9 @@
-"""Integration tests against a real local Postgres 16 (PGHOST mode).
+"""Integration tests for the engine factory against a Lakebase branch.
 
 Exercises the engine factory end-to-end and asserts real DDL fidelity via
 pg_catalog / information_schema after ``create_all()`` (not just metadata
-reflection). Requires a running Postgres with the standard PG* env set.
+reflection). Requires ``LAKEBASE_ENDPOINT`` pointing at a disposable branch
+(the ci-lakebase.yml pattern).
 """
 
 from __future__ import annotations

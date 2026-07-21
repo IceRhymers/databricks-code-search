@@ -4,7 +4,7 @@ No DB, no SDK. The flag-off contract is proven two ways: the payload builder ret
 feature-absent envelope BEFORE touching a (poisoned) engine, and ``databricks.sdk`` is absent
 from ``sys.modules`` after the call (a constructed-but-unused embedder would still import the
 SDK, so the short-circuit must return before the embedder is even built). The RRF builder is
-pinned to the shared fusion wrapper + the correct per-backend leg, and ``format_vector_literal``
+pinned to the fusion wrapper + the lakebase leg operators, and ``format_vector_literal``
 is proven to use ``repr`` (never the invalid ``format(x, "r")`` code) on scientific notation.
 """
 
@@ -40,6 +40,9 @@ class _PoisonedEngine:
 
 @pytest.mark.unit
 def test_flag_off_returns_disabled_payload_and_never_imports_sdk() -> None:
+    # Popped first (same pattern as test_embed): another test file may have already
+    # imported the SDK, and this assertion is about THIS call not importing it.
+    sys.modules.pop("databricks.sdk", None)
     payload = semantic._semantic_search_payload(_PoisonedEngine(), _cfg(enabled=False), "auth", 10)
 
     assert payload["semantic_enabled"] is False
@@ -72,11 +75,10 @@ def test_format_vector_literal_empty() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("backend", ["lakebase", "standin"])
-def test_rrf_sql_shared_wrapper(backend: str) -> None:
-    sql = str(semantic.build_hybrid_rrf_sql(backend))
+def test_rrf_sql_fusion_wrapper() -> None:
+    sql = str(semantic.build_hybrid_rrf_sql())
 
-    # Shared fusion wrapper: two rank CTEs, index-friendly inner LIMIT, FULL OUTER JOIN, RRF sum.
+    # Fusion wrapper: two rank CTEs, index-friendly inner LIMIT, FULL OUTER JOIN, RRF sum.
     assert "ann AS (" in sql and "bm AS (" in sql
     # Both legs break rank ties on id: arbitrary rank assignment among equal scores would
     # change each row's 1/(k+rank) contribution, so the same query over the same corpus
@@ -84,11 +86,12 @@ def test_rrf_sql_shared_wrapper(backend: str) -> None:
     assert sql.count("row_number() OVER (ORDER BY metric, id)") == 2
     # NEITHER leg's inner ORDER BY may carry a second sort key. Postgres cannot build an
     # ordered-index path when one follows an ORDER BY-operator key, and the fallback is not
-    # cost-based -- it seq-scans and full-sorts even with enable_seqscan=off. This guard is
-    # the ONLY thing protecting the BM25 leg: CI's stand-in metric (ts_rank_cd) is never
-    # index-ordered, so a regression here is invisible to any EXPLAIN test.
+    # cost-based -- it seq-scans and full-sorts even with enable_seqscan=off. This SQL-shape
+    # guard is the fast tripwire; the plan itself is only observable on a Lakebase branch.
     assert "ORDER BY c.embedding <=> (:qvec)::vector LIMIT :topk" in sql
     assert ", id LIMIT :topk" not in sql
+    # The ANN metric appears in the inner SELECT and its ORDER BY (index-served ordering).
+    assert sql.count("c.embedding <=> (:qvec)::vector") == 2
     # NULL embeddings never earn RRF credit.
     assert "AND c.embedding IS NOT NULL" in sql
     # Each leg's candidate cap lives in an INNER subquery whose ORDER BY repeats the metric
@@ -112,22 +115,12 @@ def test_rrf_sql_shared_wrapper(backend: str) -> None:
 
 
 @pytest.mark.unit
-def test_rrf_sql_lakebase_leg_uses_bm25_scorer() -> None:
-    sql = str(semantic.build_hybrid_rrf_sql("lakebase"))
+def test_rrf_sql_bm_leg_uses_bm25_scorer() -> None:
+    sql = str(semantic.build_hybrid_rrf_sql())
     scorer = "c.ts <@> to_bm25query(to_tsvector('english', :qtext), 'ix_chunks_ts_bm25'::regclass)"
     # Repeated in the inner SELECT and its ORDER BY so the bm25 index serves the ordering.
     assert sql.count(scorer) == 2
     assert "ts_rank_cd" not in sql
-
-
-@pytest.mark.unit
-def test_rrf_sql_standin_leg_uses_negated_ts_rank_cd() -> None:
-    sql = str(semantic.build_hybrid_rrf_sql("standin"))
-    # Negated so ASC-orders-best, keeping the shared wrapper's ORDER BY direction identical.
-    assert sql.count("- ts_rank_cd(c.ts, plainto_tsquery('english', :qtext))") == 2
-    assert "to_bm25query" not in sql
-    # The ANN leg is byte-identical to the lakebase backend's (pgvector `<=>` == lakebase_ann).
-    assert sql.count("c.embedding <=> (:qvec)::vector") == 2
 
 
 # --------------------------------------------------------- branch-scoped leg (0003, D1)
@@ -135,7 +128,7 @@ def test_rrf_sql_standin_leg_uses_negated_ts_rank_cd() -> None:
 
 @pytest.mark.unit
 def test_rrf_sql_explicit_branch_uses_gin_served_membership() -> None:
-    sql = str(semantic.build_hybrid_rrf_sql("standin", branch="feature/x"))
+    sql = str(semantic.build_hybrid_rrf_sql(branch="feature/x"))
     # Explicit branch: opts into the GIN-served exact-membership predicate on BOTH legs,
     # and the default coalesce predicate must not also be present.
     assert sql.count("f.branches @> ARRAY[:branch]") == 2
@@ -146,10 +139,11 @@ def test_rrf_sql_explicit_branch_uses_gin_served_membership() -> None:
 def test_rrf_sql_branch_predicate_is_where_never_order_by() -> None:
     # The branch predicate must never leak into either leg's ORDER BY -- that would cost the
     # ANN/BM25 index a second sort key (see _leg_cte). It belongs only in the inner WHERE.
-    sql = str(semantic.build_hybrid_rrf_sql("standin", branch="feature/x"))
+    sql = str(semantic.build_hybrid_rrf_sql(branch="feature/x"))
     for order_by_clause in [
         "ORDER BY c.embedding <=> (:qvec)::vector LIMIT :topk",
-        "ORDER BY - ts_rank_cd(c.ts, plainto_tsquery('english', :qtext)) LIMIT :topk",
+        "ORDER BY c.ts <@> to_bm25query(to_tsvector('english', :qtext), "
+        "'ix_chunks_ts_bm25'::regclass) LIMIT :topk",
     ]:
         assert order_by_clause in sql
         assert "branches" not in order_by_clause
@@ -165,7 +159,7 @@ def test_rrf_sql_inner_subquery_is_c_qualified_outer_window_stays_bare() -> None
     the inner id (ambiguous against files.id/repos.id) and over-qualifying the outer window
     (`c.id` there is invalid SQL -- "missing FROM-clause entry for table c").
     """
-    sql = str(semantic.build_hybrid_rrf_sql("standin"))
+    sql = str(semantic.build_hybrid_rrf_sql())
     # Inner projection: c.-qualified id and metric, sourced from the 3-way join.
     assert sql.count("SELECT c.id AS id,") == 2
     assert "FROM chunks c JOIN files f ON f.id = c.file_id JOIN repos r ON r.id = f.repo_id" in sql
@@ -173,12 +167,6 @@ def test_rrf_sql_inner_subquery_is_c_qualified_outer_window_stays_bare() -> None
     assert sql.count("SELECT id, row_number() OVER (ORDER BY metric, id) AS rank FROM (") == 2
     assert "SELECT c.id, row_number()" not in sql
     assert "ORDER BY c.metric" not in sql
-
-
-@pytest.mark.unit
-def test_rrf_sql_rejects_unknown_backend() -> None:
-    with pytest.raises(ValueError, match="unknown semantic backend"):
-        semantic.build_hybrid_rrf_sql("bogus")
 
 
 # -------------------------------------------------------------- enabled-path envelope shaping
@@ -199,7 +187,7 @@ class _FakeResult:
 
 
 class _FakeConn:
-    """Returns canned results by call order: [backend probe, chunks probe, RRF rows]."""
+    """Returns canned results by call order: [chunks probe, RRF rows]."""
 
     def __init__(self, results: list[Any]) -> None:
         self._results = list(results)
@@ -235,12 +223,11 @@ class _Row:
 
 
 @pytest.mark.unit
-def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No lakebase_bm25 am (empty probe) -> standin backend; embedder is faked (no SDK).
+def test_enabled_payload_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Embedder is faked (no SDK, no gateway call).
     monkeypatch.setattr(semantic, "get_embedder", lambda cfg: lambda texts: [[0.1, 0.2]])
     engine = _FakeEngine(
         [
-            _FakeResult([]),  # detect_backend probe: no lakebase_bm25 -> standin
             _FakeResult(["chunks"]),  # to_regclass('chunks') -> schema present
             _FakeResult(
                 [
@@ -250,6 +237,8 @@ def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
                         path="src/a.py",
                         chunk_index=0,
                         content="x",
+                        start_line=10,
+                        end_line=24,
                         rrf_score=0.5,
                     )
                 ]
@@ -260,7 +249,6 @@ def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = semantic._semantic_search_payload(engine, _cfg(enabled=True), "auth flow", 50)
 
     assert payload["semantic_enabled"] is True
-    assert payload["backend"] == "standin"
     assert payload["count"] == 1
     assert payload["results"] == [
         {
@@ -268,10 +256,12 @@ def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
             "file": "src/a.py",
             "chunk_index": 0,
             "content": "x",
+            "start_line": 10,
+            "end_line": 24,
             "rrf_score": 0.5,
         }
     ]
-    # Transaction-local timeout set on BOTH transactions (capability probe, then the query),
+    # Transaction-local timeout set on BOTH transactions (schema probe, then the query),
     # matching the other builders; it never leaks onto the pooled connection.
     assert engine._conn.driver_sql == [
         "SET LOCAL statement_timeout = 5000",
@@ -283,9 +273,9 @@ def test_enabled_payload_shape_standin(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_enabled_but_not_migrated_returns_structured_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Flag on before `make migrate-semantic` is recoverable, not a 500.
+    """Flag on with core migrations behind 0004 is recoverable, not a 500.
 
-    A missing gated migration is operator-fixable and belongs in the same class as
+    A missing chunks migration is operator-fixable and belongs in the same class as
     query_too_broad -- a payload field, never an exception (app/main.py's contract).
     It must also short-circuit BEFORE the embedder is called, so discovering the
     misconfiguration costs no embedding spend.
@@ -297,7 +287,6 @@ def test_enabled_but_not_migrated_returns_structured_payload(
     monkeypatch.setattr(semantic, "get_embedder", _never)
     engine = _FakeEngine(
         [
-            _FakeResult([]),  # no lakebase_bm25 -> standin
             _FakeResult([]),  # to_regclass('chunks') -> NULL: migration not run
         ]
     )
@@ -308,21 +297,4 @@ def test_enabled_but_not_migrated_returns_structured_payload(
     assert payload["semantic_schema_missing"] is True
     assert payload["results"] == []
     assert payload["count"] == 0
-    assert "migrate-semantic" in payload["reason"]
-
-
-@pytest.mark.unit
-def test_enabled_payload_detects_lakebase_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(semantic, "get_embedder", lambda cfg: lambda texts: [[0.1, 0.2]])
-    engine = _FakeEngine(
-        [
-            _FakeResult([_Row(x=1)]),  # pg_am probe hit -> lakebase
-            _FakeResult(["chunks"]),  # schema present
-            _FakeResult([]),  # RRF: no rows
-        ]
-    )
-
-    payload = semantic._semantic_search_payload(engine, _cfg(enabled=True), "auth", 50)
-    assert payload["backend"] == "lakebase"
-    assert payload["results"] == []
-    assert payload["count"] == 0
+    assert "make migrate" in payload["reason"]

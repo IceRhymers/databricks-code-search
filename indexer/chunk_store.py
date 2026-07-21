@@ -33,13 +33,15 @@ def write_chunks(
     conn: Connection,
     *,
     file_id: int,
-    chunks: Sequence[tuple[int, str, list[float]]],
+    chunks: Sequence[tuple[int, str, int, int, list[float]]],
 ) -> int:
     """Delete-and-reinsert ``file_id``'s chunk rows; return the row count written.
 
-    ``chunks`` is a sequence of ``(chunk_index, content, embedding)`` triples
-    with embeddings already computed. Runs inside the caller's open
-    transaction, alongside the rest of that file's ``index_repo`` work.
+    ``chunks`` is a sequence of ``(chunk_index, content, start_line, end_line,
+    embedding)`` tuples with embeddings already computed and 1-based inclusive
+    line ranges from the line-aligned chunker (issue #44). Runs inside the
+    caller's open transaction, alongside the rest of that file's ``index_repo``
+    work.
     """
     conn.execute(delete(chunks_table).where(chunks_table.c.file_id == file_id))
     if not chunks:
@@ -52,9 +54,11 @@ def write_chunks(
                 "file_id": file_id,
                 "chunk_index": chunk_index,
                 "content": content,
+                "start_line": start_line,
+                "end_line": end_line,
                 "embedding": embedding,
             }
-            for chunk_index, content, embedding in chunks
+            for chunk_index, content, start_line, end_line, embedding in chunks
         ],
     )
     return len(chunks)

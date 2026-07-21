@@ -1,33 +1,35 @@
-"""semantic chunks (gated, separate history)
+"""semantic chunks (core chain; default-on semantic search)
 
-Revision ID: 0002sem
-Revises:
-Create Date: 2026-07-19 13:40:00.000000
+Revision ID: 0004
+Revises: 0003
+Create Date: 2026-07-21 12:00:00.000000
 
-GATED, IRREVERSIBLE semantic-search surface for issue #14. This revision is
-DELIBERATELY isolated from the core migration graph and MUST NOT reach the core
-``make migrate`` path:
+Semantic search is enabled by default, so the ``chunks`` surface ships with the
+core migration chain: ``make migrate`` (and therefore ``make deploy``) creates it
+with no separate operator ceremony. This supersedes the formerly GATED revision
+``0002sem`` (``app/alembic/versions_semantic/``, applied via the now-removed
+``make migrate-semantic`` into a separate ``alembic_version_semantic`` table).
 
-* ``down_revision = None`` + ``branch_labels = ("semantic",)`` and NO ``depends_on``
-  -- it is a standalone branch head, never a child of ``0001``. A separate version
-  table (``alembic_version_semantic``, wired in ``scripts/migrate.py --semantic``
-  and ``env.py``) means Alembic never records this head in the core
-  ``alembic_version``; if it did, a later core ``upgrade head`` would try to resolve
-  ``0002sem`` against the core-only ScriptDirectory and raise ``CommandError``,
-  permanently breaking core migrations on every enabled project. The 0001->chunks
-  ordering is therefore enforced OPERATIONALLY (the ``--semantic`` entrypoint
-  pre-checks that ``files`` exists) and structurally (the FK below), not by a graph
-  edge -- a ``depends_on`` edge would make Alembic try to RE-APPLY 0001 into the
-  separate history and fail with "relation repos already exists".
+**Project-level assumption (was a gate, now an assumption):** the target Lakebase
+project's Databricks-managed ``shared_preload_libraries`` already includes
+``lakebase_vector,lakebase_text``. That preload change is irreversible,
+project-level, and performed out-of-band (UI/support) -- this migration cannot
+perform it. When the preload is absent, ``CREATE EXTENSION`` fails loudly with
+"must be loaded via shared_preload_libraries" -- now at ``make migrate``/deploy
+time -- and that error IS the signal to go complete the preload prerequisite.
+See ``docs/runbooks/semantic-enablement.md``.
 
-* **The real per-project enablement is NOT this migration.** ``lakebase_vector`` and
-  ``lakebase_text`` load only when the Databricks-MANAGED ``shared_preload_libraries``
-  already includes them. That preload change is irreversible, project-level, and
-  performed out-of-band (UI/support) -- it is a PREREQUISITE this migration cannot
-  perform. When the preload is absent, ``CREATE EXTENSION`` fails loudly with
-  "must be loaded via shared_preload_libraries"; that error IS the intended signal to
-  go complete the managed-preload prerequisite first. See
-  ``docs/runbooks/semantic-enablement.md``.
+**Idempotency guard:** a project that already ran the old gated migration has
+``chunks`` (and possibly ``alembic_version_semantic``). ``to_regclass('chunks')``
+short-circuits the CREATE DDL for that case -- this revision then only adds the
+``start_line``/``end_line`` columns the gated revision predates (issue #44), records
+itself in the core ``alembic_version``, and drops the orphaned semantic version table.
+
+**Line ranges (issue #44):** ``start_line``/``end_line`` (1-based, inclusive) are
+NULLABLE -- rows written before the line-aware chunk writer stay NULL until the next
+re-index naturally backfills them (the INDEX_SEMANTICS_VERSION bump forces exactly
+that), and readers must treat NULL as "no authoritative range" (the webui falls back
+to its needle-match anchor).
 
 Ground truth (captured 2026-07-19 against the live ``code-search`` Lakebase project,
 Postgres 17, on a disposable branch): the ANN access method is ``lakebase_ann`` with
@@ -43,17 +45,30 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from alembic import op
+from sqlalchemy import text
 
 from app.config import SEMANTIC_EMBEDDING_DIM
 
 # revision identifiers, used by Alembic.
-revision: str = "0002sem"
-down_revision: str | None = None
-branch_labels: str | Sequence[str] | None = ("semantic",)
+revision: str = "0004"
+down_revision: str | None = "0003"
+branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # Idempotency guard: a project that ran the old gated `migrate-semantic` already has
+    # the table (created by the retired 0002sem revision). Skip the CREATE DDL, add only
+    # the line-range columns that revision predates (issue #44; IF NOT EXISTS makes a
+    # re-run safe), and clean up the orphaned separate version table; this revision
+    # still lands in `alembic_version`.
+    bind = op.get_bind()
+    if bind.execute(text("SELECT to_regclass('chunks')")).scalar() is not None:
+        op.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS start_line integer")
+        op.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS end_line integer")
+        op.execute("DROP TABLE IF EXISTS alembic_version_semantic")
+        return
+
     # Extensions first (tokenizer -> vector -> text), mirroring 0001's ordering so the
     # dependent lakebase_ann / lakebase_bm25 access methods resolve when the indexes
     # below are built. lakebase_text builds on lakebase_tokenizer. These FAIL LOUDLY
@@ -70,6 +85,11 @@ def upgrade() -> None:
         "file_id integer NOT NULL REFERENCES files(id) ON DELETE CASCADE, "
         "chunk_index integer NOT NULL, "
         "content text NOT NULL, "
+        # 1-based inclusive line range of the chunk within its file (issue #44).
+        # NULLABLE: rows from a pre-line-aware writer stay NULL until re-indexed,
+        # and readers fall back to needle-matching when absent.
+        "start_line integer, "
+        "end_line integer, "
         f"embedding vector({SEMANTIC_EMBEDDING_DIM}), "
         "ts tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED, "
         # Load-bearing for WRITE performance, not just integrity. Postgres does NOT

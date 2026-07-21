@@ -1,23 +1,17 @@
-# Integration tests against a REAL Lakebase branch (issue #14 follow-up).
+# Integration tests against a REAL Lakebase branch -- the project's ONLY integration
+# gate (this project is Lakebase-only; no Postgres image can stand in for the
+# `lakebase_ann` `<=>` ordered-index scan or `lakebase_bm25`'s `ts <@>
+# to_bm25query(...)` scorer, and a stand-in cannot prove BM25 ranking or reveal a
+# query-plan collapse on that leg -- a real regression of exactly that kind was
+# caught in review, not by CI).
 #
-# ==========================================================================
-# DISABLED. There is no CI Lakebase project yet. Enabling requires BOTH:
-#   1. the `code-search-ci` project provisioned, with its managed
-#      shared_preload_libraries including lakebase_vector,lakebase_text, and
-#   2. repository variable CI_LAKEBASE_ENABLED set to "true".
-# See docs/runbooks/ci-lakebase.md. Until then this workflow cannot run: it has
-# no automatic trigger, and a manual dispatch no-ops on the variable guard.
-# ==========================================================================
-#
-# WHY this exists alongside ci.yml's `integration` job rather than replacing it:
-# the semantic layer's production query path uses `lakebase_ann`'s `<=>` ordered-index
-# scan and `lakebase_bm25`'s `ts <@> to_bm25query(...)` scorer. Neither exists in
-# pgvector, so the container job runs a stand-in whose BM25 leg (`ts_rank_cd`) is
-# never index-ordered -- it can prove the RRF fusion plumbing, but it cannot prove
-# BM25 RANKING and it cannot reveal a query-plan collapse on that leg (a real
-# regression of exactly that kind was caught in review, not by CI). This job closes
-# that gap. Once it is green and trusted, ci.yml's `integration` job becomes
-# redundant and should be removed in favour of this one.
+# PREREQUISITES (operator, out-of-band; until they exist the vars guard below
+# no-ops the job on every PR):
+#   1. the `code-search-ci` Lakebase project provisioned, with its managed
+#      shared_preload_libraries including lakebase_vector,lakebase_text,
+#   2. repo secrets DATABRICKS_HOST / DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET,
+#   3. repository variable CI_LAKEBASE_ENABLED set to "true".
+# See docs/runbooks/ci-lakebase.md.
 #
 # ISOLATION: each run forks a throwaway Lakebase branch (copy-on-write, so it is
 # cheap) and purges it in an `always()` step. The suite creates and drops extensions
@@ -27,11 +21,9 @@
 name: CI (Lakebase)
 
 on:
-  # No push/pull_request trigger by design -- see the DISABLED banner above.
-  # When enabling, add:
-  #   pull_request:
-  #   push:
-  #     branches: [master]
+  pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -77,21 +69,13 @@ jobs:
             --project "$CI_LAKEBASE_PROJECT" \
             --branch "${{ steps.branch.outputs.id }}" >> "$GITHUB_ENV"
 
-      - name: Apply core migrations
+      - name: Apply migrations
         # PGHOST must stay unset so app/db/client.py takes the Lakebase OAuth path.
+        # The core chain includes 0004 (semantic `chunks` + real lakebase_vector /
+        # lakebase_text DDL) -- no separate semantic step, no ack.
         run: uv run python scripts/migrate.py
 
-      - name: Apply gated semantic migration
-        # The whole point of this job: real lakebase_vector / lakebase_text DDL.
-        # CODE_SEARCH_SEMANTIC_ACK is the non-interactive form of the irreversibility
-        # acknowledgement -- safe here because the target is a throwaway branch.
-        env:
-          CODE_SEARCH_SEMANTIC_ACK: "1"
-        run: uv run python scripts/migrate.py --semantic
-
       - name: Integration tests (real Lakebase engine)
-        env:
-          CODE_SEARCH_SEMANTIC_ENABLED: "1"
         run: make test-integration
 
       - name: Purge ephemeral Lakebase branch

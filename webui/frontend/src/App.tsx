@@ -38,6 +38,7 @@ export function App(): JSX.Element {
             repo={route.repo}
             path={route.path}
             line={route.line}
+            endLine={route.endLine}
             find={route.find}
             branch={route.branch}
           />

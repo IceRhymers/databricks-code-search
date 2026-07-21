@@ -55,9 +55,6 @@ SUB="${1:-}"
 TARGET="${2:-dev}"
 
 [ -n "$SUB" ] || die "usage: deploy.sh <full|destroy> [TARGET]"
-# A set PGHOST would send `make migrate` (and create_db_engine) at local Postgres instead of
-# the bundle's Lakebase — same guard the `migrate` Makefile target uses.
-[ -z "${PGHOST:-}" ] || die "PGHOST is set -> deploy would target local Postgres; unset PGHOST"
 
 # Prod threads --var job_run_as_sp (the writer SP); dev has no vars. One derivation idiom,
 # mirrored from the `migrate` Makefile target.

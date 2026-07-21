@@ -1,15 +1,15 @@
-"""Integration tests for the hybrid RRF query against real local Postgres (issue #14).
+"""Integration tests for the hybrid RRF query against a real Lakebase branch (issue #14).
 
-Runs the ``standin`` backend (pgvector ``<=>`` + ``ts_rank_cd``) that CI's
-``pgvector/pgvector:pg16`` image supports -- the ``lakebase_ann`` / ``lakebase_bm25``
-operators are lakebase-only and are proven by the live smoke leg, not here. This test proves
-the fusion PLUMBING (both legs' ranks fuse via ``FULL OUTER JOIN`` + ``1/(k+rank)``), the real
-ANN cosine operator, and HNSW index usage (EXPLAIN). The BM25 leg here is ``ts_rank_cd``, an
-APPROXIMATION of the production ``lakebase_text`` scorer (documented, plan DR-4).
+Runs the PRODUCTION operators -- ``lakebase_ann`` ``<=>`` and ``lakebase_bm25``
+``<@>`` / ``to_bm25query`` -- so this suite proves the fusion plumbing (both legs' ranks
+fuse via ``FULL OUTER JOIN`` + ``1/(k+rank)``), real BM25 ranking, AND ANN index usage
+(EXPLAIN). The suite requires an ephemeral Lakebase branch whose project preloads
+``lakebase_vector,lakebase_text`` (the ci-lakebase.yml pattern); the fixture fails
+loudly when the access methods are absent.
 
-The stand-in ``chunks`` table (pgvector ``vector`` + generated ``tsvector`` + hnsw/gin indexes)
-mirrors the TEST-ONLY revision under ``fixtures/versions_semantic_standin/``; it is built with
-raw DDL on the fixture connection so this test needs no beta extension.
+The fixture builds ``chunks`` in a throwaway schema with DDL identical to the ``0004``
+migration's (same extensions, same indexes), keeping the same per-test isolation as the
+rest of the integration suite.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _vec(pairs: dict[int, float]) -> list[float]:
 
 @pytest.fixture
 def seeded() -> Iterator[Connection]:
-    """Throwaway schema: core DDL + a pgvector stand-in ``chunks`` seeded with 3 known chunks.
+    """Throwaway schema: core DDL + the real (0004-shaped) ``chunks`` seeded with 3 chunks.
 
     Chunks are crafted so the ANN and BM25 legs disagree, exercising the ``FULL OUTER JOIN``:
       * A -- embedding aligned with the query vector AND text-relevant (ranks high in BOTH legs)
@@ -50,17 +50,26 @@ def seeded() -> Iterator[Connection]:
     conn = engine.connect()
     try:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        # Same order as 0004: tokenizer -> vector -> text. Fails loudly on a project
+        # without the lakebase_vector,lakebase_text preload -- the intended signal.
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_text"))
         conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {SCHEMA}"))
         conn.execute(text(f"SET search_path TO {SCHEMA}, public"))
         conn.commit()
 
-        # A5 precondition: the CI image must provide HNSW (pgvector >= 0.5.0).
-        hnsw = conn.execute(text("SELECT 1 FROM pg_am WHERE amname = 'hnsw'")).first()
-        assert hnsw is not None, "pgvector HNSW access method is unavailable (image regressed?)"
+        # Precondition: the branch must expose the production access methods.
+        for am in ("lakebase_ann", "lakebase_bm25"):
+            row = conn.execute(text(f"SELECT 1 FROM pg_am WHERE amname = '{am}'")).first()
+            assert row is not None, (
+                f"{am} access method unavailable -- is this a Lakebase branch whose project "
+                "preloads lakebase_vector,lakebase_text? (see docs/runbooks/ci-lakebase.md)"
+            )
 
         Base.metadata.create_all(bind=conn)
+        # DDL identical to the 0004 migration's (real operators, real indexes).
         conn.execute(
             text(
                 "CREATE TABLE chunks ("
@@ -68,6 +77,8 @@ def seeded() -> Iterator[Connection]:
                 "file_id integer NOT NULL REFERENCES files(id) ON DELETE CASCADE, "
                 "chunk_index integer NOT NULL, "
                 "content text NOT NULL, "
+                "start_line integer, "
+                "end_line integer, "
                 f"embedding vector({SEMANTIC_EMBEDDING_DIM}), "
                 "ts tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED, "
                 "CONSTRAINT uq_chunks_file_id_chunk_index UNIQUE (file_id, chunk_index))"
@@ -75,11 +86,11 @@ def seeded() -> Iterator[Connection]:
         )
         conn.execute(
             text(
-                "CREATE INDEX ix_chunks_embedding_hnsw ON chunks "
-                "USING hnsw (embedding vector_cosine_ops)"
+                "CREATE INDEX ix_chunks_embedding_ann ON chunks "
+                "USING lakebase_ann (embedding vector_cosine_ops)"
             )
         )
-        conn.execute(text("CREATE INDEX ix_chunks_ts_gin ON chunks USING gin (ts)"))
+        conn.execute(text("CREATE INDEX ix_chunks_ts_bm25 ON chunks USING lakebase_bm25 (ts)"))
         conn.commit()
 
         repo_id = conn.execute(
@@ -103,9 +114,9 @@ def seeded() -> Iterator[Connection]:
             file_id=file_id,
             chunks=[
                 # A ranks high in BOTH legs; B is ANN-only; C is BM25-only.
-                (0, "user authentication and login", _vec({0: 1.0})),
-                (1, "database connection pooling and retries", _vec({0: 0.7, 1: 0.7})),
-                (2, "authentication authentication token authentication", _vec({1: 1.0})),
+                (0, "user authentication and login", 1, 1, _vec({0: 1.0})),
+                (1, "database connection pooling and retries", 2, 2, _vec({0: 0.7, 1: 0.7})),
+                (2, "authentication authentication token authentication", 3, 3, _vec({1: 1.0})),
             ],
         )
         conn.commit()
@@ -113,7 +124,8 @@ def seeded() -> Iterator[Connection]:
         yield conn
     finally:
         conn.rollback()
-        conn.execute(text("DROP EXTENSION IF EXISTS vector CASCADE"))
+        # Extensions are database-wide and migration-owned (0004's do-not-drop rationale);
+        # teardown drops only this test's schema.
         conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         conn.commit()
         conn.close()
@@ -134,7 +146,7 @@ def _params(topk: int, limit: int) -> dict[str, object]:
 def test_rrf_fuses_ann_and_bm25_legs(seeded: Connection) -> None:
     # topk=2 so each leg keeps only its top 2 candidates: ANN keeps {A, B}, BM25 keeps {C, A}.
     # The FULL OUTER JOIN must surface all three -- A (both legs), B (ANN-only), C (BM25-only).
-    rows = seeded.execute(build_hybrid_rrf_sql("standin"), _params(topk=2, limit=10)).all()
+    rows = seeded.execute(build_hybrid_rrf_sql(), _params(topk=2, limit=10)).all()
 
     contents = [r.content for r in rows]
     assert len(rows) == 3, f"expected all three chunks fused, got {contents}"
@@ -150,22 +162,25 @@ def test_rrf_fuses_ann_and_bm25_legs(seeded: Connection) -> None:
     assert rows[0].repo == "acme/widgets"
     assert rows[0].path == "src/auth.py"
     assert rows[0].chunk_index == 0
+    # Line ranges round-trip from the writer to the envelope (issue #44).
+    assert (rows[0].start_line, rows[0].end_line) == (1, 1)
 
 
 @pytest.mark.integration
-def test_ann_leg_uses_hnsw_index_not_seqscan_sort(seeded: Connection) -> None:
-    # EXPLAIN the ANN leg's shape: the inner ORDER BY <=> LIMIT must ride the HNSW index, not a
-    # Seq Scan + Sort. enable_seqscan=off (transaction-local) makes the assertion meaningful on a
-    # tiny table without changing the query the builder emits.
+def test_ann_leg_uses_ann_index_not_seqscan_sort(seeded: Connection) -> None:
+    # EXPLAIN the ANN leg's shape: the inner ORDER BY <=> LIMIT must ride the lakebase_ann
+    # index, not a Seq Scan + Sort. enable_seqscan=off (transaction-local) makes the assertion
+    # meaningful on a tiny table without changing the query the builder emits. This is the
+    # regression the single-expression inner ORDER BY exists to prevent (see _leg_cte) --
+    # provable only here, against the real operator.
     with seeded.begin():
         seeded.exec_driver_sql("SET LOCAL enable_seqscan = off")
         plan_rows = seeded.execute(
-            text("EXPLAIN " + str(build_hybrid_rrf_sql("standin"))), _params(topk=2, limit=10)
+            text("EXPLAIN " + str(build_hybrid_rrf_sql())), _params(topk=2, limit=10)
         ).all()
     plan = "\n".join(str(r[0]) for r in plan_rows)
 
-    assert "ix_chunks_embedding_hnsw" in plan, f"ANN leg did not use the HNSW index:\n{plan}"
-    assert "Index Scan using ix_chunks_embedding_hnsw" in plan, plan
+    assert "ix_chunks_embedding_ann" in plan, f"ANN leg did not use the lakebase_ann index:\n{plan}"
 
 
 # ------------------------------------------------------------------- branch scoping (0003)
@@ -192,7 +207,7 @@ def test_rrf_default_query_excludes_feature_only_chunk(seeded: Connection) -> No
     write_chunks(
         seeded,
         file_id=feature_file_id,
-        chunks=[(0, "gizmo widget only on the feature branch", _vec({2: 1.0}))],
+        chunks=[(0, "gizmo widget only on the feature branch", 1, 1, _vec({2: 1.0}))],
     )
     seeded.commit()
 
@@ -200,7 +215,7 @@ def test_rrf_default_query_excludes_feature_only_chunk(seeded: Connection) -> No
     params["qvec"] = format_vector_literal(_vec({2: 1.0}))
     params["qtext"] = "gizmo"
 
-    default_rows = seeded.execute(build_hybrid_rrf_sql("standin"), params).all()
+    default_rows = seeded.execute(build_hybrid_rrf_sql(), params).all()
     assert all(r.content != "gizmo widget only on the feature branch" for r in default_rows)
 
 
@@ -230,7 +245,7 @@ def _seed_null_default_head_chunk(conn: Connection) -> None:
     write_chunks(
         conn,
         file_id=head_file_id,
-        chunks=[(0, "widget gizmo only reachable on head", _vec({3: 1.0}))],
+        chunks=[(0, "widget gizmo only reachable on head", 1, 1, _vec({3: 1.0}))],
     )
     conn.commit()
 
@@ -248,7 +263,7 @@ def test_rrf_default_query_resolves_null_default_branch_to_head(seeded: Connecti
     # resolve to 'HEAD' and match a chunk tagged branches=['HEAD'], with no branch= given.
     _seed_null_default_head_chunk(seeded)
 
-    default_rows = seeded.execute(build_hybrid_rrf_sql("standin"), _null_default_params()).all()
+    default_rows = seeded.execute(build_hybrid_rrf_sql(), _null_default_params()).all()
     contents = [r.content for r in default_rows]
     assert "widget gizmo only reachable on head" in contents
 
@@ -261,7 +276,7 @@ def test_rrf_explicit_branch_head_reaches_null_default_repo_chunk(seeded: Connec
 
     params = _null_default_params()
     params["branch"] = "HEAD"
-    branch_rows = seeded.execute(build_hybrid_rrf_sql("standin", branch="HEAD"), params).all()
+    branch_rows = seeded.execute(build_hybrid_rrf_sql(branch="HEAD"), params).all()
     contents = [r.content for r in branch_rows]
     assert "widget gizmo only reachable on head" in contents
 
@@ -284,7 +299,7 @@ def test_rrf_branch_filter_reaches_feature_only_chunk(seeded: Connection) -> Non
     write_chunks(
         seeded,
         file_id=feature_file_id,
-        chunks=[(0, "gizmo widget only on the feature branch", _vec({2: 1.0}))],
+        chunks=[(0, "gizmo widget only on the feature branch", 1, 1, _vec({2: 1.0}))],
     )
     seeded.commit()
 
@@ -293,7 +308,7 @@ def test_rrf_branch_filter_reaches_feature_only_chunk(seeded: Connection) -> Non
     params["qtext"] = "gizmo"
     params["branch"] = "feature"
 
-    branch_rows = seeded.execute(build_hybrid_rrf_sql("standin", branch="feature"), params).all()
+    branch_rows = seeded.execute(build_hybrid_rrf_sql(branch="feature"), params).all()
     contents = [r.content for r in branch_rows]
     assert "gizmo widget only on the feature branch" in contents
     # The pre-existing "main"-only chunks (A/B/C) never carry "feature" membership, so an

@@ -29,12 +29,14 @@ export function FilePage({
   repo,
   path,
   line,
+  endLine,
   find,
   branch,
 }: {
   repo: string;
   path: string;
   line: number | null;
+  endLine: number | null;
   find: string | null;
   branch: string | null;
 }): JSX.Element {
@@ -132,7 +134,12 @@ export function FilePage({
           </button>
         </div>
       )}
-      <CodeBlock content={state.file.content} lang={detectLang(path)} targetLine={line} />
+      <CodeBlock
+        content={state.file.content}
+        lang={detectLang(path)}
+        targetLine={line}
+        targetEndLine={endLine}
+      />
     </div>
   );
 }

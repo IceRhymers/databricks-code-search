@@ -37,13 +37,32 @@ def test_embedding_dim_single_sourced() -> None:
 
 
 @pytest.mark.unit
-def test_semantic_enabled_false_by_default() -> None:
-    assert get_settings().semantic_enabled is False
+def test_semantic_defaults_are_on_and_gateway_backed() -> None:
+    """Default-on contract (AC5): no env needed on any app/job for semantic search."""
+    cfg = get_settings()
+    assert cfg.semantic_enabled is True
+    assert cfg.semantic_embedding_model == "system.ai.gte-large-en"
+    assert cfg.semantic_embedding_endpoint == "/ai-gateway/mlflow/v1/embeddings"
+
+
+@pytest.mark.unit
+def test_semantic_opt_out_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODE_SEARCH_SEMANTIC_ENABLED", "0")
+    assert Settings().semantic_enabled is False
 
 
 @pytest.mark.unit
 def test_chunks_columns_and_embedding_dim() -> None:
-    expected = {"id", "file_id", "chunk_index", "content", "embedding", "ts"}
+    expected = {
+        "id",
+        "file_id",
+        "chunk_index",
+        "content",
+        "start_line",
+        "end_line",
+        "embedding",
+        "ts",
+    }
     assert set(chunks.columns.keys()) == expected
     assert chunks.c.id.primary_key
     assert not chunks.c.file_id.nullable

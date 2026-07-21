@@ -1,8 +1,9 @@
-"""Integration tests for indexer.store's chunk_writer param against real local Postgres.
+"""Integration tests for indexer.store's chunk_writer param against a Lakebase branch.
 
 Reuses test_store.py's throwaway-schema fixture style, extended with a ``chunks``
-table matching app.db.semantic's shape -- a plain pgvector ``vector`` column, no
-beta extension required. Built with raw DDL (like test_semantic_rrf.py's stand-in)
+table matching app.db.semantic's shape (``vector`` column via ``lakebase_vector``,
+plain ``ts`` -- the generated column and BM25 behavior are test_semantic_rrf.py's
+concern). Built with raw DDL (like test_semantic_rrf.py's fixture)
 rather than ``semantic_metadata.create_all``: ``chunks.file_id`` references
 ``files.id`` across two separate ``MetaData`` instances (deliberately -- see
 app/db/semantic.py), which SQLAlchemy's cross-metadata FK sorter can't resolve.
@@ -36,7 +37,7 @@ def conn() -> Iterator[Connection]:
     connection = engine.connect()
     try:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS lakebase_vector"))
         connection.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         connection.execute(text(f"CREATE SCHEMA {SCHEMA}"))
         connection.execute(text(f"SET search_path TO {SCHEMA}, public"))
@@ -50,6 +51,8 @@ def conn() -> Iterator[Connection]:
                 "file_id integer NOT NULL REFERENCES files(id) ON DELETE CASCADE, "
                 "chunk_index integer NOT NULL, "
                 "content text NOT NULL, "
+                "start_line integer, "
+                "end_line integer, "
                 f"embedding vector({SEMANTIC_EMBEDDING_DIM}), "
                 "ts tsvector, "
                 "CONSTRAINT uq_chunks_file_id_chunk_index UNIQUE (file_id, chunk_index))"
@@ -60,7 +63,7 @@ def conn() -> Iterator[Connection]:
         yield connection
     finally:
         connection.rollback()
-        connection.execute(text("DROP EXTENSION IF EXISTS vector CASCADE"))
+        # Extensions are database-wide and migration-owned; teardown drops only the schema.
         connection.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         connection.commit()
         connection.close()
@@ -77,7 +80,7 @@ _STUB_VECTOR = [0.1] * SEMANTIC_EMBEDDING_DIM
 def _stub_chunk_writer(conn: Connection, repo_id: int, file_id: int, pf: ParsedFile) -> None:
     # A fixed, precomputed 1-chunk-per-file "embedding" -- proves the seam without
     # needing a real embedder (issue #14 A4: chunk_writer never calls one).
-    write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, _STUB_VECTOR)])
+    write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
 
 
 def _count(conn: Connection, table: str, where: str = "") -> int:

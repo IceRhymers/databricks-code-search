@@ -521,6 +521,8 @@ def test_semantic_enabled_builds_and_wires_a_chunk_writer() -> None:
             "file_id": 42,
             "chunk_index": 0,
             "content": "def f():\n    return 1\n",
+            "start_line": 1,
+            "end_line": 2,
             "embedding": [0.5],
         }
     ]

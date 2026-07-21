@@ -1,225 +1,118 @@
-# Semantic search enablement (issue #14)
+# Semantic search (issue #14) — default-on
 
-Operator runbook for turning on `semantic_search` (vector + BM25 hybrid RRF) on a
-Lakebase project. This is a **deliberate, manual, per-project** operation --
-never part of `make deploy` / `scripts/deploy.sh` -- because step 1 below is
-irreversible and because the schema it creates depends on a beta extension pair
-that must be approved for the target project first.
+`semantic_search` (vector + BM25 hybrid RRF) is **enabled by default**: no env var is
+needed on the MCP app, the webui app, or the indexer job. Enablement for a target is
+simply `make deploy TARGET=<dev|prod>` — the `chunks` DDL rides the core migration
+chain (`app/alembic/versions/0004_semantic_chunks.py`, applied by `make migrate` at
+deploy step 5), and the deploy's own grant steps (7 and 9) cover it.
 
-## 1. The real irreversible step: managed `shared_preload_libraries`
+## 1. Project assumption: managed `shared_preload_libraries`
 
-`lakebase_vector` and `lakebase_text` (and the `lakebase_tokenizer` extension
-`lakebase_text` builds on) only load when the Databricks-**managed**
-`shared_preload_libraries` for the Lakebase project already includes them. This
-is **not** settable through the endpoint/project API or the bundle -- attempting
-to set it that way returns `"setting cannot be changed"`. Getting it added is an
-out-of-band request (UI / Databricks support) against the specific Lakebase
+**Stated project assumption:** every target Lakebase project (dev, prod, and the
+`code-search-ci` CI project) has `lakebase_vector,lakebase_text` in its
+Databricks-**managed** `shared_preload_libraries`. This was formerly a gate; it is now
+an assumption the migration relies on.
+
+The preload is **not** settable through the endpoint/project API or the bundle —
+attempting to set it that way returns `"setting cannot be changed"`. Getting it added
+is an out-of-band request (UI / Databricks support) against the specific Lakebase
 project, and **it is irreversible and project-level**: once added, it cannot be
 removed from that project.
 
-Until the preload includes them, `CREATE EXTENSION lakebase_vector` (and
-`lakebase_text`) fails with an error to the effect of "must be loaded via
-shared_preload_libraries". That failure is the **intended fail-loud signal** --
-it means step 1 has not happened yet for this project, not that anything is
-broken. Do not attempt to work around it; go get the preload added.
+If a project lacks the preload, `CREATE EXTENSION lakebase_vector` (and
+`lakebase_text`) fails with "must be loaded via shared_preload_libraries" — now
+surfacing at `make migrate` / `make deploy` time. That failure is the **intended
+fail-loud signal**: it means the assumption does not hold for this project yet. Do not
+work around it; go get the preload added, then re-run the deploy.
 
-Ground truth (verified live against the `code-search` Lakebase project,
-2026-07-19): before enablement the managed preload was
+Ground truth (verified live against the `code-search` Lakebase project, 2026-07-19):
+before enablement the managed preload was
 `neon,pg_stat_statements,databricks_auth,auto_explain`. After the Databricks-side
 change added `lakebase_vector,lakebase_text`, `CREATE EXTENSION IF NOT EXISTS
-lakebase_tokenizer` / `lakebase_vector` / `lakebase_text` all succeeded in that
-order, and the gated revision's DDL (`vector_cosine_ops` ANN index via
-`lakebase_ann`, `tsvector_bm25_ops` BM25 index via `lakebase_bm25`) built clean.
-See `app/alembic/versions_semantic/0002sem_semantic_chunks.py` for the exact DDL
-and access-method/opclass ground truth this depends on.
+lakebase_tokenizer` / `lakebase_vector` / `lakebase_text` all succeeded in that order,
+and the revision's DDL (`vector_cosine_ops` ANN index via `lakebase_ann`,
+`tsvector_bm25_ops` BM25 index via `lakebase_bm25`) built clean. See
+`app/alembic/versions/0004_semantic_chunks.py` for the exact DDL and
+access-method/opclass ground truth this depends on.
 
-**Do this first, once per project, before anything below.** There is no
-migration or script that performs it -- it is a support/UI action against the
-Lakebase project itself.
-
-## 2. Enablement order
-
-Run these in order, against one target (`dev` or `prod`):
-
-**(a) Managed preload (irreversible, out-of-band).** Confirm with Databricks
-support / the workspace UI that `lakebase_vector` and `lakebase_text` are in the
-project's managed `shared_preload_libraries`. Do not proceed until this is
-confirmed -- the next step fails loudly if it isn't.
-
-**(b) Gated migration.**
+## 2. Enablement = deploy
 
 ```
-make migrate-semantic TARGET=<dev|prod>
+make deploy TARGET=<dev|prod>
 ```
 
-This runs `scripts/migrate.py --semantic`, which:
-- pre-checks that the core migration has already run (`files` table exists;
-  fails loudly with a clear message otherwise -- run `make migrate
-  TARGET=<target>` first if you haven't),
-- prompts an interactive typed confirmation (`Type "enable-semantic" to
-  proceed:`) before touching anything,
-- applies `app/alembic/versions_semantic/0002sem_semantic_chunks.py` into a
-  **separate** version table, `alembic_version_semantic` -- never the core
-  `alembic_version` -- so it can never break a later core `make migrate` on this
-  or any other project (see the revision's docstring for why a shared version
-  table would be catastrophic).
+That is the whole procedure. Specifically, the pipeline (`scripts/deploy.sh`):
 
-This creates `chunks` (with `embedding vector(1024)`, generated `ts tsvector`,
-the `lakebase_ann`/`vector_cosine_ops` ANN index, and the
-`lakebase_bm25`/`tsvector_bm25_ops` BM25 index) as owned by whatever
-role/identity ran the migration (normally the developer's own identity on dev,
-or the deploying identity on prod).
+- **step 5 (`make migrate`)** applies the core chain up to `0004`, which creates the
+  extensions, `chunks` (including the `start_line`/`end_line` columns, issue #44), and
+  both lakebase indexes. On a project that already ran the retired
+  `make migrate-semantic`, `0004`'s `to_regclass('chunks')` guard skips the CREATE,
+  adds the line-range columns, and drops the orphaned `alembic_version_semantic`.
+- **steps 7 and 9** re-apply the wildcard grants **after** the migration, so both app
+  SPs get `SELECT` on `chunks` and (prod) the job SP gets write + `chunks_id_seq`
+  usage. No manual grant reconciliation is needed on the deploy path.
 
-**(c) Re-apply grants.** See section 3 -- this is the step that's easy to get
-wrong.
+**Existing deployments:** the next `make deploy` on a target that predates `0004` runs
+the migration and then the idempotent grants — no manual reconciliation. The
+`INDEX_SEMANTICS_VERSION` bump (`app/db/models.py`) forces every already-indexed
+branch to re-index once on the next job run, which backfills `chunks` (and its line
+ranges); semantic results appear after that run completes.
 
-**(d) Only now, turn the flag on.** Set `CODE_SEARCH_SEMANTIC_ENABLED=1` for the
-app **after** (b) and (c) succeed. Order matters: the flag and the schema are
-independent, so enabling first is a reachable state, and `semantic_search` cannot
-infer the schema from the extensions (the `pg_am` capability probe tells it whether
-the beta extensions are loaded, not whether `chunks` exists). Enabling early is
-handled gracefully rather than catastrophically -- the tool returns a structured
-`semantic_schema_missing` payload rather than raising -- but it returns no results
-until the migration has run, and if you skip (c) the failure appears later, at index
-or query time, as a permission error.
+## 3. Opt-out
 
-**Both Apps, not just one (issue #36).** `CODE_SEARCH_SEMANTIC_ENABLED=1` must be
-set on **both** Databricks Apps in the bundle -- the MCP app (`code_search`) and
-the webui app (`webui`) -- each has its own `app.yaml` and its own environment, so
-setting it on one does not set it on the other. The webui SPA's Semantic tab is
-driven entirely by `GET /api/semantic/status`, which reads the **webui app's own**
-`cfg.semantic_enabled` (see `docs/runbooks/webui.md`); it stays hidden until the
-webui app itself has the flag. Enabling only the MCP app leaves agents able to call
-`semantic_search` over MCP while the webui Semantic tab stays dark -- this is by
-design, not a bug, but it is easy to mistake for one.
+To disable the feature, set `CODE_SEARCH_SEMANTIC_ENABLED=0` explicitly —
+`semantic_search` short-circuits before any DB/embedder access and the indexer skips
+chunk writes entirely.
 
-## 3. Grants reconciliation (the subtle part)
+**All three surfaces, not just one (issue #36):** the flag must be set on the MCP app
+(`code_search`), the webui app (`webui`), **and** the indexer job — each has its own
+environment. The webui SPA's Semantic tab is driven entirely by
+`GET /api/semantic/status`, which reads the **webui app's own** `cfg.semantic_enabled`
+(see `docs/runbooks/webui.md`). Disabling only the MCP app leaves the webui tab
+visible (and vice versa) — easy to mistake for a bug.
 
-`chunks` did not exist when grants were last applied (during `make deploy` /
-`scripts/deploy.sh`'s steps 7 (MCP app) and 9 (webui app)), so neither app SP has
-`SELECT` on it and the job SP has no `INSERT`/`UPDATE`/`DELETE` or sequence usage
-on `chunks_id_seq`. The wildcard grants in `app/db/grants.py` (`GRANT SELECT ON
-ALL TABLES IN SCHEMA`, `GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA`,
-`GRANT USAGE ON ALL SEQUENCES IN SCHEMA`) only cover tables/sequences that exist
-**at the moment the grant runs** -- they are not retroactive. You must re-run the
-grants step for the **MCP app** now that `chunks` exists, and (issue #36) for the
-**webui app** too.
+## 4. Embeddings: AI Gateway
 
-Run this **as the owner of `chunks`** (the identity that ran `migrate-semantic`
-in step 2b) or as a superuser -- an unprivileged role cannot grant on an object
-it doesn't own. This is the same `make migrate ... ARGS=--apply-grants` step
-`scripts/deploy.sh` runs at its steps 7 and 9 (`grant_attempt`), just re-run
-after the semantic migration:
+Embeddings go through the workspace AI Gateway MLflow embeddings route
+(`POST /ai-gateway/mlflow/v1/embeddings`, default model `system.ai.gte-large-en`,
+1024-dim), via the SDK's workspace-authenticated raw API client (`indexer/embed.py`).
+No model-serving endpoint needs to be provisioned. Overrides:
+`CODE_SEARCH_SEMANTIC_EMBEDDING_ENDPOINT` (route path) and
+`CODE_SEARCH_SEMANTIC_EMBEDDING_MODEL` — a model with a different dimension trips the
+dim tripwire test / `EmbeddingDimMismatchError` rather than writing bad vectors.
 
-```
-# dev (MCP app grant only)
-APP_SP_ROLE=<app-sp-client-id> \
-  make migrate TARGET=dev ARGS=--apply-grants
+On a workspace where the route or model is unavailable, the indexer degrades
+gracefully (indexes the core corpus without chunks, logging loudly —
+`indexer/job.py`); an MCP/webui query fails as a logged tool error.
 
-# prod (MCP app -- BOTH roles -- mirrors scripts/deploy.sh step 7)
-APP_SP_ROLE=$(databricks apps get <app_name> -o json | jq -er '.service_principal_client_id') \
-JOB_WRITER_ROLE=$JOB_RUN_AS_SP \
-  make migrate TARGET=prod ARGS=--apply-grants
-```
-
-**Also re-grant the webui app's SP.** The webui app (`docs/runbooks/webui.md`)
-has its **own** service principal and its own least-privilege read-only role,
-granted separately at deploy time (`scripts/deploy.sh` step 9). Whether that role
-already has `SELECT` on `chunks` **may not be covered** -- `build_app_grants`
-(`app/db/grants.py:57`) also emits `ALTER DEFAULT PRIVILEGES IN SCHEMA ... GRANT
-SELECT ON TABLES`, which covers tables created *after* the grant ran, but only
-for tables created by the **same role** that the default privilege was granted
-against. So coverage of a later-created `chunks` for the webui SP depends
-entirely on which identity happened to run the semantic migration in step 2b --
-do not assume it worked. Re-running the webui app's grant is idempotent and is
-the robust fix regardless:
-
-```
-# dev/prod (webui app grant -- read-only, no job role)
-APP_SP_ROLE=$(databricks apps get <webui_app_name> -o json | jq -er '.service_principal_client_id') \
-  make migrate TARGET=<dev|prod> ARGS=--apply-grants
-```
-
-**Warning (asymmetry):** skipping the webui re-grant can leave the MCP app
-working (its `semantic_search` tool returning results normally) while the webui
-app's `/api/semantic` fails at query time with a permission-denied error -- an
-asymmetry that is easy to misdiagnose as "semantic search is broken" when only
-one of the two apps' SPs is actually missing the grant.
-
-Notes:
-- This is the plain `make migrate` target (**not** `make migrate-semantic`) --
-  `scripts/migrate.py` deliberately rejects `--semantic --apply-grants`
-  together (grants and the gated DDL are separate, independently-run
-  concerns). `make migrate` re-running `upgrade head` against an
-  already-current core schema is a no-op; only the grants step does new work.
-- On prod, derive `APP_SP_ROLE` **fresh** from `databricks apps get` (client
-  IDs can rotate) and set `JOB_WRITER_ROLE` to the same job run-as SP
-  (`JOB_RUN_AS_SP`) used for the original deploy -- pass **both** for the MCP
-  app, exactly as `scripts/deploy.sh`'s `cmd_full` step 7 does. The webui app's
-  grant never takes a `JOB_WRITER_ROLE` -- it is read-only-only, same as
-  `scripts/deploy.sh` step 9.
-- `build_job_grants` (`app/db/grants.py`) already emits `GRANT USAGE ON ALL
-  SEQUENCES IN SCHEMA ... TO <job_role>`, so re-running it after `chunks`
-  exists covers the new `bigserial` `chunks_id_seq` too -- no separate sequence
-  grant is needed.
-- **Warning:** a bare `make migrate ARGS=--apply-grants` with no
-  `JOB_WRITER_ROLE` set (or a dev-style app-only grant applied against prod)
-  leaves the indexer's job SP without `INSERT` on `chunks` and without `USAGE`
-  on `chunks_id_seq`. The indexer will then fail at index time with a
-  permission-denied error the first time it tries to write chunks -- not at
-  migration time, so this is easy to miss if you only check the migration
-  step's exit code. Always pass both `APP_SP_ROLE` and `JOB_WRITER_ROLE` on
-  prod **for the MCP-app grant**; the webui app's grant takes only
-  `APP_SP_ROLE` by design -- it is read-only and never takes a
-  `JOB_WRITER_ROLE` (see the webui re-grant command above).
-- Verify: the app SP can `SELECT` from `chunks` (e.g. via the app's `/ready`
-  probe, which already runs a protected-table `SELECT` as the app SP), a
-  subsequent indexing run with `semantic_enabled=true` can insert into
-  `chunks` without error, and (issue #36) the webui `/api/semantic?q=smoke+test`
-  returns results (not a permission error) as the webui SP.
-
-### Lock-window note (A4)
+### Lock-window / memory note (A4)
 
 Embeddings are computed and buffered **outside** the indexing transaction
-(`indexer/job.py` precomputes `(chunks, embeddings)` before opening
-`index_repo`'s `conn.begin()`), so the write itself holds no model-serving call
-under a repo row lock -- only plain DML. Before enabling on a project with large
-repos, still confirm the Lakebase endpoint's
-`idle_in_transaction_session_timeout` comfortably exceeds the time to write one
-repo's buffered chunks, and that `semantic_max_chunks_per_repo`
-(`app/config.py`, default 8000) is large enough for your largest repo -- indexing
-fails loudly rather than silently truncating if a repo exceeds the ceiling.
+(`indexer/job.py` precomputes `(chunks, embeddings)` before opening `index_repo`'s
+`conn.begin()`), so the write itself holds no network call under a repo row lock —
+only plain DML. On a project with large repos, confirm the Lakebase endpoint's
+`idle_in_transaction_session_timeout` comfortably exceeds the time to write one repo's
+buffered chunks, and that `semantic_max_chunks_per_repo` (`app/config.py`, default
+8000) is large enough for your largest repo — indexing fails loudly rather than
+silently truncating if a repo exceeds the ceiling.
 
-That default is deliberately conservative: the buffered vectors are Python float
-lists costing ~32 B per element, so at `dim=1024` each chunk is ~32 KB and 8000
-chunks is ~260 MB resident, held for the duration of the repo's write
-transaction. Raising it scales memory linearly (50000 would be ~1.6 GB and would
-OOM a typical job container *before* the loud ceiling check could fire, which
-defeats the purpose of the ceiling). If a repo legitimately needs more, prefer
-the temp-table staging path (follow-up) over raising this number.
+That default is deliberately conservative: the buffered vectors are Python float lists
+costing ~32 B per element, so at `dim=1024` each chunk is ~32 KB and 8000 chunks is
+~260 MB resident, held for the duration of the repo's write transaction. Raising it
+scales memory linearly (50000 would be ~1.6 GB and would OOM a typical job container
+*before* the loud ceiling check could fire, which defeats the purpose of the ceiling).
+If a repo legitimately needs more, prefer the temp-table staging path (follow-up) over
+raising this number.
 
-## 4. Rollback note
+**Parallelism:** with semantic on by default, the `effective_workers` clamp to 2 in
+`indexer/job.py` now applies to every index run by default (each worker materialises a
+whole repo's chunks) — see `docs/runbooks/indexing-parallelism.md`.
 
-`app/alembic/versions_semantic/0002sem_semantic_chunks.py`'s `downgrade()` drops
-the BM25/ANN indexes and the `chunks` table, but **does not** drop the
-`lakebase_tokenizer` / `lakebase_vector` / `lakebase_text` extensions -- they are
-database-wide objects, and dropping/recreating them buys nothing since the
-managed-preload enablement (section 1) that makes them loadable is itself
-irreversible per project. Downgrading the migration only removes the schema
-objects this feature owns; it does not "disable" the project.
+## 5. Rollback note
 
-To disable the feature going forward without a downgrade, set
-`semantic_enabled=false` (`CODE_SEARCH_SEMANTIC_ENABLED`) -- `semantic_search`
-short-circuits before any DB/embedder access and the indexer skips chunk
-writes entirely.
-
-## 5. Deploy interaction
-
-The semantic migration is **deliberately kept out of `scripts/deploy.sh`**. The
-core deploy pipeline (`make deploy`) never touches a beta extension or the
-`chunks` table -- `make migrate` inside `deploy.sh` only ever runs the core
-`0001` history against the core `alembic_version` table. Enabling semantic
-search is always a separate, deliberate, gated operator action: section 1 (once
-per project, out-of-band) followed by sections 2-3 (`make migrate-semantic`
-then re-grant), run manually whenever an operator chooses to turn the feature on
-for an already-deployed project.
+`0004`'s `downgrade()` drops the BM25/ANN indexes and the `chunks` table, but **does
+not** drop the `lakebase_tokenizer` / `lakebase_vector` / `lakebase_text` extensions —
+they are database-wide objects, and dropping/recreating them buys nothing since the
+managed-preload change (section 1) is itself irreversible per project. Downgrading
+only removes the schema objects this feature owns; it does not "un-preload" the
+project. For a behavioral rollback, prefer the opt-out flag (section 3).

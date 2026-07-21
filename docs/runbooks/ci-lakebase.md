@@ -1,47 +1,44 @@
-# Runbook: running CI against a real Lakebase engine
+# Runbook: CI against a real Lakebase engine
 
-`.github/workflows/ci-lakebase.yml` runs the integration suite against a real
-Lakebase branch instead of a `pgvector` container. **It is disabled** until the
+`.github/workflows/ci-lakebase.yml` runs the integration suite against an ephemeral
+Lakebase branch. It is **the project's only integration gate** — this project is
+Lakebase-only, and no Postgres image can stand in for the production operators. The
+workflow triggers on every PR and on pushes to `master`, but the
+`vars.CI_LAKEBASE_ENABLED` guard keeps the job inert (skipped) until the
 prerequisites below are met.
 
-## Why
+## Why Lakebase-only
 
-The semantic layer's production query path uses two things that exist in no
-Postgres image:
+The semantic layer's production query path uses two things that exist in no Postgres
+image:
 
 - `lakebase_ann`'s `<=>` served by an **ordered-index scan**, and
 - `lakebase_bm25`'s `ts <@> to_bm25query(...)` **BM25 scorer**.
 
-`ci.yml`'s container job substitutes pgvector `<=>` plus `ts_rank_cd`. That
-proves the RRF fusion plumbing and the ANN leg, but it can prove neither BM25
-**ranking** nor the BM25 leg's **query plan** — its stand-in metric is never
-index-ordered, so a plan collapse there is invisible. A regression of exactly
-that kind (an inner `ORDER BY` tiebreak that made the ordered-index path
-unavailable) was caught in code review rather than by CI, and would have been a
-production-only failure. This workflow closes that gap.
+A pgvector stand-in can prove RRF fusion plumbing, but neither BM25 **ranking** nor
+the BM25 leg's **query plan** — a stand-in metric is never index-ordered, so a plan
+collapse there is invisible. A regression of exactly that kind (an inner `ORDER BY`
+tiebreak that made the ordered-index path unavailable) was caught in code review
+rather than by CI, and would have been a production-only failure. Running on a real
+branch closes that gap; the former pgvector container job in `ci.yml` is gone.
 
-## Prerequisites
+**Until the prerequisites are met, integration coverage is zero** (the guard skips
+the job on every PR). Provision the CI project promptly after landing this workflow.
+
+## Prerequisites (operator, out-of-band)
 
 1. **Provision the CI project.** A Lakebase Autoscaling project separate from
    dev/prod — default id `code-search-ci`, declared as the `ci` bundle target in
-   `databricks.yml`. It must be separate: every run creates and drops extensions
-   and tables, which must never happen in a data-bearing project.
+   `databricks.yml`. It must be separate: every run creates and drops tables, which
+   must never happen in a data-bearing project.
 
-2. **Enable the beta preload on it.** Its Databricks-managed
-   `shared_preload_libraries` must include `lakebase_vector,lakebase_text`. This
-   is the same irreversible, out-of-band step described in
-   [`semantic-enablement.md`](semantic-enablement.md) §1 — it is not settable via
-   the API. Without it, the workflow's semantic migration step fails with
+2. **Enable the preload on it.** Its Databricks-managed `shared_preload_libraries`
+   must include `lakebase_vector,lakebase_text` — the stated project assumption (see
+   [`semantic-enablement.md`](semantic-enablement.md) §1; irreversible, not settable
+   via the API). Without it, the workflow's migrate step fails with
    `must be loaded via shared_preload_libraries`.
 
-3. **Keep the CI project's `production` branch UN-MIGRATED.** This is the
-   non-obvious one. Every run forks `production`, and forks inherit *installed*
-   extensions. `test_no_vector_extension_installed` asserts that the core
-   migration leaves no vector-family extension installed, so it fails against a
-   fork of an already-migrated parent. The parent stays clean; each run's branch
-   installs what it needs and is then purged.
-
-4. **Configure repository auth and settings.**
+3. **Configure repository auth and settings.**
    - Secrets: `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`
      for a service principal with permission to create/delete branches on that
      project. Prefer OIDC federation over a long-lived client secret once the
@@ -49,34 +46,39 @@ production-only failure. This workflow closes that gap.
    - Variables: `CI_LAKEBASE_ENABLED=true` (the guard), and optionally
      `CI_LAKEBASE_PROJECT` to override the project id.
 
-5. **Add the triggers.** The workflow deliberately has no `pull_request` / `push`
-   trigger — see the commented block under `on:`. Add them when enabling.
-
 ## How a run works
 
-Each run forks a throwaway branch (copy-on-write, so it is cheap), applies the
-core migration, applies the **gated semantic migration** against the real beta
-extensions, runs `make test-integration` with `CODE_SEARCH_SEMANTIC_ENABLED=1`,
-and purges the branch in an `always()` step.
+Each run forks a throwaway branch off `production` (copy-on-write, so it is cheap),
+runs `scripts/migrate.py` (the core chain includes the `0004` semantic `chunks`
+revision — no separate semantic step, no ack), runs `make test-integration`
+(semantic is default-on; integration tests use fake embedders, so no embedding-
+endpoint cost), and purges the branch in an `always()` step. A pre-migrated parent
+branch is fine: `upgrade head` is idempotent, and every test isolates its DDL in a
+throwaway schema.
 
 Two safety properties worth preserving if you edit it:
 
-- **Per-run branch isolation.** The suite drops extensions and recreates tables;
-  a shared database would let concurrent PRs corrupt each other.
-- **Branch TTL.** `scripts/ci_branch.py` sets a 2h TTL, so a cancelled run that
-  never reaches teardown cannot leak a branch indefinitely. Teardown is also
-  best-effort by design — a purge failure logs a warning rather than masking a
-  real test failure.
+- **Per-run branch isolation.** The suite creates and drops schemas/tables; a shared
+  database would let concurrent PRs corrupt each other.
+- **Branch TTL.** `scripts/ci_branch.py` sets a 2h TTL, so a cancelled run that never
+  reaches teardown cannot leak a branch indefinitely. Teardown is also best-effort by
+  design — a purge failure logs a warning rather than masking a real test failure.
+
+## Local / manual runs
+
+The same pattern works for a manual integration pass or `make migration`
+autogenerate:
+
+```
+uv run python scripts/ci_branch.py up --project code-search-ci --branch <slug>
+# exports LAKEBASE_ENDPOINT / LAKEBASE_DATABASE
+uv run python scripts/migrate.py
+make test-integration
+uv run python scripts/ci_branch.py down --project code-search-ci --branch <slug>
+```
 
 ## Cost
 
-Branches are copy-on-write and endpoints scale to zero, so the steady-state cost
-is roughly the CI project's storage plus the compute of each run. The TTL bounds
-the worst case (a leaked branch) to hours rather than indefinitely.
-
-## After it is green
-
-`ci.yml`'s `integration` job becomes redundant: this job covers everything it
-covers, against the real engine. Remove the container job at that point rather
-than paying for both. Until then, keep both — the container job is currently the
-only integration coverage that actually runs.
+Branches are copy-on-write and endpoints scale to zero, so the steady-state cost is
+roughly the CI project's storage plus the compute of each run. The TTL bounds the
+worst case (a leaked branch) to hours rather than indefinitely.

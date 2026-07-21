@@ -35,6 +35,7 @@ describe("parseLocation", () => {
       repo: "acme/widgets",
       path: "a.py",
       line: null,
+      endLine: null,
       find: null,
       branch: "x",
     });
@@ -43,5 +44,15 @@ describe("parseLocation", () => {
   it("parses /file?repo=..&path=.. with no branch param as branch: null", async () => {
     const route = await parseLocationFor("/file?repo=acme%2Fwidgets&path=a.py");
     expect(route).toMatchObject({ page: "file", branch: null });
+  });
+
+  it("parses a #L10-L24 range anchor into line/endLine (issue #44)", async () => {
+    const route = await parseLocationFor("/file?repo=acme%2Fwidgets&path=a.py#L10-L24");
+    expect(route).toMatchObject({ page: "file", line: 10, endLine: 24 });
+  });
+
+  it("parses a single #L7 anchor with endLine: null", async () => {
+    const route = await parseLocationFor("/file?repo=acme%2Fwidgets&path=a.py#L7");
+    expect(route).toMatchObject({ page: "file", line: 7, endLine: null });
   });
 });

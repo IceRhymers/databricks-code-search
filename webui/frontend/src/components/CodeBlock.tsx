@@ -70,10 +70,13 @@ export function CodeBlock({
   content,
   lang,
   targetLine,
+  targetEndLine = null,
 }: {
   content: string;
   lang: string | null;
   targetLine: number | null;
+  /** Inclusive end of a highlighted range (issue #44 chunk anchors); null = single line. */
+  targetEndLine?: number | null;
 }): JSX.Element {
   const theme = useTheme();
   const [tokenLines, setTokenLines] = useState<Token[][] | null>(null);
@@ -103,12 +106,13 @@ export function CodeBlock({
       <pre>
         {lines.map((lineTokens, i) => {
           const lineNo = i + 1;
-          const isTarget = lineNo === targetLine;
+          const isTarget =
+            targetLine !== null && lineNo >= targetLine && lineNo <= (targetEndLine ?? targetLine);
           return (
             <div
               key={lineNo}
               id={`L${lineNo}`}
-              ref={isTarget ? targetRef : undefined}
+              ref={lineNo === targetLine ? targetRef : undefined}
               className={`code-line${isTarget ? " target" : ""}`}
             >
               <a className="line-no" href={`#L${lineNo}`}>

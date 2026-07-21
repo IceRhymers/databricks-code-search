@@ -1,12 +1,10 @@
 """Integration tests for the query compiler (issue #9): AST -> executed SQL rows.
 
-Requires a running Postgres with the standard PG* env set (schema idiom mirrors
+Runs against a Lakebase branch via ``create_db_engine()`` (schema idiom mirrors
 ``tests/integration/test_migrations.py``: a unique throwaway schema, ``SET
 search_path``, ``Base.metadata.create_all`` -- which also builds the trgm GIN
-indexes -- and ``DROP SCHEMA ... CASCADE`` cleanup in a ``finally``). In this repo
-that Postgres only exists as CI's ``pgvector/pgvector:pg16`` service container
-(``.github/workflows/ci.yml``); there is no local Postgres available here, so
-these tests are CI-only and were validated by lint/type-check, not execution.
+indexes -- and ``DROP SCHEMA ... CASCADE`` cleanup in a ``finally``). CI runs the
+suite on an ephemeral branch (``.github/workflows/ci-lakebase.yml``).
 
 The ``seeded`` fixture is module-scoped: every test in this file only reads (plain
 ``SELECT`` executions and ``EXPLAIN``), so one seeded corpus serves the whole
