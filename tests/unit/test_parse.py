@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from indexer.languages import MAX_FILE_BYTES
-from indexer.parse import iter_source_files
+from indexer.parse import _BINARY_SNIFF_BYTES, iter_source_files
 
 
 @pytest.fixture
@@ -58,3 +58,30 @@ def test_binary_oversized_and_git_are_skipped(tree: Path) -> None:
 def test_size_is_byte_length(tree: Path) -> None:
     by_path = {pf.path: pf for pf in iter_source_files(tree)}
     assert by_path["src/main.py"].size == len(b"def f():\n    return 1\n")
+
+
+@pytest.mark.unit
+def test_nul_past_sniff_window_is_stripped_not_skipped(tmp_path: Path) -> None:
+    root = tmp_path / "acme-widgets-abc1234"
+    root.mkdir()
+    (root / "late_nul.sql").write_bytes(b"a" * 9000 + b"\x00" + b"trailing\n")
+
+    by_path = {pf.path: pf for pf in iter_source_files(root)}
+
+    assert "late_nul.sql" in by_path
+    assert "\x00" not in by_path["late_nul.sql"].content
+    # Original on-disk bytes = 9000 + 1 (NUL) + len(b"trailing\n") = 9010;
+    # one NUL is stripped, so content is 9009 chars while size stays on-disk.
+    assert len(by_path["late_nul.sql"].content) == 9009
+    assert by_path["late_nul.sql"].size == 9010
+
+
+@pytest.mark.unit
+def test_nul_in_first_8kb_still_skipped(tmp_path: Path) -> None:
+    root = tmp_path / "acme-widgets-abc1234"
+    root.mkdir()
+    (root / "early_nul.txt").write_bytes(b"text\x00more text\n")
+    assert len(b"text\x00more text\n") < _BINARY_SNIFF_BYTES
+
+    paths = {pf.path for pf in iter_source_files(root)}
+    assert "early_nul.txt" not in paths

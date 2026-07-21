@@ -31,6 +31,10 @@ def iter_source_files(root: Path) -> Iterator[ParsedFile]:
 
     Skips ``.git/``, files larger than ``MAX_FILE_BYTES``, and binary files (NUL
     sniff or UTF-8 decode failure). ``path`` is repo-relative (``root`` stripped).
+    Any NUL byte surviving the sniff window (legal UTF-8, so it decodes cleanly)
+    is stripped from ``content`` before yield, since Postgres ``text`` rejects
+    NUL; ``size`` stays the on-disk byte length and may exceed ``len(content)``
+    when NULs are stripped.
     """
     root = root.resolve()
     for entry in sorted(root.rglob("*")):
@@ -53,6 +57,12 @@ def iter_source_files(root: Path) -> Iterator[ParsedFile]:
             content = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
+
+        # Postgres `text` rejects NUL (0x00). NUL is legal UTF-8, so a file that
+        # decodes cleanly can still carry an embedded NUL past the 8 KB sniff
+        # window (issue #37). Strip it here, before the yield, so the stored
+        # content and its downstream content_sha stay consistent.
+        content = content.replace("\x00", "")
 
         rel_path = entry.relative_to(root).as_posix()
         lang = EXT_TO_LANG.get(entry.suffix.lower())
