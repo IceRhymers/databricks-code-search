@@ -25,6 +25,94 @@ workspace UI, or `databricks apps update-permissions`). There is no OAuth app co
 register — that prerequisite is specific to the MCP app's `/mcp` streamable-HTTP transport,
 which webui does not expose.
 
+## Semantic search (issue #36)
+
+The webui exposes the same hybrid semantic engine (`app/search/semantic.py`) the MCP
+`semantic_search` tool uses, via two routes on the same FastAPI app, and a Semantic tab in
+the SPA. Both routes are thin passthrough wrappers over `app.service` payload builders --
+they never reimplement search logic, and MCP responses are unaffected.
+
+### `GET /api/semantic/status`
+
+Zero-DB, zero-SDK: reads `cfg.semantic_enabled` straight off this app's own `Settings` and
+returns `{"semantic_enabled": <bool>}`. This drives the SPA's nav-link visibility --
+`App.tsx` fetches it once at mount and renders the "Semantic" nav link only when true. A
+failed fetch (network error, etc.) leaves it `false` -- the nav link fails **closed**, not
+open. Note this reflects the **webui app's own** flag; the MCP app has a separate `app.yaml`
+and can have the flag set independently (see
+[`docs/runbooks/semantic-enablement.md`](semantic-enablement.md) section 2(d)) -- the tab
+stays hidden until the webui app itself has `CODE_SEARCH_SEMANTIC_ENABLED=1`.
+
+### `GET /api/semantic`
+
+Params: `q` (required, non-empty), `limit` (default `50` -- parity with the MCP
+`semantic_search` tool's own default, not `/api/search`'s `0 -> row_limit` convention),
+`branch` (optional, threads straight to the SQL predicate as-is, never appended to a query
+string the way `/api/search`'s `branch:` sugar works).
+
+The response is the builder's payload passed through unchanged (`clamp_limit` still applies
+to `limit`):
+- **Disabled** (`semantic_enabled: false` + `reason`) and **not-migrated**
+  (`semantic_schema_missing: true` + `reason`) are 200 bodies -- recoverable conditions are
+  payload fields, never HTTP errors, mirroring the MCP tool's dispatch contract.
+- **Enabled + migrated**: 200 with `results` (chunk-level `{repo, file, chunk_index,
+  content, rrf_score}`, in RRF-descending/id-tiebreak order -- see the V1 limitation below),
+  `backend`, and `count`.
+- **400** `{"error": "invalid parameter"}` -- a NUL byte in `q`/`branch` reaching a bound SQL
+  parameter (`sqlalchemy.exc.DataError`).
+- **422** -- FastAPI request validation (missing/empty `q`), parity with `/api/search`.
+- **502** `{"error": "semantic search backend unavailable"}` -- any other exception (embedding
+  endpoint auth/network failures are arbitrary exception types). The raw error is logged
+  server-side (`logger.exception`) and never echoed in the response body, mirroring `/ready`'s
+  no-leak policy.
+
+All error bodies use the same `{"detail": {"error": "..."}}` wire shape FastAPI produces for
+`HTTPException(detail={"error": ...})`, identical to `/api/search`/`/api/file`.
+
+### The Semantic tab
+
+A separate `/semantic` route and page (`SemanticPage.tsx`), not a mode toggle on the search
+page -- semantic results are a structurally different envelope (top-k ranked chunks) from
+grep's cursor-paginated line matches, and the two modes answer different questions
+(natural-language relevance vs. pattern matching). Consequences of that separation:
+
+- **No fusion with grep.** Semantic and grep results never interleave in one list; there is
+  no cross-mode dedup pass.
+- **Flat RRF order.** Chunk cards render in exactly the payload's order (RRF score
+  descending, `id` tiebreak) -- the UI never re-sorts. The same file can appear as multiple
+  cards (one per matching chunk) since chunks, not files, are the ranked unit.
+- **Per-chunk cards** (`ChunkCard.tsx`): each shows `{repo}/{file}`, the chunk index, the RRF
+  score (`rrf_score.toFixed(4)`), and the chunk's raw content (no syntax highlighting --
+  highlighting every result chunk is FilePage's cost profile, not a results list's).
+- The route stays registered even when the nav tab is hidden: a direct `/semantic` deep link
+  renders the page's own explanatory state (disabled banner or not-migrated banner) rather
+  than a 404.
+
+### Best-effort "open at nearest line" anchor
+
+`chunks` carries no line ranges (a V1 limitation of the schema -- see below), so clicking a
+`ChunkCard` opens `/file?repo=...&path=...&find=<needle>` where `find` is the chunk's
+**longest non-empty trimmed line** (`extractNeedle` in `utils/chunkAnchor.ts` -- deliberately
+not the first line, since the first line of a token-cut chunk tends to be generic and causes
+silent wrong-line hits). `FilePage` then re-locates that exact text in the file content it
+already fetched (`locateNeedleLine`) and rewrites the URL to the usual `#L<n>` anchor, so the
+existing scroll/highlight behavior takes over unchanged. Three outcomes:
+- **Unique hit:** rewrites straight to `#L<n>`.
+- **Multiple occurrences:** still jumps to the first occurrence, plus a dismissible note that
+  the line appears more than once and the jump may not be the chunk's exact location.
+- **Miss** (content changed shape since indexing, or was re-indexed): opens the file at the
+  top with a dismissible note that the chunk couldn't be located.
+
+### V1 limitation: no index-time line ranges
+
+The `chunks` table stores content only, not `start_line`/`end_line` -- chunk boundaries come
+from token-cutting, not the file's line structure, so there is no authoritative line anchor
+to render. The client-side needle match above is the interim behavior; adding real line
+ranges would require a gated migration revision on an already-shipped table, a chunk-writer
+change, and a full re-index of every semantically-enabled project, so it is out of scope here
+and tracked as a follow-up issue (index-time `start_line`/`end_line` for exact semantic
+anchors).
+
 ## Read-only role
 
 The webui app's service principal is granted the same least-privilege read-only role as the

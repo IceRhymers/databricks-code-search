@@ -373,6 +373,160 @@ def test_api_repos_lists_indexed_repos() -> None:
     assert body["repos"][0]["last_indexed_commit"] == "deadbeef"
 
 
+# ------------------------------------------------------------------------------- /api/semantic
+
+
+@pytest.mark.unit
+def test_api_semantic_disabled_payload_passes_through(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    disabled_payload = {
+        "query": "foo",
+        "semantic_enabled": False,
+        "results": [],
+        "count": 0,
+        "reason": "semantic search is disabled (set CODE_SEARCH_SEMANTIC_ENABLED=1 to enable)",
+    }
+    monkeypatch.setattr(service, "semantic_search_payload", lambda *a, **k: disabled_payload)
+
+    resp = client.get("/api/semantic", params={"q": "foo"})
+
+    assert resp.status_code == 200
+    assert resp.json() == disabled_payload
+
+
+@pytest.mark.unit
+def test_api_semantic_enabled_payload_passes_through_byte_identical(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    enabled_payload = {
+        "query": "how are branch filters compiled to SQL",
+        "semantic_enabled": True,
+        "backend": "standin",
+        "results": [
+            {
+                "repo": "acme/widgets",
+                "file": "src/handler.go",
+                "chunk_index": 0,
+                "content": "func Handle() {}",
+                "rrf_score": 0.0164,
+            }
+        ],
+        "count": 1,
+    }
+    monkeypatch.setattr(service, "semantic_search_payload", lambda *a, **k: enabled_payload)
+
+    resp = client.get("/api/semantic", params={"q": "how are branch filters compiled to SQL"})
+
+    assert resp.status_code == 200
+    assert resp.json() == enabled_payload
+
+
+@pytest.mark.unit
+def test_api_semantic_limit_default_and_clamp_and_branch_threading(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # limit=50 default (MCP-tool parity, NOT /api/search's 0 -> row_limit convention); an
+    # oversized explicit limit still clamps through service.clamp_limit; branch threads through
+    # unchanged (None when omitted).
+    calls: list[tuple[str, int, str | None]] = []
+
+    def _fake(_engine: Any, _cfg: Any, q: str, limit: int, branch: str | None) -> dict[str, Any]:
+        calls.append((q, limit, branch))
+        return {
+            "query": q,
+            "semantic_enabled": True,
+            "backend": "standin",
+            "results": [],
+            "count": 0,
+        }
+
+    monkeypatch.setattr(service, "semantic_search_payload", _fake)
+
+    client.get("/api/semantic", params={"q": "foo"})
+    client.get("/api/semantic", params={"q": "foo", "limit": 5000})
+    client.get("/api/semantic", params={"q": "foo", "branch": "main"})
+
+    assert calls[0] == ("foo", 50, None)
+    assert calls[1] == ("foo", 1000, None)  # clamped to _cfg()'s max_row_limit
+    assert calls[2] == ("foo", 50, "main")
+
+
+@pytest.mark.unit
+def test_api_semantic_missing_q_is_422(client: TestClient) -> None:
+    resp = client.get("/api/semantic")
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.unit
+def test_api_semantic_data_error_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _raise(*_a: object, **_k: object) -> dict[str, Any]:
+        raise _NUL_BYTE_ERROR
+
+    monkeypatch.setattr(service, "semantic_search_payload", _raise)
+
+    resp = client.get("/api/semantic", params={"q": "foo\x00bar"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "invalid parameter"
+
+
+@pytest.mark.unit
+def test_api_semantic_backend_failure_is_502_and_does_not_leak_error_detail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _raise(*_a: object, **_k: object) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(service, "semantic_search_payload", _raise)
+
+    resp = client.get("/api/semantic", params={"q": "foo"})
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["error"] == "semantic search backend unavailable"
+    assert "boom" not in resp.text
+
+
+# ------------------------------------------------------------------------ /api/semantic/status
+
+
+@pytest.mark.unit
+def test_api_semantic_status_false_by_default() -> None:
+    app.dependency_overrides[get_settings] = _cfg
+    try:
+        with TestClient(app) as test_client:
+            resp = test_client.get("/api/semantic/status")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json() == {"semantic_enabled": False}
+
+
+@pytest.mark.unit
+def test_api_semantic_status_true_when_enabled() -> None:
+    def _enabled_cfg() -> Settings:
+        return Settings(
+            lakebase_endpoint=None,
+            statement_timeout_ms=5000,
+            max_content_bytes=8 * 1024 * 1024,
+            row_limit=200,
+            max_row_limit=1000,
+            semantic_enabled=True,
+        )
+
+    app.dependency_overrides[get_settings] = _enabled_cfg
+    try:
+        with TestClient(app) as test_client:
+            resp = test_client.get("/api/semantic/status")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json() == {"semantic_enabled": True}
+
+
 # --------------------------------------------------------------------- security headers
 
 

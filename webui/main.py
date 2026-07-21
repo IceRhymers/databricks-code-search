@@ -212,6 +212,55 @@ async def api_repos(engine: EngineDep, cfg: SettingsDep) -> dict[str, Any]:
     return await _run_blocking(lambda: service.list_repos_payload(engine, cfg))
 
 
+async def api_semantic_status(cfg: SettingsDep) -> dict[str, Any]:
+    """Flag-only visibility probe for the Semantic nav tab: zero-DB, zero-SDK by construction.
+
+    Does NOT probe schema presence (``semantic_schema_missing`` surfaces at query time instead,
+    inside the ``/api/semantic`` payload) -- the flag is a product decision (visibility), the
+    schema is operator progress (an in-tab message), and conflating them would couple nav
+    rendering to DB health for no benefit (issue #36 Fork 4).
+    """
+    return {"semantic_enabled": cfg.semantic_enabled}
+
+
+async def api_semantic(
+    engine: EngineDep,
+    cfg: SettingsDep,
+    q: Annotated[str, Query(min_length=1)],
+    limit: Annotated[int, Query()] = 50,
+    branch: Annotated[str | None, Query()] = None,
+) -> dict[str, Any]:
+    """Hybrid semantic + BM25 search over indexed chunks (issue #36).
+
+    ``limit`` defaults to 50 -- parity with the MCP ``semantic_search`` tool's own default
+    (``app/main.py``), NOT ``/api/search``'s ``0 -> row_limit`` convention: the two surfaces
+    should return the same result set for the same defaulted call.
+
+    Disabled (``semantic_enabled: false``) and not-migrated (``semantic_schema_missing: true``)
+    payloads pass through unchanged as 200 bodies -- recoverable conditions are payload fields,
+    never HTTP errors (mirrors ``app/main.py``'s dispatch contract). Only malformed input and
+    backend faults become HTTP errors: a NUL byte in ``q``/``branch`` reaching a bound SQL
+    parameter raises ``DataError`` -> 400 (same rationale as the existing routes); anything else
+    (e.g. the embedding endpoint's SDK/auth/network failures, which are arbitrary exception
+    types) is logged with a full traceback server-side and mapped to a generic 502 so a raw
+    error body never echoes endpoint/host detail (mirrors ``ready()``'s no-leak policy).
+    """
+    clamped = service.clamp_limit(limit, cfg)
+    try:
+        return await _run_blocking(
+            lambda: service.semantic_search_payload(engine, cfg, q, clamped, branch)
+        )
+    except DataError as error:
+        raise HTTPException(status_code=400, detail={"error": "invalid parameter"}) from error
+    except Exception as error:
+        if isinstance(error, HTTPException):
+            raise
+        logger.exception("semantic search failed")
+        raise HTTPException(
+            status_code=502, detail={"error": "semantic search backend unavailable"}
+        ) from error
+
+
 # ----------------------------------------------------------------------- security headers
 
 
@@ -245,6 +294,8 @@ def create_app() -> FastAPI:
     app.get("/api/search")(api_search)
     app.get("/api/file")(api_file)
     app.get("/api/repos")(api_repos)
+    app.get("/api/semantic/status")(api_semantic_status)
+    app.get("/api/semantic")(api_semantic)
 
     if _FRONTEND_DIST.is_dir():
         app.mount("/", SPAStaticFiles(directory=_FRONTEND_DIST, html=True), name="spa")

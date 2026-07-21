@@ -35,6 +35,35 @@ export function searchCode(query: string, opts: { limit?: number; cursor?: strin
   return getJson<SearchEnvelope>(`/api/search?${params.toString()}`);
 }
 
+export interface SemanticResult {
+  repo: string;
+  file: string;
+  chunk_index: number;
+  content: string;
+  rrf_score: number;
+}
+
+export interface SemanticEnvelope {
+  query: string;
+  semantic_enabled: boolean;
+  backend?: string;
+  results: SemanticResult[];
+  count: number;
+  reason?: string;
+  semantic_schema_missing?: boolean;
+}
+
+export function semanticSearch(query: string, opts: { limit?: number; branch?: string } = {}): Promise<SemanticEnvelope> {
+  const params = new URLSearchParams({ q: query });
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.branch) params.set("branch", opts.branch);
+  return getJson<SemanticEnvelope>(`/api/semantic?${params.toString()}`);
+}
+
+export function getSemanticStatus(): Promise<{ semantic_enabled: boolean }> {
+  return getJson<{ semantic_enabled: boolean }>("/api/semantic/status");
+}
+
 export interface FileResponse {
   repo: string;
   path: string;

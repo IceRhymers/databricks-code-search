@@ -29,7 +29,12 @@ from app.db.models import File, Repo, RepoBranch
 from app.query.parser import And, Node, Or, QueryParseError, SymbolFilter, parse
 from app.search.errors import QueryTooBroadError
 from app.search.grep import FileCursor, grep_search
+from app.search.semantic import _semantic_search_payload as semantic_search_payload  # noqa: F401
 from app.search.symbols import SymbolResult, symbol_search
+
+# `semantic_search_payload` (above) is a public re-export: the webui-facing alias of the MCP
+# semantic_search tool's builder (issue #36), kept here so webui/main.py keeps importing every
+# payload builder from app.service only.
 
 # --------------------------------------------------------------------- pagination cursor
 

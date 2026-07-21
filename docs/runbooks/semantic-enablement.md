@@ -83,33 +83,68 @@ handled gracefully rather than catastrophically -- the tool returns a structured
 until the migration has run, and if you skip (c) the failure appears later, at index
 or query time, as a permission error.
 
+**Both Apps, not just one (issue #36).** `CODE_SEARCH_SEMANTIC_ENABLED=1` must be
+set on **both** Databricks Apps in the bundle -- the MCP app (`code_search`) and
+the webui app (`webui`) -- each has its own `app.yaml` and its own environment, so
+setting it on one does not set it on the other. The webui SPA's Semantic tab is
+driven entirely by `GET /api/semantic/status`, which reads the **webui app's own**
+`cfg.semantic_enabled` (see `docs/runbooks/webui.md`); it stays hidden until the
+webui app itself has the flag. Enabling only the MCP app leaves agents able to call
+`semantic_search` over MCP while the webui Semantic tab stays dark -- this is by
+design, not a bug, but it is easy to mistake for one.
+
 ## 3. Grants reconciliation (the subtle part)
 
 `chunks` did not exist when grants were last applied (during `make deploy` /
-`scripts/deploy.sh`, step 6), so the app SP has no `SELECT` on it and the job SP
-has no `INSERT`/`UPDATE`/`DELETE` or sequence usage on `chunks_id_seq`. The
-wildcard grants in `app/db/grants.py` (`GRANT SELECT ON ALL TABLES IN SCHEMA`,
-`GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA`, `GRANT USAGE ON ALL
-SEQUENCES IN SCHEMA`) only cover tables/sequences that exist **at the moment the
-grant runs** -- they are not retroactive. You must re-run the grants step now
-that `chunks` exists.
+`scripts/deploy.sh`'s steps 7 (MCP app) and 9 (webui app)), so neither app SP has
+`SELECT` on it and the job SP has no `INSERT`/`UPDATE`/`DELETE` or sequence usage
+on `chunks_id_seq`. The wildcard grants in `app/db/grants.py` (`GRANT SELECT ON
+ALL TABLES IN SCHEMA`, `GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA`,
+`GRANT USAGE ON ALL SEQUENCES IN SCHEMA`) only cover tables/sequences that exist
+**at the moment the grant runs** -- they are not retroactive. You must re-run the
+grants step for the **MCP app** now that `chunks` exists, and (issue #36) for the
+**webui app** too.
 
 Run this **as the owner of `chunks`** (the identity that ran `migrate-semantic`
 in step 2b) or as a superuser -- an unprivileged role cannot grant on an object
 it doesn't own. This is the same `make migrate ... ARGS=--apply-grants` step
-`scripts/deploy.sh` runs at its step 6 (`grant_attempt`), just re-run after the
-semantic migration:
+`scripts/deploy.sh` runs at its steps 7 and 9 (`grant_attempt`), just re-run
+after the semantic migration:
 
 ```
-# dev (app grant only)
+# dev (MCP app grant only)
 APP_SP_ROLE=<app-sp-client-id> \
   make migrate TARGET=dev ARGS=--apply-grants
 
-# prod (BOTH roles -- mirrors scripts/deploy.sh step 6)
+# prod (MCP app -- BOTH roles -- mirrors scripts/deploy.sh step 7)
 APP_SP_ROLE=$(databricks apps get <app_name> -o json | jq -er '.service_principal_client_id') \
 JOB_WRITER_ROLE=$JOB_RUN_AS_SP \
   make migrate TARGET=prod ARGS=--apply-grants
 ```
+
+**Also re-grant the webui app's SP.** The webui app (`docs/runbooks/webui.md`)
+has its **own** service principal and its own least-privilege read-only role,
+granted separately at deploy time (`scripts/deploy.sh` step 9). Whether that role
+already has `SELECT` on `chunks` **may not be covered** -- `build_app_grants`
+(`app/db/grants.py:57`) also emits `ALTER DEFAULT PRIVILEGES IN SCHEMA ... GRANT
+SELECT ON TABLES`, which covers tables created *after* the grant ran, but only
+for tables created by the **same role** that the default privilege was granted
+against. So coverage of a later-created `chunks` for the webui SP depends
+entirely on which identity happened to run the semantic migration in step 2b --
+do not assume it worked. Re-running the webui app's grant is idempotent and is
+the robust fix regardless:
+
+```
+# dev/prod (webui app grant -- read-only, no job role)
+APP_SP_ROLE=$(databricks apps get <webui_app_name> -o json | jq -er '.service_principal_client_id') \
+  make migrate TARGET=<dev|prod> ARGS=--apply-grants
+```
+
+**Warning (asymmetry):** skipping the webui re-grant can leave the MCP app
+working (its `semantic_search` tool returning results normally) while the webui
+app's `/api/semantic` fails at query time with a permission-denied error -- an
+asymmetry that is easy to misdiagnose as "semantic search is broken" when only
+one of the two apps' SPs is actually missing the grant.
 
 Notes:
 - This is the plain `make migrate` target (**not** `make migrate-semantic`) --
@@ -119,8 +154,10 @@ Notes:
   already-current core schema is a no-op; only the grants step does new work.
 - On prod, derive `APP_SP_ROLE` **fresh** from `databricks apps get` (client
   IDs can rotate) and set `JOB_WRITER_ROLE` to the same job run-as SP
-  (`JOB_RUN_AS_SP`) used for the original deploy -- pass **both**, exactly as
-  `scripts/deploy.sh`'s `cmd_full` step 6 does.
+  (`JOB_RUN_AS_SP`) used for the original deploy -- pass **both** for the MCP
+  app, exactly as `scripts/deploy.sh`'s `cmd_full` step 7 does. The webui app's
+  grant never takes a `JOB_WRITER_ROLE` -- it is read-only-only, same as
+  `scripts/deploy.sh` step 9.
 - `build_job_grants` (`app/db/grants.py`) already emits `GRANT USAGE ON ALL
   SEQUENCES IN SCHEMA ... TO <job_role>`, so re-running it after `chunks`
   exists covers the new `bigserial` `chunks_id_seq` too -- no separate sequence
@@ -132,11 +169,14 @@ Notes:
   permission-denied error the first time it tries to write chunks -- not at
   migration time, so this is easy to miss if you only check the migration
   step's exit code. Always pass both `APP_SP_ROLE` and `JOB_WRITER_ROLE` on
-  prod.
+  prod **for the MCP-app grant**; the webui app's grant takes only
+  `APP_SP_ROLE` by design -- it is read-only and never takes a
+  `JOB_WRITER_ROLE` (see the webui re-grant command above).
 - Verify: the app SP can `SELECT` from `chunks` (e.g. via the app's `/ready`
-  probe, which already runs a protected-table `SELECT` as the app SP) and a
+  probe, which already runs a protected-table `SELECT` as the app SP), a
   subsequent indexing run with `semantic_enabled=true` can insert into
-  `chunks` without error.
+  `chunks` without error, and (issue #36) the webui `/api/semantic?q=smoke+test`
+  returns results (not a permission error) as the webui SP.
 
 ### Lock-window note (A4)
 

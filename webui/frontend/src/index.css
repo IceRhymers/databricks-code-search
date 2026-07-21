@@ -269,6 +269,39 @@ mark {
   border-radius: 2px;
 }
 
+.chunk-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+  overflow: hidden;
+}
+
+.chunk-card-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
+.chunk-card-header .lang {
+  color: var(--fg-muted);
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+}
+
+.chunk-card-body {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
 .load-more {
   display: block;
   margin: 1rem auto;

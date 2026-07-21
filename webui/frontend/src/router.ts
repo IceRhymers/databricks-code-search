@@ -6,8 +6,9 @@ import { useEffect, useSyncExternalStore } from "react";
 
 export type Route =
   | { page: "search"; query: string }
-  | { page: "file"; repo: string; path: string; line: number | null }
-  | { page: "repos" };
+  | { page: "file"; repo: string; path: string; line: number | null; find: string | null }
+  | { page: "repos" }
+  | { page: "semantic"; query: string };
 
 function parseLocation(): Route {
   const { pathname, search, hash } = window.location;
@@ -19,10 +20,14 @@ function parseLocation(): Route {
       repo: params.get("repo") ?? "",
       path: params.get("path") ?? "",
       line: line ? Number(line[1]) : null,
+      find: params.get("find"),
     };
   }
   if (pathname === "/repos") {
     return { page: "repos" };
+  }
+  if (pathname === "/semantic") {
+    return { page: "semantic", query: params.get("q") ?? "" };
   }
   return { page: "search", query: params.get("q") ?? "" };
 }
