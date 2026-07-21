@@ -90,11 +90,24 @@ smoke: ## Smoke-test the deployed app (TARGET=dev|prod; ARGS=--expect-indexed/--
 index: ## Run the indexing job on TARGET (populates repos/files/symbols from configured repos)
 	databricks bundle run code_search_index -t $(TARGET)
 
-webui-wheel: ## Build the app wheel and stage it as webui/wheels/app.whl (fixed name; run before bundle deploy so webui's source sync picks up a fresh wheel)
+webui-wheel: ## Build the app wheel + refresh webui/uv.lock and stage under webui/wheels/ (run before bundle deploy; the webui App installs on the uv path / Python 3.12)
 	rm -f dist/*.whl
 	uv build --wheel
 	mkdir -p webui/wheels
-	cp dist/*.whl webui/wheels/app.whl
+	# Preserve the real {name}-{version}-...-.whl filename: webui/pyproject.toml's path source
+	# points at it by name, and a renamed `app.whl` is not a valid wheel filename. Clear stale
+	# wheels first so exactly one version is present.
+	rm -f webui/wheels/*.whl
+	cp dist/*.whl webui/wheels/
+	# Regenerate uv.lock against the freshly-staged wheel. Databricks Apps installs the webui App on
+	# the uv path (pyproject.toml + uv.lock, no requirements.txt) and runs `uv sync --locked`, which
+	# hash-verifies the wheel -- so the lock's pinned hash MUST match what ships. `uv build` is NOT
+	# byte-reproducible (new hash every build) AND a plain `uv lock` is a no-op when the version is
+	# unchanged, so it keeps a STALE hash and `--locked` fails ("Hash mismatch"). --refresh-package
+	# forces uv to re-read and re-hash the local wheel every time. The lock is a deploy-time
+	# artifact (gitignored, like the wheel). It also fails loudly if a version bump left
+	# pyproject.toml's path source pointing at a now-missing wheel filename.
+	cd webui && uv lock --refresh-package databricks-code-search
 
 webui-build: ## Build the webui frontend (npm ci + vite build) into webui/frontend/dist/, which is committed
 	cd webui/frontend && npm ci && npm run build

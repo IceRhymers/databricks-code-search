@@ -58,6 +58,19 @@ include:
 sync:
   include:
     - config.yaml
+    # The webui App (#35) installs on the uv path (Python 3.12) and needs BOTH pyproject.toml
+    # (synced by default) and uv.lock. But uv.lock is gitignored globally (see .gitignore) and
+    # bundle sync applies .gitignore *silently* (cli#3547) -- without this force-include the App
+    # would ship no lock, fail to select the uv path, and fall back to pip/3.11 where the
+    # databricks-code-search wheel (requires-python >=3.12) refuses to install. The wheel is
+    # force-included for the same insurance reason the .gitignore `!webui/wheels/*.whl` negation
+    # exists: a future broad `*.whl` ignore must never silently drop it from the App source.
+    # webui/.python-version pins the interpreter to 3.12 (the minor the lock is resolved against);
+    # it syncs by default today but is listed here so an ignore rule can never silently drop it and
+    # let the Apps build fall back to the newest interpreter (3.14), which breaks `uv sync --locked`.
+    - webui/uv.lock
+    - webui/wheels/*.whl
+    - webui/.python-version
 
 # The wheel consumed by the serverless indexing job's environment `dependencies`.
 # Built with uv (matches the repo's uv-based toolchain); DABs runs `build` itself.
