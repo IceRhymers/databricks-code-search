@@ -3,7 +3,7 @@ import { splitLineByByteRanges } from "../utils/byteRanges";
 
 function fileHref(repo: string, path: string, line: number | null, branch: string | null): string {
   const params = new URLSearchParams({ repo, path });
-  if (branch != null) params.set("branch", branch);
+  if (branch) params.set("branch", branch);
   const anchor = line != null ? `#L${line}` : "";
   return `/file?${params.toString()}${anchor}`;
 }
