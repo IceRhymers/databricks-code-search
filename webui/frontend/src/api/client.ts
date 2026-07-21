@@ -72,8 +72,9 @@ export interface FileResponse {
   found: boolean;
 }
 
-export function getFile(repo: string, path: string): Promise<FileResponse> {
+export function getFile(repo: string, path: string, branch?: string | null): Promise<FileResponse> {
   const params = new URLSearchParams({ repo, path });
+  if (branch) params.set("branch", branch);
   return getJson<FileResponse>(`/api/file?${params.toString()}`);
 }
 

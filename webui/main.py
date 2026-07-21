@@ -189,8 +189,12 @@ async def api_file(
     cfg: SettingsDep,
     repo: Annotated[str, Query(min_length=1)],
     path: Annotated[str, Query(min_length=1)],
+    branch: Annotated[str | None, Query()] = None,
 ) -> dict[str, Any]:
     """Return one file's full content by (repo name, path); a miss is a 404.
+
+    ``branch`` is optional: omitted (``None``), :func:`service.get_file_payload` falls back to
+    its usual default-branch resolution -- unchanged behavior for every existing caller.
 
     A ``repo``/``path`` containing a NUL byte reaches a bound SQL parameter in
     :func:`service.get_file_payload`'s lookup, where Postgres rejects it
@@ -198,7 +202,9 @@ async def api_file(
     that 500s an attacker-controlled input instead of 400ing it.
     """
     try:
-        payload = await _run_blocking(lambda: service.get_file_payload(engine, cfg, repo, path))
+        payload = await _run_blocking(
+            lambda: service.get_file_payload(engine, cfg, repo, path, branch)
+        )
     except DataError as error:
         raise HTTPException(status_code=400, detail={"error": "invalid parameter"}) from error
     if not payload["found"]:

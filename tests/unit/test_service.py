@@ -15,6 +15,7 @@ import pytest
 
 from app import service
 from app.config import Settings
+from app.query.parser import parse
 from app.search.errors import QueryTooBroadError
 from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
 from app.search.symbols import SymbolMatch, SymbolResult
@@ -356,3 +357,45 @@ def test_query_too_broad_on_grep_omits_next_cursor_when_bare(
     monkeypatch.setattr(service, "grep_search", _raise)
     payload = service.search_code_payload(_FakeEngine([]), _cfg(), "foo", 50)
     assert "next_cursor" not in payload
+
+
+# ------------------------------------------------- permalink_branch selection (issue #46)
+
+
+@pytest.mark.unit
+def test_collect_branch_filters_finds_top_level_branch_atom() -> None:
+    assert service._collect_branch_filters(parse("branch:main foo")) == frozenset({"main"})
+
+
+@pytest.mark.unit
+def test_collect_branch_filters_no_branch_atom_is_empty() -> None:
+    assert service._collect_branch_filters(parse("foo lang:go")) == frozenset()
+
+
+@pytest.mark.unit
+def test_collect_branch_filters_collects_across_nested_and_or() -> None:
+    node = parse("branch:a (branch:b OR lang:go)")
+    assert service._collect_branch_filters(node) == frozenset({"a", "b"})
+
+
+@pytest.mark.unit
+def test_select_permalink_branch_smallest_of_intersection() -> None:
+    result = service._select_permalink_branch(frozenset({"main", "release"}), ("main", "release"))
+    assert result == "main"
+
+
+@pytest.mark.unit
+def test_select_permalink_branch_empty_intersection_falls_back_to_min_row_branch() -> None:
+    result = service._select_permalink_branch(frozenset({"x"}), ("main", "feature"))
+    assert result == "feature"
+    assert result in ("main", "feature")
+
+
+@pytest.mark.unit
+def test_select_permalink_branch_no_filters_is_none() -> None:
+    assert service._select_permalink_branch(frozenset(), ("main",)) is None
+
+
+@pytest.mark.unit
+def test_select_permalink_branch_no_row_branches_is_none() -> None:
+    assert service._select_permalink_branch(frozenset({"x"}), ()) is None

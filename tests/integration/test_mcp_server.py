@@ -351,6 +351,9 @@ async def test_streamable_http_tools_and_health(seeded_schema: str) -> None:
                 )
                 assert feature_search_atom["file_count"] == 1
                 assert feature_search_atom["files"][0]["branches"] == ["feature/x"]
+                # permalink_branch (issue #46): a query with an explicit branch: atom resolves
+                # the emitted file's permalink to that same branch.
+                assert feature_search_atom["files"][0]["permalink_branch"] == "feature/x"
 
                 # get_file(branch=) disambiguates the two divergent content versions of the
                 # SAME path -- proves the predicate stays single-row (scalar_one_or_none never

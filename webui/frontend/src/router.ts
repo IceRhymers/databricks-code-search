@@ -6,11 +6,18 @@ import { useEffect, useSyncExternalStore } from "react";
 
 export type Route =
   | { page: "search"; query: string }
-  | { page: "file"; repo: string; path: string; line: number | null; find: string | null }
+  | {
+      page: "file";
+      repo: string;
+      path: string;
+      line: number | null;
+      find: string | null;
+      branch: string | null;
+    }
   | { page: "repos" }
   | { page: "semantic"; query: string };
 
-function parseLocation(): Route {
+export function parseLocation(): Route {
   const { pathname, search, hash } = window.location;
   const params = new URLSearchParams(search);
   if (pathname === "/file") {
@@ -21,6 +28,7 @@ function parseLocation(): Route {
       path: params.get("path") ?? "",
       line: line ? Number(line[1]) : null,
       find: params.get("find"),
+      branch: params.get("branch"),
     };
   }
   if (pathname === "/repos") {

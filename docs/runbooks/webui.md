@@ -25,6 +25,18 @@ workspace UI, or `databricks apps update-permissions`). There is no OAuth app co
 register — that prerequisite is specific to the MCP app's `/mcp` streamable-HTTP transport,
 which webui does not expose.
 
+## Branch-scoped permalinks (issue #46)
+
+Lexical (`/api/search`) results carry a service-selected `permalink_branch` per file entry
+(`null` when the query had no `branch:` filter, otherwise the branch that resolved the file's
+matched content version). The Search page threads it into every file/line link it renders, so
+opening a result from a `branch:`-filtered search opens that branch's version of the file
+rather than falling back to the repo's default branch. Semantic results are unaffected --
+`ChunkCard` links never carry a branch.
+
+`GET /api/file` accepts an optional `branch` query param; omitted, it keeps its existing
+default-branch resolution unchanged.
+
 ## Semantic search (issue #36)
 
 The webui exposes the same hybrid semantic engine (`app/search/semantic.py`) the MCP

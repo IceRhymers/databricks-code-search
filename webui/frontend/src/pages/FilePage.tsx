@@ -30,11 +30,13 @@ export function FilePage({
   path,
   line,
   find,
+  branch,
 }: {
   repo: string;
   path: string;
   line: number | null;
   find: string | null;
+  branch: string | null;
 }): JSX.Element {
   const [state, setState] = useState<FilePageState>({ status: "loading" });
   const [copied, setCopied] = useState(false);
@@ -47,7 +49,7 @@ export function FilePage({
   useEffect(() => {
     setState({ status: "loading" });
     setAnchorNote(null);
-    getFile(repo, path)
+    getFile(repo, path, branch)
       .then((file) => {
         setState({ status: "loaded", file });
         // `find` is the chunk's pre-computed needle (ChunkCard already ran extractNeedle);
@@ -61,6 +63,7 @@ export function FilePage({
             return;
           }
           const params = new URLSearchParams({ repo, path });
+          if (branch) params.set("branch", branch);
           replaceRoute(`/file?${params.toString()}#L${located.line}`);
           if (located.occurrences > 1) {
             setAnchorNote(
@@ -79,7 +82,7 @@ export function FilePage({
         setState({ status: "error", message });
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repo, path]);
+  }, [repo, path, branch]);
 
   function copyPermalink() {
     const url = new URL(window.location.href);

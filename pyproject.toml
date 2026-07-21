@@ -31,7 +31,7 @@ dependencies = [
 # for it. Local dev/CI still get it via `uv sync --all-extras` (see `make install` / ci.yml);
 # webui/requirements.txt is exported with `--extra webui` (see that file's header comment).
 [project.optional-dependencies]
-webui = ["fastapi>=0.139.2"]
+webui = ["fastapi>=0.139.0"]
 
 [project.scripts]
 code-search-index = "indexer.job:main"

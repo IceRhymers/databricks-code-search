@@ -320,6 +320,62 @@ def test_api_file_missing_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.unit
+def test_api_file_forwards_branch_query_param(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /api/file?...&branch=feature forwards branch="feature" to get_file_payload."""
+    captured: dict[str, Any] = {}
+
+    def fake_get_file_payload(
+        engine: Any, cfg: Any, repo: str, path: str, branch: str | None = None
+    ) -> dict[str, Any]:
+        captured["branch"] = branch
+        return {
+            "repo": repo,
+            "path": path,
+            "branch": branch or "HEAD",
+            "content": "x",
+            "found": True,
+        }
+
+    monkeypatch.setattr(service, "get_file_payload", fake_get_file_payload)
+    engine = _FakeEngine()
+    app.dependency_overrides[get_engine] = lambda: engine
+    app.dependency_overrides[get_settings] = _cfg
+    try:
+        with TestClient(app) as test_client:
+            resp = test_client.get(
+                "/api/file", params={"repo": "acme/widgets", "path": "a.py", "branch": "feature"}
+            )
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert captured["branch"] == "feature"
+
+
+@pytest.mark.unit
+def test_api_file_omitted_branch_forwards_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting branch forwards None -- unchanged default-branch resolution."""
+    captured: dict[str, Any] = {}
+
+    def fake_get_file_payload(
+        engine: Any, cfg: Any, repo: str, path: str, branch: str | None = None
+    ) -> dict[str, Any]:
+        captured["branch"] = branch
+        return {"repo": repo, "path": path, "branch": "HEAD", "content": "x", "found": True}
+
+    monkeypatch.setattr(service, "get_file_payload", fake_get_file_payload)
+    engine = _FakeEngine()
+    app.dependency_overrides[get_engine] = lambda: engine
+    app.dependency_overrides[get_settings] = _cfg
+    try:
+        with TestClient(app) as test_client:
+            resp = test_client.get("/api/file", params={"repo": "acme/widgets", "path": "a.py"})
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert captured["branch"] is None
+
+
+@pytest.mark.unit
 def test_api_file_nul_byte_in_path_is_400() -> None:
     # repo/path reach a bound SQL parameter in service.get_file_payload's lookup; Postgres
     # rejects a NUL byte there (verified against a live local Postgres -- see

@@ -17,7 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from typing import Any
+from typing import Any, assert_never
 
 from sqlalchemy import Text, any_, func, literal, select
 from sqlalchemy.dialects.postgresql import ARRAY
@@ -26,7 +26,20 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import Settings
 from app.db.models import File, Repo, RepoBranch
-from app.query.parser import And, Node, Or, QueryParseError, SymbolFilter, parse
+from app.query.parser import (
+    And,
+    BranchFilter,
+    LangFilter,
+    Node,
+    Or,
+    PathFilter,
+    QueryParseError,
+    Regex,
+    RepoFilter,
+    Substring,
+    SymbolFilter,
+    parse,
+)
 from app.search.errors import QueryTooBroadError
 from app.search.grep import FileCursor, grep_search
 from app.search.semantic import _semantic_search_payload as semantic_search_payload  # noqa: F401
@@ -132,6 +145,51 @@ def _query_has_symbol_atom(node: Node) -> bool:
             return any(_query_has_symbol_atom(child) for child in children)
         case _:
             return False
+
+
+def _collect_branch_filters(node: Node) -> frozenset[str]:
+    """Collect every ``branch:`` value in ``node``, under any ``And``/``Or`` nesting.
+
+    An empty ``frozenset`` means the query carries no ``branch:`` filter anywhere. This
+    mirrors :func:`app.query.compiler._has_branch_filter`'s tree walk, but -- unlike this
+    module's own :func:`_query_has_symbol_atom` -- it is deliberately EXHAUSTIVE: the tail is
+    ``assert_never(node)`` rather than a catch-all ``case _: return frozenset()``, so a future
+    :data:`Node` variant is a mypy error here, not a silently-empty result.
+    """
+    match node:
+        case BranchFilter(value=v):
+            return frozenset({v})
+        case And(children=children) | Or(children=children):
+            return frozenset().union(*(_collect_branch_filters(c) for c in children))
+        case Substring() | Regex() | RepoFilter() | PathFilter() | LangFilter() | SymbolFilter():
+            return frozenset()
+        case _:
+            assert_never(node)
+
+
+def _select_permalink_branch(
+    branch_filters: frozenset[str], row_branches: tuple[str, ...]
+) -> str | None:
+    """Pick the one branch a search-result row's permalink should resolve to (issue #46).
+
+    Contract: ``None`` iff ``branch_filters`` is empty -- the query had no ``branch:`` filter
+    anywhere -- and ``None`` is returned here and ONLY here (or if ``row_branches`` itself is
+    empty, which should not occur in practice). Otherwise ``applicable =
+    branch_filters.intersection(row_branches)`` (MUST be ``.intersection()`` -- ``row_branches``
+    is a tuple, so ``&`` raises ``TypeError``); when non-empty, the lexicographically smallest
+    member (``sorted(applicable)[0]``) is returned -- a member of ``row_branches`` so
+    :func:`get_file_payload`'s ``branches @>`` membership predicate resolves back to this exact
+    content-sha row. An empty intersection with filters present is reachable only via an OR arm
+    that matched this row on a non-branch predicate (e.g. ``branch:x OR lang:go``); that case
+    returns ``min(row_branches)``, NEVER ``None`` -- falling back to ``None`` here would send the
+    caller to default-branch resolution, which is the very bug this issue fixes.
+    """
+    if not branch_filters:
+        return None
+    applicable = sorted(branch_filters.intersection(row_branches))
+    if applicable:
+        return applicable[0]
+    return min(row_branches) if row_branches else None
 
 
 def clamp_limit(limit: int, cfg: Settings) -> int:
@@ -312,6 +370,11 @@ def search_code_payload(
                 next_cursor=(None if pagination_mode else _UNSET),
             )
 
+        # `query` is now known parseable (both legs' early-return handling above is past), so
+        # this parse call is safe. This is its OWN parse -- deliberately not reusing the parse
+        # at the structural sym-atom check below, which only runs on continuation pages.
+        branch_filters = _collect_branch_filters(parse(query))
+
         # Symbol leg: sym: definitions the highlight-driven grep path cannot return. A timeout
         # here flags query_too_broad but still returns whatever grep found (partial, not a lie).
         # Note: a `sym:X foo` query runs the compiler candidate scan twice (once per leg), each
@@ -405,6 +468,10 @@ def search_code_payload(
     for entry in sorted(merged.values(), key=lambda e: (e["repo_id"], e["path"], e["content_sha"])):
         # Order matches within a file by line; NULL symbol lines sort last.
         entry["matches"].sort(key=lambda m: (m["line"] is None, m["line"] or 0))
+        # content_sha + permalink_branch are additive per-file keys on the payload shared by
+        # the MCP search_code tool and /api/search; per issue #46 the lexical MCP payload is
+        # additive-only (Option A, consensus-approved). permalink_branch is service-selected --
+        # clients must never infer a file version from the query.
         files.append(
             {
                 "repo": name_map.get(entry["repo_id"], str(entry["repo_id"])),
@@ -412,6 +479,8 @@ def search_code_payload(
                 "language": entry["lang"],
                 "branches": list(entry["branches"]),  # real membership (0003), not hardcoded
                 "matches": entry["matches"],
+                "content_sha": entry["content_sha"],
+                "permalink_branch": _select_permalink_branch(branch_filters, entry["branches"]),
             }
         )
 

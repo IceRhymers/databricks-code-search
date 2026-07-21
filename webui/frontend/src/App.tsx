@@ -34,7 +34,13 @@ export function App(): JSX.Element {
       <main className="app-main">
         {route.page === "search" && <SearchPage initialQuery={route.query} />}
         {route.page === "file" && (
-          <FilePage repo={route.repo} path={route.path} line={route.line} find={route.find} />
+          <FilePage
+            repo={route.repo}
+            path={route.path}
+            line={route.line}
+            find={route.find}
+            branch={route.branch}
+          />
         )}
         {route.page === "repos" && <ReposPage />}
         {route.page === "semantic" && <SemanticPage initialQuery={route.query} />}

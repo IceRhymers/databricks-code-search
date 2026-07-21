@@ -7,7 +7,7 @@ function envelope(overrides: Partial<SearchEnvelope> = {}): SearchEnvelope {
     file_count: 1,
     match_count: 1,
     duration_ns: 1000,
-    files: [{ repo: "r1", file: "a.py", language: "python", branches: ["HEAD"], matches: [] }],
+    files: [{ repo: "r1", file: "a.py", language: "python", branches: ["HEAD"], content_sha: "sha-a", permalink_branch: null, matches: [] }],
     truncated: false,
     truncation_reason: null,
     regex_incompatible: false,
@@ -49,7 +49,7 @@ describe("searchReducer", () => {
     state = searchReducer(state, {
       type: "search_success",
       payload: envelope({
-        files: [{ repo: "r1", file: "a.py", language: "python", branches: ["HEAD"], matches: [] }],
+        files: [{ repo: "r1", file: "a.py", language: "python", branches: ["HEAD"], content_sha: "sha-a", permalink_branch: null, matches: [] }],
         file_count: 1,
         match_count: 1,
         next_cursor: "page2",
@@ -61,7 +61,7 @@ describe("searchReducer", () => {
     state = searchReducer(state, {
       type: "load_more_success",
       payload: envelope({
-        files: [{ repo: "r1", file: "b.py", language: "python", branches: ["HEAD"], matches: [] }],
+        files: [{ repo: "r1", file: "b.py", language: "python", branches: ["HEAD"], content_sha: "sha-b", permalink_branch: null, matches: [] }],
         file_count: 1,
         match_count: 2,
         next_cursor: null,

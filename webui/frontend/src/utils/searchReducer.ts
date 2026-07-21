@@ -22,6 +22,8 @@ export interface SearchFile {
   file: string;
   language: string | null;
   branches: string[];
+  content_sha: string;
+  permalink_branch: string | null;
   matches: SearchMatch[];
 }
 

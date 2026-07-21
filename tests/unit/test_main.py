@@ -173,6 +173,8 @@ def test_search_code_payload_matches_golden_shape(monkeypatch: pytest.MonkeyPatc
                     "byte_ranges": [[3, 6], [24, 27]],
                 }
             ],
+            "content_sha": "deadbeef",
+            "permalink_branch": None,
         }
     ]
 
@@ -856,6 +858,8 @@ def test_search_code_splits_divergent_content_versions_of_one_path(
             "language": "go",
             "branches": ["main"],
             "matches": [{"line": 1, "text": "foo", "byte_ranges": [[0, 3]]}],
+            "content_sha": "sha-main",
+            "permalink_branch": None,
         },
         {
             "repo": "acme/widgets",
@@ -863,6 +867,8 @@ def test_search_code_splits_divergent_content_versions_of_one_path(
             "language": "go",
             "branches": ["feature/x"],
             "matches": [{"line": 1, "text": "foo bar", "byte_ranges": [[0, 3]]}],
+            "content_sha": "sha-feature",
+            "permalink_branch": None,
         },
     ]
     assert sorted(payload["files"], key=lambda f: f["branches"]) == sorted(
