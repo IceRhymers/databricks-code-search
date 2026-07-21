@@ -112,9 +112,10 @@ cmd_full() {
 	key=$(req "$(jval github_token_secret_key)" "secret key")
 	file_path=$(req "$(jworkspace file_path)" "workspace file_path")
 
-	# 2. Build the webui wheel — stages a fresh app.whl into webui/wheels/ BEFORE deploy: Apps
-	#    source sync (step 3) uploads whatever is on disk at deploy time, and a stale/missing
-	#    wheel means the webui app can't import `app.*` at start.
+	# 2. Build the webui wheel + refresh webui/uv.lock BEFORE deploy: Apps source sync (step 3)
+	#    uploads whatever is on disk at deploy time. The webui App installs on the uv path
+	#    (pyproject.toml + uv.lock, no requirements.txt) so it runs on Python 3.12; a stale/missing
+	#    wheel or lock means the webui app can't import `app.*` (or install) at start.
 	echo "deploy: [2/11] make webui-wheel"
 	make webui-wheel
 

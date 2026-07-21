@@ -3,22 +3,27 @@
 # resources/webui.yml's comment on why -- avoids a merge conflict / empty-interpolation risk).
 #
 # `source_code_path: ../webui` (resources/webui.yml) uploads the CONTENTS of webui/ to the
-# working-dir root: main.py, frontend/dist/ (the committed SPA build), requirements.txt, and
-# wheels/app.whl (built by `make webui-wheel`, which MUST run before `bundle deploy` -- see
-# scripts/deploy.sh). Unlike app/app.yaml, no `ln -sf` symlink trick is needed here: main.py
-# imports `app.*` from the installed WHEEL (below), not from same-directory sibling files.
+# working-dir root: main.py, frontend/dist/ (the committed SPA build), pyproject.toml, uv.lock,
+# and wheels/*.whl (both the lock and the wheel are staged by `make webui-wheel`, which MUST run
+# before `bundle deploy` -- see scripts/deploy.sh). Unlike app/app.yaml, no `ln -sf` symlink trick
+# is needed here: main.py imports `app.*` from the installed WHEEL (via pyproject.toml), not from
+# same-directory sibling files.
 #
-# `pip install -r requirements.txt` is explicit here rather than relying solely on the Apps
-# runtime's own requirements-file auto-install, because whether that installer accepts a local
-# PATH requirement (`./wheels/app.whl`, not a PyPI package name) is unverified without a live
-# workspace (see webui/requirements.txt and WS-B3 in .omc/plans/ralplan-35-webui.md). If the
-# auto-install already covers it, this repeats the same install and pip no-ops on already
-# -satisfied requirements -- the explicit step is the flagged post-merge verification's safe
-# default, not a guess. The shell form is REQUIRED so the injected DATABRICKS_APP_PORT (default
-# 8000; never 8080) is honored -- an exec-array `--port` would not expand it.
-command: ["bash", "-c", "pip install -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"]
+# Databricks Apps selects the uv dependency path (Python 3.12, per pyproject.toml's
+# `requires-python`) because this dir ships pyproject.toml + uv.lock and NO requirements.txt -- a
+# requirements.txt would force pip AND Python 3.11, on which the databricks-code-search wheel
+# (requires-python >=3.12) refuses to install and the app crashes ("requires a different Python").
+# `uv run` executes uvicorn inside the uv-provisioned 3.12 venv, installing from uv.lock on first
+# run; `--frozen` keeps it from re-resolving. The shell form is REQUIRED so the injected
+# DATABRICKS_APP_PORT (default 8000; never 8080) expands -- an exec-array form would not.
+command: ["bash", "-c", "uv run --frozen uvicorn main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"]
 env:
   # Only LAKEBASE_ENDPOINT is set here; DATABRICKS_HOST and the app SP OAuth creds are
   # auto-injected by the Apps runtime (WorkspaceClient() self-configures), same as app/app.yaml.
   - name: LAKEBASE_ENDPOINT
     value: "projects/code-search/branches/production/endpoints/primary"
+  # uv hardlinks from its cache into the venv by default and warns (or fails with a cross-device
+  # link error) when they sit on different mounts, as they do in the Apps sandbox. Copy mode is
+  # the documented remedy.
+  - name: UV_LINK_MODE
+    value: "copy"

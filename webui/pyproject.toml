@@ -1,0 +1,42 @@
+# uv-based dependency manifest for the web UI Databricks App (issue #35).
+#
+# WHY uv instead of requirements.txt: the Databricks Apps runtime defaults to Python 3.11 on the
+# pip path, but this repo's `databricks-code-search` wheel declares `requires-python = ">=3.12"`
+# (top-level pyproject.toml), matching the indexing job's serverless 3.12 interpreter (cp312
+# tree-sitter/psycopg wheels). On 3.11, pip refuses the wheel ("requires a different Python:
+# 3.11.15 not in '>=3.12'") and the app crashes at start. Databricks Apps only honors
+# `requires-python` (and will provision Python) on the uv path, which it selects when a dir ships
+# pyproject.toml + uv.lock and NO requirements.txt -- "requirements.txt always takes precedence"
+# and would pin pip/3.11. Refs:
+#   https://docs.databricks.com/aws/en/dev-tools/databricks-apps/system-env
+#   https://docs.databricks.com/aws/en/dev-tools/databricks-apps/dependencies
+[project]
+name = "webui-code-search"
+version = "0.1.0"
+# Pinned to 3.12 (not just ">=3.12"): the Apps build runs `uv sync --locked` and, with only a
+# lower bound, uv grabs the NEWEST interpreter it can fetch (observed: CPython 3.14.3). That both
+# lacks cp3xx binary wheels for psycopg/tree-sitter AND re-resolves to a set that no longer
+# matches uv.lock, so `--locked` fails ("lockfile needs to be updated"). The upper bound forces
+# uv to a 3.12 interpreter -- the exact minor the lock is resolved against (see .python-version).
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Pulls in fastapi (the `webui` extra) plus app.*'s own runtime deps (sqlalchemy, psycopg,
+    # pgvector, databricks-sdk, pydantic-settings, uvicorn, ...). webui/main.py imports `app.*`
+    # from this installed wheel, not from same-directory sibling source.
+    "databricks-code-search[webui]",
+]
+
+# Not a distributable package itself -- just an app entrypoint (main.py, run via uvicorn). Without
+# this, uv would try to build `webui-code-search`, which has no build backend.
+[tool.uv]
+package = false
+
+# Resolve `databricks-code-search` from the locally-staged wheel (never published to PyPI). A
+# RELATIVE path source is required, not a flat index: `uv sync --locked` on the Apps runtime
+# re-resolves, and a flat index records the wheels dir as an ABSOLUTE file:// URL that differs
+# from the local build path, so `--locked` always sees a change and fails. A relative path is
+# resolved against the app dir on both sides and stays consistent. The versioned filename is
+# tracked here deliberately: `make webui-wheel` rebuilds the wheel and reruns `uv lock`, which
+# errors loudly if a version bump left this path pointing at a missing file (update both together).
+[tool.uv.sources]
+databricks-code-search = { path = "wheels/databricks_code_search-0.1.0-py3-none-any.whl" }
