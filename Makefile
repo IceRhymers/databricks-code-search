@@ -108,6 +108,18 @@ webui-wheel: ## Build the app wheel + refresh webui/uv.lock and stage under webu
 	# artifact (gitignored, like the wheel). It also fails loudly if a version bump left
 	# pyproject.toml's path source pointing at a now-missing wheel filename.
 	cd webui && uv lock --refresh-package databricks-code-search
+	# De-databricks the lock: a workstation behind the corp proxy resolves through the internal
+	# PyPI mirror (~/.config/uv/uv.toml pins pypi-proxy.dev.databricks.com as default index), so
+	# the lock's registry + artifact URLs point there -- and the Apps build environment cannot
+	# reach that host (observed: pgvector wheel download "operation timed out" at deploy). The
+	# mirror preserves PyPI's URL layout 1:1 (/simple/ index, /packages/<hash-path>/<file>), so a
+	# host rewrite to the public equivalents is exact; the lock pins per-artifact hashes and the
+	# Apps build's `uv sync --locked` verifies them, so any divergence fails loudly at install
+	# rather than shipping a wrong artifact. No-op on workstations already resolving public PyPI.
+	sed -i.bak \
+		-e 's#https://pypi-proxy\.dev\.databricks\.com/simple/#https://pypi.org/simple/#g' \
+		-e 's#https://pypi-proxy\.dev\.databricks\.com/packages/#https://files.pythonhosted.org/packages/#g' \
+		webui/uv.lock && rm -f webui/uv.lock.bak
 
 webui-build: ## Build the webui frontend (npm ci + vite build) into webui/frontend/dist/, which is committed
 	cd webui/frontend && npm ci && npm run build
