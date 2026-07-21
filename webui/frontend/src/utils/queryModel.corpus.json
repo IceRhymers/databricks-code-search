@@ -1,0 +1,84 @@
+[
+  { "query": "repo:acme lang:go foo", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "repo", "value": "acme", "start": 0, "end": 9 },
+    { "field": "lang", "value": "go", "start": 10, "end": 17 },
+    { "field": null, "value": "foo", "start": 18, "end": 21 }
+  ] },
+  { "query": "", "verdict": "safe", "python_parses": false, "atoms": [] },
+  { "query": "-repo:acme", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "-repo:acme", "start": 0, "end": 10 }
+  ] },
+  { "query": "Repo:acme", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "Repo:acme", "start": 0, "end": 9 }
+  ] },
+  { "query": "case:yes repo:acme foo", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "case", "value": "yes", "start": 0, "end": 8 },
+    { "field": "repo", "value": "acme", "start": 9, "end": 18 },
+    { "field": null, "value": "foo", "start": 19, "end": 22 }
+  ] },
+  { "query": "repo:acme repo:widgets", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "repo", "value": "acme", "start": 0, "end": 9 },
+    { "field": "repo", "value": "widgets", "start": 10, "end": 22 }
+  ] },
+  { "query": "repo:acme branch:main foo", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "repo", "value": "acme", "start": 0, "end": 9 },
+    { "field": "branch", "value": "main", "start": 10, "end": 21 },
+    { "field": null, "value": "foo", "start": 22, "end": 25 }
+  ] },
+  { "query": "repo:acme branch:main branch:dev", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "repo", "value": "acme", "start": 0, "end": 9 },
+    { "field": "branch", "value": "main", "start": 10, "end": 21 },
+    { "field": "branch", "value": "dev", "start": 22, "end": 32 }
+  ] },
+  { "query": "repo:acme branch:or", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "repo", "value": "acme", "start": 0, "end": 9 },
+    { "field": "branch", "value": "or", "start": 10, "end": 19 }
+  ] },
+  { "query": "sym:Handler", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "sym", "value": "Handler", "start": 0, "end": 11 }
+  ] },
+  { "query": "file:*.py", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "file", "value": "*.py", "start": 0, "end": 9 }
+  ] },
+  { "query": "branch:main", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "branch", "value": "main", "start": 0, "end": 11 }
+  ] },
+  { "query": "lang:go", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "lang", "value": "go", "start": 0, "end": 7 }
+  ] },
+  { "query": "foo bar", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "foo", "start": 0, "end": 3 },
+    { "field": null, "value": "bar", "start": 4, "end": 7 }
+  ] },
+  { "query": "case:no foo", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "case", "value": "no", "start": 0, "end": 7 },
+    { "field": null, "value": "foo", "start": 8, "end": 11 }
+  ] },
+  { "query": "repo:\"a b\"", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:/re/", "verdict": "unsafe", "python_parses": true },
+  { "query": "/re/", "verdict": "unsafe", "python_parses": true },
+  { "query": "\"quoted content\"", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:a OR repo:b", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:a or repo:b", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:a Or repo:b", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:a oR repo:b", "verdict": "unsafe", "python_parses": true },
+  { "query": "(repo:a foo)", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:acme (foo)", "verdict": "unsafe", "python_parses": true },
+  { "query": "a b OR c d", "verdict": "unsafe", "python_parses": true },
+  { "query": "foo or bar", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:", "verdict": "unsafe", "python_parses": false },
+  { "query": "repo:acme \"unterminated", "verdict": "unsafe", "python_parses": false },
+  { "query": "content:x", "verdict": "unsafe", "python_parses": false },
+  { "query": "r:foo", "verdict": "unsafe", "python_parses": false },
+  { "query": "l:go", "verdict": "unsafe", "python_parses": false },
+  { "query": "f:x", "verdict": "unsafe", "python_parses": false },
+  { "query": "b:x", "verdict": "unsafe", "python_parses": false },
+  { "query": "c:x", "verdict": "unsafe", "python_parses": false },
+  { "query": "case:maybe", "verdict": "unsafe", "python_parses": false },
+  { "query": "case:YES", "verdict": "unsafe", "python_parses": false },
+  { "query": "case:", "verdict": "unsafe", "python_parses": false },
+  { "query": "repo:a OR", "verdict": "unsafe", "python_parses": false },
+  { "query": "((foo)", "verdict": "unsafe", "python_parses": false },
+  { "query": "()", "verdict": "unsafe", "python_parses": false },
+  { "query": "/unterminated", "verdict": "unsafe", "python_parses": false }
+]
