@@ -16,6 +16,7 @@ workspace, so a laptop or sandbox without Databricks credentials does not fail
 
 from __future__ import annotations
 
+import functools
 import json
 import shutil
 import subprocess
@@ -34,41 +35,69 @@ _DATABRICKS_CLI = shutil.which("databricks")
 _PROD_PLACEHOLDER_SP = "00000000-0000-0000-0000-000000000000"
 
 
-def _bundle_validate(target: str, *, extra_args: list[str] | None = None) -> dict[str, Any]:
-    """Run `databricks bundle validate -t <target> -o json` and return the parsed doc.
+@functools.lru_cache(maxsize=1)
+def _skip_reason_if_unauthenticated() -> str | None:
+    """Probe auth/CLI availability independently of `bundle validate`.
 
-    stdout/stderr are captured separately: `bundle validate` writes advisory
-    warnings (e.g. unmatched sync globs) to stderr even on success, and merging
-    them into stdout breaks JSON parsing. Skips (does not fail) on a missing CLI,
-    a timeout, or any non-zero exit -- the latter covers "not logged in" /
-    "workspace unreachable", which is an environment gap, not a regression in
-    this repo's bundle config.
+    This is the ONLY thing allowed to skip the tests below. `bundle validate`
+    itself is deliberately never treated as skippable on failure: var
+    resolution and the prod `run_as` overlay are exactly what this module
+    exists to catch, and a test that skips on any non-zero `validate` exit
+    would also skip straight through a real bundle-config regression. A cheap,
+    bundle-independent call (`current-user me`) distinguishes "no/expired
+    auth or unreachable workspace" (skip) from everything else (let it fail).
+    Cached (once per test run) since every test in this module would otherwise
+    repeat the same round trip.
     """
     if _DATABRICKS_CLI is None:
-        pytest.skip("databricks CLI not found on PATH")
-
-    cmd = [_DATABRICKS_CLI, "bundle", "validate", "-t", target, "-o", "json", *(extra_args or [])]
+        return "databricks CLI not found on PATH"
     try:
         proc = subprocess.run(
-            cmd,
+            [_DATABRICKS_CLI, "current-user", "me", "-o", "json"],
             cwd=_REPO_ROOT,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        pytest.skip(f"could not run `databricks bundle validate -t {target}`: {exc}")
-
+        return f"could not run `databricks current-user me`: {exc}"
     if proc.returncode != 0:
-        pytest.skip(
-            f"`databricks bundle validate -t {target}` failed (likely no/expired auth or "
-            f"unreachable workspace), not a code defect: {proc.stderr.strip()[:500]}"
+        return (
+            "`databricks current-user me` failed (no/expired auth or unreachable "
+            f"workspace): {proc.stderr.strip()[:500]}"
         )
+    return None
 
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        pytest.skip(f"`databricks bundle validate -t {target} -o json` did not emit JSON: {exc}")
+
+def _bundle_validate(target: str, *, extra_args: list[str] | None = None) -> dict[str, Any]:
+    """Run `databricks bundle validate -t <target> -o json` and return the parsed doc.
+
+    Skips only via `_skip_reason_if_unauthenticated`'s bundle-independent probe.
+    Once auth is confirmed working, everything below is a real assertion: a
+    non-zero exit, a timeout, or non-JSON stdout all fail the test rather than
+    skip it, since at that point the failure is this repo's bundle config, not
+    the environment. stdout/stderr are captured separately -- `bundle validate`
+    writes advisory warnings (e.g. unmatched sync globs) to stderr even on
+    success, and merging them into stdout would break JSON parsing.
+    """
+    skip_reason = _skip_reason_if_unauthenticated()
+    if skip_reason is not None:
+        pytest.skip(skip_reason)
+
+    assert _DATABRICKS_CLI is not None  # guaranteed by the probe above
+    cmd = [_DATABRICKS_CLI, "bundle", "validate", "-t", target, "-o", "json", *(extra_args or [])]
+    proc = subprocess.run(
+        cmd,
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        f"`databricks bundle validate -t {target}` failed (auth already confirmed working, "
+        f"so this is a real bundle-config problem): {proc.stderr.strip()[:1000]}"
+    )
+    return json.loads(proc.stdout)
 
 
 def _resolved_code_search_index_job(target: str, **kw: Any) -> dict[str, Any]:

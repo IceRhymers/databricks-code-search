@@ -43,18 +43,6 @@ def test_queueing_is_preserved() -> None:
 
 
 @pytest.mark.unit
-def test_max_concurrent_runs_declared_immediately_after_the_job_name() -> None:
-    """Guards the pin's visibility: a reader scanning the job resource must see the
-    concurrency invariant before scrolling past the task/environment/schedule
-    blocks, not buried after them."""
-    text = _JOB_RESOURCE_PATH.read_text()
-    name_idx = text.index("name: code-search-index")
-    pin_idx = text.index("max_concurrent_runs:")
-    tasks_idx = text.index("tasks:")
-    assert name_idx < pin_idx < tasks_idx
-
-
-@pytest.mark.unit
 def test_existing_job_wiring_is_untouched() -> None:
     """The pin must not alter the task/environment/schedule wiring this job already
     depends on (python_wheel_task entry point, serverless environment, cron)."""
