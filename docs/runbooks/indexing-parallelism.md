@@ -63,6 +63,49 @@ not be one.
 
 ---
 
+## 1.1 One logical corpus writer: why runs are now serialized
+
+`resources/job.yml` pins `code_search_index` to `max_concurrent_runs: 1`,
+retaining `queue: enabled: true`. An overlapping trigger (a scheduled run
+landing on top of a manual retry, or two manual runs) now queues instead of
+starting a second concurrent run.
+
+**What this invariant actually buys:** at most one run of this job is ever
+fetching, deriving, or applying corpus state at a time. That is a
+precondition for global desired-state reconciliation (#56), which performs
+corpus-wide destructive DML (deleting rows for repos/branches no longer in
+the desired inventory) — safe only if no second run can be deriving a
+different desired inventory concurrently and racing the sweep.
+
+**What it is NOT:** a replacement for the per-branch sequencing in §1 above.
+The two invariants operate at different grains:
+
+| Invariant | Grain | Enforced by |
+|---|---|---|
+| Branches within one repo are sequential | inside one run, one repo | `indexer/job.py`'s per-repo worker loop (never concurrent) |
+| At most one job run at a time | across runs | `resources/job.yml`'s `max_concurrent_runs: 1` |
+
+**Coverage boundary — read this before adding a second writer.** This
+invariant covers only concurrent *runs of this job*. It does NOT cover:
+
+- A second job, script, or ad hoc process that writes to the same corpus
+  tables outside `code_search_index`.
+- A future per-repo/per-branch task-sharding split (`for_each_task`) that
+  fans a single run's work across *separate job runs* rather than threads
+  within one run's `ThreadPoolExecutor` — that would multiply run count and
+  defeat the pin's purpose entirely.
+- Raising `max_concurrent_runs` above 1 — the guard `indexer/store.py`'s
+  `StaleIndexError` exists specifically to fail loudly if this invariant is
+  ever silently removed (see §1 above).
+
+Any of these needs a shared database fencing/lease protocol (an advisory
+lock, a lease table) before it can safely coexist with reconciliation's
+corpus-wide DML. Until that protocol exists, treat "raise
+`max_concurrent_runs`" or "add a second writer" as a designed-around case,
+not a config tweak.
+
+---
+
 ## 2. Reading the logs
 
 Every record carries the repo it belongs to in brackets, including records from

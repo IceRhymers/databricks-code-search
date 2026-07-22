@@ -50,6 +50,17 @@ jobs:
       - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f  # v4
         with:
           python-version: "3.12"
+      # Future-readiness: no step here calls the `databricks` CLI directly today (the
+      # SDK-driven scripts below authenticate via DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET
+      # env vars, not the CLI), but tests/integration/test_job_resource_resolved.py --
+      # part of `make test-integration` below -- shells out to `databricks bundle
+      # validate` and skip-guards itself when the binary is absent. Installing it here is
+      # what turns that guard into a real assertion in this job instead of a permanent
+      # skip, and costs nothing on the runners where it stays unexercised (e.g. this
+      # job's vars.CI_LAKEBASE_ENABLED-gated no-op path).
+      - uses: databricks/setup-cli@dd60b7b133203edca3e8f08b1e053c43a979296e  # v1.8.0
+        with:
+          version: "1.8.0"
 
       - name: Install dependencies
         run: make install

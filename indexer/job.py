@@ -17,6 +17,19 @@ sweep sound without an advisory lock. Each BRANCH is isolated: one branch's
 failure or CAS conflict does not stop its repo's other branches from being
 attempted, and the process exits non-zero if any branch fails.
 
+One logical corpus writer, at the RUN level: ``resources/job.yml`` pins
+``max_concurrent_runs: 1`` (queueing retained), so at most one run of this job
+is ever fetching, deriving, or applying corpus state at a time -- the
+invariant global desired-state reconciliation (#56) depends on to avoid two
+runs deriving and applying different desired inventories concurrently. This is
+a SEPARATE invariant from the per-branch sequencing above: it bounds
+concurrent JOB RUNS, not what happens inside one run, and it does NOT cover a
+writer outside this job entirely (a second job, an ad hoc ``bundle run``, or a
+future per-repo/per-branch task-sharding split within one run). Any of those
+would need a shared database fencing/lease protocol before it could coexist
+with reconciliation -- see ``docs/runbooks/indexing-parallelism.md`` §1.1 for
+the full invariant and its coverage boundary.
+
 Repos are worked on concurrently by a bounded ``ThreadPoolExecutor`` sized by
 ``config.index_concurrency`` (clamped by
 :func:`indexer.repo_config.effective_workers`) -- the pool's unit of work is one

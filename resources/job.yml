@@ -8,6 +8,15 @@ resources:
   jobs:
     code_search_index:
       name: code-search-index
+      # One logical corpus writer: reconciliation (#56) performs corpus-wide desired-state
+      # cleanup, which is only safe if at most one run can be deriving/applying a desired
+      # inventory at a time. Pinned to 1 rather than left at the DABs default (which permits
+      # unbounded concurrent runs) so a scheduled run overlapping a manual retry queues
+      # instead of racing. Queueing (below) is what makes the pin harmless to throughput --
+      # an overlapping trigger waits rather than being dropped. See indexer/job.py's module
+      # docstring and docs/runbooks/indexing-parallelism.md §1.1 for the full invariant and
+      # what it does NOT cover (per-repo/per-branch concurrency within one run).
+      max_concurrent_runs: 1
       tasks:
         - task_key: index
           environment_key: default
