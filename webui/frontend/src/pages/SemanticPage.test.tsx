@@ -52,6 +52,19 @@ describe("semanticBody", () => {
     expect(markup).not.toContain("0 chunks");
   });
 
+  it("shows the unsupported_filter banner for a negated query with the negation remedy", () => {
+    const markup = markupFor(
+      envelope({
+        unsupported_filter: "-",
+        reason:
+          "negation is not supported in semantic queries; remove the leading '-' or quote the " +
+          "term to search it as text",
+      })
+    );
+    expect(markup).toContain("negation is not supported in semantic queries");
+    expect(markup).not.toContain("chunk");
+  });
+
   it("shows the nothing_to_embed banner with its reason and never falls through to results", () => {
     const markup = markupFor(
       envelope({

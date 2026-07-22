@@ -161,6 +161,13 @@ describe("deriveChips", () => {
     expect(chips).toEqual({ editable: false, repoActive: null, langActive: null, branch: { available: false, options: [], active: null } });
   });
 
+  it("disables everything for a negated query, even one naming a known repo", () => {
+    // Negation makes the whole query unsafe (see `recognize`'s token-initial '-' check), so
+    // chips must not surface a stale repoActive/branch group from before the '-' was typed.
+    const chips = deriveChips(recognize("-repo:acme foo"), REPOS);
+    expect(chips).toEqual({ editable: false, repoActive: null, langActive: null, branch: { available: false, options: [], active: null } });
+  });
+
   it("derives no chip state from a commit atom -- commits are free-text, never enumerable", () => {
     const withCommit = deriveChips(recognize("repo:acme commit:abc1234 foo"), REPOS);
     const withoutCommit = deriveChips(recognize("repo:acme foo"), REPOS);

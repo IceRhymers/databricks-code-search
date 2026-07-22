@@ -86,5 +86,33 @@
   { "query": "repo:a OR", "verdict": "unsafe", "python_parses": false },
   { "query": "((foo)", "verdict": "unsafe", "python_parses": false },
   { "query": "()", "verdict": "unsafe", "python_parses": false },
-  { "query": "/unterminated", "verdict": "unsafe", "python_parses": false }
+  { "query": "/unterminated", "verdict": "unsafe", "python_parses": false },
+  { "query": "-lang:go", "verdict": "unsafe", "python_parses": true },
+  { "query": "-branch:main", "verdict": "unsafe", "python_parses": true },
+  { "query": "-sym:Handler", "verdict": "unsafe", "python_parses": true },
+  { "query": "-file:*.py", "verdict": "unsafe", "python_parses": true },
+  { "query": "-commit:abc1234", "verdict": "unsafe", "python_parses": true },
+  { "query": "-\"quoted\"", "verdict": "unsafe", "python_parses": true },
+  { "query": "-/re/", "verdict": "unsafe", "python_parses": true },
+  { "query": "-foo OR bar", "verdict": "unsafe", "python_parses": true },
+  { "query": "repo:acme -(a OR b)", "verdict": "unsafe", "python_parses": true },
+  { "query": "-repo:a -repo:b", "verdict": "unsafe", "python_parses": true },
+  { "query": "\"-foo\"", "verdict": "unsafe", "python_parses": true },
+  { "query": "--", "verdict": "unsafe", "python_parses": true },
+  { "query": "-case:yes", "verdict": "unsafe", "python_parses": false },
+  { "query": "-(", "verdict": "unsafe", "python_parses": false },
+  { "query": "-)", "verdict": "unsafe", "python_parses": false },
+  { "query": "-", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "-", "start": 0, "end": 1 }
+  ] },
+  { "query": "- foo", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "-", "start": 0, "end": 1 },
+    { "field": null, "value": "foo", "start": 2, "end": 5 }
+  ] },
+  { "query": "a-b", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "a-b", "start": 0, "end": 3 }
+  ] },
+  { "query": "foo-", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "foo-", "start": 0, "end": 4 }
+  ] }
 ]
