@@ -41,8 +41,11 @@ Caveats (load-bearing, documented, never silently wrong):
   no files. Both are now **announced by name** rather than returning a silent empty result
   indistinguishable from a true negative (issue #31):
 
-  1. A filter-only query with no content atom (e.g. ``lang:go`` alone -- there is nothing to
-     highlight; file listing is a separate concern) sets ``no_content_atom``.
+  1. A query with no AFFIRMATIVE content atom to highlight sets ``no_content_atom``: either a
+     filter-only query (e.g. ``lang:go`` alone -- there is nothing to highlight; file listing is
+     a separate concern) or a purely-negated query (e.g. ``-foo`` alone -- the exclusion is
+     SQL-only and never a highlight). Both collect zero patterns identically; the raw ``query``
+     string is what a caller uses to tell them apart (see :func:`_no_content_atom`).
   2. A query whose atoms all match zero-width (e.g. ``/^/``, ``/\b/`` -- dropped as
      non-highlights, and NOT ``regex_incompatible`` since the pattern compiled fine) sets
      ``zero_width_only_atoms``.
@@ -63,6 +66,20 @@ Caveats (load-bearing, documented, never silently wrong):
 * **Per-file memory** relies on the indexer's per-file byte cap (issue #7 ``MAX_FILE_BYTES``)
   keeping any single ``content`` bounded; ``File.size`` is nullable/unpopulated in this
   branch, so a ``size`` pre-filter is intentionally NOT used.
+* **A broken regex still reaches Postgres, negated or not.** The compiler binds a
+  ``Regex`` pattern RAW into the SQL ``~``/``~*`` predicate regardless of polarity (a
+  :class:`Not` wraps the predicate in ``not_(...)``, it does not validate the pattern), so
+  a Postgres-invalid POSIX ARE such as ``/[/`` reaches the database whether the atom is
+  written as ``/[/`` or ``-/[/``. Postgres raises ``InvalidRegularExpression`` (SQLSTATE
+  class 22, a Data Exception), which SQLAlchemy surfaces as ``sqlalchemy.exc.DataError`` --
+  a DIFFERENT class from the ``OperationalError`` :func:`app.search.errors
+  .reraise_or_query_too_broad` catches, so it never reaches that mapper at all and
+  propagates straight out of ``grep_search`` uncaught, exactly like any other unexpected
+  fault (``app/main.py``'s ``_dispatch`` logs the traceback and re-raises). This is
+  **polarity-independent and pre-existing** (true for ``/[/`` before negation shipped, and
+  unchanged by it): grep only ever skips a negated broken regex's *Python-side* highlight
+  compilation (see :func:`_collect_matchers`); the SQL predicate is compiled server-side
+  regardless. Not handled in issue #70 -- tracked as follow-up issue #75.
 
 Byte offsets are UTF-8, line-local, half-open ``[start, end)``: for a :class:`LineMatch`,
 ``line_text.encode("utf-8")[start:end]`` is exactly the matched bytes (file-absolute offsets
@@ -191,7 +208,8 @@ class GrepResult:
     truncated: bool  # byte cap OR (row cap tripped AND no cursor kwarg was supplied)
     truncation_reason: str | None  # "byte_cap" | "row_cap" | None
     regex_incompatible: bool  # some Regex atom failed Python re.compile
-    no_content_atom: bool  # no content atom at all (filter-only query), nothing compiled away
+    no_content_atom: bool  # no AFFIRMATIVE content atom to highlight (filter-only OR fully
+    # negated, e.g. ``lang:go`` OR ``-foo`` alone); nothing compiled away either way
     zero_width_only_atoms: bool  # content atoms present, every one provably zero-width
     next_cursor: FileCursor | None  # last candidate consumed; None when this page exhausts them
 
@@ -267,7 +285,14 @@ def _build_matchers(node: Node, case_sensitive: bool) -> tuple[list[re.Pattern[s
 
 
 def _no_content_atom(patterns: Sequence[re.Pattern[str]], regex_incompatible: bool) -> bool:
-    """True when the query carries no content atom at all -- a filter-only query (issue #31).
+    """True when the query carries no AFFIRMATIVE content atom to highlight (issue #31).
+
+    ``patterns`` is empty for two structurally different queries, both reported identically
+    here: a filter-only query (``lang:go`` -- no content atom anywhere) and a fully-negated
+    query (``-foo`` -- a content atom exists but ``_collect_matchers`` never recurses into
+    ``Not``, so it contributes nothing to highlight). Neither has anything to highlight, so
+    the same flag is correct for both; a caller that needs to tell them apart recovers that
+    from the echoed ``query`` string, not from a second field (see issue #70's contract note).
 
     ``regex_incompatible`` is a REQUIRED conjunct, not a refinement: ``_collect_matchers``
     swallows ``re.error`` and appends nothing, so an uncompilable regex such as ``/[/`` also

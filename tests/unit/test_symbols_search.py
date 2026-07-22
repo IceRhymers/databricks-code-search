@@ -56,7 +56,9 @@ def test_collect_skips_negated_symbol_atom() -> None:
 
 @pytest.mark.unit
 def test_collect_returns_only_positive_symbol_beside_a_negated_one() -> None:
-    # `-sym:foo sym:bar` finds only `bar` definitions; the negated leg contributes nothing.
+    # AC4 traceability: `sym:Wanted -sym:Ignored`-shaped query (`-sym:foo sym:bar` here) finds
+    # only the affirmative `bar` definition; the negated leg contributes nothing, so no negative
+    # symbol term is ever projected as a result.
     assert _patterns("-sym:foo sym:bar") == ["bar"]
 
 
