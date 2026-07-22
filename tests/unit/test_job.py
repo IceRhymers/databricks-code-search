@@ -981,7 +981,9 @@ def test_run_indexes_kept_branches_and_logs_reconciliation_blocked_warning(
     assert code == 0
     assert len(idx.calls) == SOFT_BRANCH_CAP  # truncated set still gets indexed
 
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == "indexer.branches"
+    ]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
     assert "acme/widgets" in message
