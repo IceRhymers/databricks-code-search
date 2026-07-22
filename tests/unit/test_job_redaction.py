@@ -28,6 +28,7 @@ import pytest
 from indexer.job import read_github_token, run
 from indexer.languages import IndexCounts
 from indexer.repo_config import RepoConfig
+from indexer.store import ReconcileCounts
 
 SENTINEL = "ghp_SENTINEL_tok_do_not_log_0xDEADBEEF"
 
@@ -88,6 +89,10 @@ class _FakeResult:
     def all(self) -> list[Any]:
         return []
 
+    def scalars(self) -> _FakeResult:
+        """Answers the reconciliation checkpoint's ``select(Repo.name)`` (stored repos)."""
+        return self
+
 
 class _FakeConn:
     def __enter__(self) -> _FakeConn:
@@ -95,6 +100,9 @@ class _FakeConn:
 
     def __exit__(self, *exc: Any) -> bool:
         return False
+
+    def rollback(self) -> None:
+        """No-op: real code clears the purge-guard read's autobegun txn here."""
 
     def execute(self, stmt: Any) -> _FakeResult:
         """Answers run()'s pre-fan-out stamp SELECT. No rows = nothing skipped,
@@ -124,6 +132,19 @@ def _index_fn(
     return IndexCounts(files=files, symbols=0, swept=0)
 
 
+# No-op reconcile fns: a clean run in these tests always passes
+# _decide_reconciliation's gate, so run() reaches the post-fan-out checkpoint and
+# would otherwise call the REAL indexer.store primitives against these fake
+# conn/engine objects (neither of which implements conn.begin()). Every clean-run
+# test below injects these explicitly rather than relying on the defaults.
+def _reconcile_retired_noop(conn: Any, *, name: str, retired_branches: Any) -> ReconcileCounts:
+    return ReconcileCounts(branches_removed=0, files_stripped=0, files_deleted=0)
+
+
+def _reconcile_removed_noop(conn: Any, *, desired_repos: Any) -> list[str]:
+    return []
+
+
 @pytest.mark.unit
 def test_token_never_appears_in_debug_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)  # root logger forced to DEBUG
@@ -144,6 +165,8 @@ def test_token_never_appears_in_debug_logs(caplog: pytest.LogCaptureFixture) -> 
             engine=_FakeEngine(),
             index_fn=_index_fn,
             config_loader=lambda _c, _p: _CONFIG,
+            reconcile_retired_fn=_reconcile_retired_noop,
+            reconcile_removed_fn=_reconcile_removed_noop,
         )
     assert code == 0
 
@@ -216,8 +239,52 @@ def test_token_never_appears_during_enumeration(caplog: pytest.LogCaptureFixture
             engine=_FakeEngine(),
             index_fn=_index_fn,
             config_loader=lambda _c, _p: _ORG_CONFIG,
+            reconcile_retired_fn=_reconcile_retired_noop,
+            reconcile_removed_fn=_reconcile_removed_noop,
         )
     assert code == 0  # the org enumerated, and its one repo indexed
+
+    assert SENTINEL not in caplog.text
+    for record in caplog.records:
+        assert SENTINEL not in record.getMessage()
+        for arg in record.args or ():
+            assert SENTINEL not in str(arg)
+
+
+@pytest.mark.unit
+def test_reconciliation_failure_never_logs_exception_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reconcile primitive raising must never leak its exception message.
+
+    The purge decision (``select(Repo.name)``) always runs once the gate passes
+    regardless of what the fakes return, so ``reconcile_removed_fn`` raising here
+    reliably exercises ``_reconcile``'s except branch -- unlike
+    ``reconcile_retired_fn``, which this fake setup's empty stamp snapshot would
+    never even call (nothing is ever "retired" against an empty persisted set).
+    """
+    caplog.set_level(logging.DEBUG)
+    wc = _FakeWorkspaceClient()
+
+    def _reconcile_removed_leaks(conn: Any, *, desired_repos: Any) -> list[str]:
+        raise RuntimeError(f"db error near table: {SENTINEL}")
+
+    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+        code = run(
+            config_path="/Workspace/x/config.yaml",
+            scope="scope",
+            key="key",
+            endpoint="ep",
+            database="db",
+            workspace_client=wc,
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=_index_fn,
+            config_loader=lambda _c, _p: _CONFIG,
+            reconcile_retired_fn=_reconcile_retired_noop,
+            reconcile_removed_fn=_reconcile_removed_leaks,
+        )
+    assert code == 1  # reconciliation failed -> non-zero exit
 
     assert SENTINEL not in caplog.text
     for record in caplog.records:

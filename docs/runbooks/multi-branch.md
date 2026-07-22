@@ -72,10 +72,12 @@ reconciliation for it.** `indexer.branches.resolve_branches` returns a typed `Br
 (`branches`, `complete`, `dropped`, `cap`) instead of a bare list, and `indexer.job`'s per-repo
 `RepoOutcome` carries the same `complete` flag through as `discovery_complete`. A capped repo's
 kept branches are still indexed normally — nothing here changes what gets indexed or the run's
-exit code — but the upcoming desired-state reconciliation pass (#56/#59, see §7) must not treat
-a truncated set as proof the repo has no other branches: doing so would let it retire branches
-that were only dropped by the cap, not genuinely removed upstream. Narrow the glob (or raise the
-repo's branch hygiene) to get back to `complete=True` and unblock reconciliation for that repo.
+exit code — but the desired-state reconciliation checkpoint (#56/#59, see §7) treats a truncated
+set as incomplete discovery and blocks reconciliation **corpus-wide** for that run, not just for
+the capped repo: it must not treat a truncated set as proof a repo has no other branches, which
+would let it retire branches only dropped by the cap, not genuinely removed upstream. Narrow the
+glob (or raise the repo's branch hygiene) to get back to `complete=True` and unblock
+reconciliation.
 
 Branches are indexed **sequentially within a repo, not in parallel** (Option A1). This is
 deliberate, not a missing optimization: it's what keeps the single-writer-per-repo invariant the
@@ -199,27 +201,73 @@ set) and post-filter for default/`branch:` membership *after* fusion — a recal
 correctness one, and it only needs a config-level change (no schema migration) if you hit it.
 Record whichever outcome you observe in this section once verified against a real project.
 
-## 7. Known limitation: retired-branch membership is never swept
+## 7. Clean-run corpus reconciliation
 
 When a branch stops being resolved — a default-branch flip (`master` → `main`), a branch
-deleted on GitHub, or a `config.yaml` glob narrowed to no longer match it — **nothing removes
-it**. Its `repo_branches` row and its membership in `files.branches` both persist, so stale
-content stays queryable via `branch:<retired-name>` and the branch keeps showing up in
-`list_repos`. The per-branch membership sweep (`indexer/store.py::index_repo`) only ever touches
-branches it is *currently* indexing in that run — it has no way to know a branch was dropped
-from the resolved set entirely, since it never runs for that branch again.
+deleted on GitHub, or a `config.yaml` glob narrowed to no longer match it — or when a whole repo
+drops out of the resolved config, `indexer/job.py::run()` reconciles it away automatically. This
+closes the gap the pre-#59 limitation used to describe ("retired-branch membership is never
+swept"): the per-branch membership sweep (`indexer/store.py::index_repo`) only ever touches
+branches it is *currently* indexing, so it alone can never know a branch (or a whole repo) was
+dropped entirely. A dedicated post-fan-out checkpoint now does.
 
-This is an accepted V1 limitation (documented, not silent): a follow-up reconciliation pass —
-comparing each repo's currently-resolved branch set against its `repo_branches` rows, pruning
-rows (and `array_remove`-ing + deleting emptied `files`) for anything no longer resolved — is
-tracked in `.omc/plans/open-questions.md` but not implemented. If you narrow a `branches:` glob
-or a repo's default branch changes, expect the old branch's content to remain searchable via
-`branch:<old-name>` until that reconciliation pass ships.
+**The clean-run gate is fail-closed, and it is corpus-wide.** After every worker in a run has
+joined (`ThreadPoolExecutor`'s `with` block exits), `indexer.job._decide_reconciliation` checks
+the WHOLE run, not just the repo in question:
 
-`indexer.branches.BranchResolution.complete` (#61, see §2) is the property that reconciliation
-will gate on once it ships — a repo whose discovery was truncated (`complete=False`) must not
-have its omitted branches treated as evidence of retirement; the full reconciliation design
-(what reads `complete`, how deletion is scoped) is #59's scope, not covered further here.
+- zero branch/repo `failed` outcomes,
+- zero branch `conflict` outcomes (conflicts self-heal on the next run — see §1 — but are not
+  themselves evidence the corpus can be trusted this run),
+- every resolved repo produced a result (no repo silently dropped out of the count), and
+- every resolved repo's branch discovery was **complete** (`discovery_complete` / `BranchResolution.complete`, see §2) — a single soft-cap-truncated repo blocks reconciliation for *every* repo in the run, not just itself.
+
+Any one of those failing means the run indexed successfully (or partially) but reconciliation is
+skipped entirely — the corpus stays exactly as it was, one run stale rather than wrongly pruned.
+This is the deliberate **stale-over-destructive** philosophy: an operator can always re-run to
+retry reconciliation, but a wrongly deleted row is not similarly recoverable. Only when the gate
+passes does the checkpoint open one post-fan-out connection and, per resolved repo, retire any
+branch present in its persisted `repo_branches` registry but absent from this run's resolved set,
+then purge any stored repo absent from this run's fully resolved repo set.
+
+**A large corpus shrink is withheld, not applied, as an incident signal.** If a clean run's purge
+would remove more than half of the currently-stored repos in one pass
+(`indexer.job.MAX_PURGE_SHRINK_FRACTION = 0.5`, no config override), the repo-level purge alone is
+withheld — retired-*branch* cleanup on the surviving repos still applies normally, since that part
+is provably safe on repos this run genuinely, completely resolved. The run logs an ERROR and exits
+non-zero. This exists because a narrowed GitHub token/org/repo scope returns a clean HTTP 200 with
+fewer repos than before — indistinguishable, by count alone, from a legitimate mass decommission —
+and would otherwise silently mass-purge a live corpus. **Before assuming this is a legitimate
+config change: check the indexing job's GitHub token still has read access to every org/repo the
+resolved config expects** (a 403 on enumeration fails the run outright and would never reach this
+guard, but a *narrowed org membership* can still enumerate successfully with fewer repos). Once
+you've confirmed the shrink is real config intent — not credential narrowing — there are two ways
+to complete it:
+
+- **Staged removal (the normal path):** remove at most half of the currently-stored repos from
+  `config.yaml` per clean run. Each run's purge then falls at or under the 50% guard and the
+  corpus converges to the new desired state over a few runs.
+- **Manual one-time purge (for repos that are already absent from config but were never applied
+  because of this guard):** once token scope is confirmed, run
+  `indexer.store.reconcile_removed_repos(conn, desired_repos=<the resolved repo names>)` directly
+  against the database (the same primitive the job calls) to apply the withheld purge in one
+  shot, bypassing the per-run guard for this one operator-confirmed action.
+
+A withheld purge is always visible in the job log as an ERROR naming the would-purge count against
+the stored count — that line is the incident signal to alert on, not a routine "nothing to do"
+skip.
+
+**Failure mid-reconciliation is reported honestly, never as silent success.** Each store primitive
+(`reconcile_retired_branches`, `reconcile_removed_repos`) keeps its own transaction, so a failure
+partway through leaves whatever already committed in place. The run's log line distinguishes
+"corpus PARTIALLY reconciled" (something committed before the error — the rest completes on the
+next clean run, since both primitives are idempotent) from "corpus left stale" (nothing committed
+at all) — and always exits non-zero either way. The logged error never includes the raw exception
+message or a traceback, only the phase, the repo (where applicable), and the exception's type
+name, matching this job's existing token-redaction discipline.
+
+`indexer.branches.BranchResolution.complete` (#61, see §2) is the property the gate reads directly
+— a repo whose discovery was truncated (`complete=False`) blocks reconciliation for the whole run
+until the config is narrowed back to a complete resolution.
 
 ---
 
@@ -228,7 +276,7 @@ have its omitted branches treated as evidence of retirement; the full reconcilia
 - [`.omc/plans/multi-branch-support-plan.md`](../../.omc/plans/multi-branch-support-plan.md) —
   the full consensus-approved design (schema, indexer, query layer, serve).
 - [`.omc/plans/open-questions.md`](../../.omc/plans/open-questions.md) — the Phase-0 gate
-  result (B1 decision) and the still-open follow-ups referenced above.
+  result (B1 decision); the retired-branch-sweep follow-up it tracked is resolved by §7 (#59).
 - [`indexing-parallelism.md`](indexing-parallelism.md) — the single-writer-per-repo invariant
   this migration extends to per-branch sequencing.
 - [`semantic-enablement.md`](semantic-enablement.md) — the semantic search rollout this

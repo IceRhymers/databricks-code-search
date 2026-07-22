@@ -16,7 +16,7 @@ scratch notes.
 
 | File | Description |
 |------|-------------|
-| `multi-branch.md` | Multi-branch indexing (migration `0003`): `branches:` config globs and the 20-branch cap, grant-coupled deploy, exact (not glob) `branch:` query semantics, pgcrypto backfill, semantic branch-scoping EXPLAIN gate, and the never-swept retired-branch limitation |
+| `multi-branch.md` | Multi-branch indexing (migration `0003`): `branches:` config globs and the 20-branch cap, grant-coupled deploy, exact (not glob) `branch:` query semantics, pgcrypto backfill, semantic branch-scoping EXPLAIN gate, and clean-run corpus reconciliation (#59): the fail-closed gate, the >50% purge shrink guard as an incident signal, and honest partial-vs-stale failure reporting |
 | `semantic-enablement.md` | Semantic search default-on: the managed `shared_preload_libraries` project assumption (irreversible, out-of-band), enablement-is-just-deploy via migration `0004`, the three-surface opt-out flag, AI Gateway embeddings, memory/lock-window sizing, and rollback notes |
 | `ci-lakebase.md` | The integration CI gate: why CI runs against a real ephemeral Lakebase branch (no Postgres stand-in can prove BM25 ranking or the ordered-index plan), operator prerequisites, per-run branch isolation/TTL safety properties, and the local manual-run recipe |
 | `webui.md` | The `webui` Databricks App: deploy/URL/auth (`CAN_USE`, no OAuth app connection), branch permalinks and filter chips, the semantic tab and its status route, read-only grants, security headers, committed frontend build, and the deploy-time `app.whl` packaging seam |

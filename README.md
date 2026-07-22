@@ -330,6 +330,19 @@ with a loud warning if a glob matches more. See
 details, the deploy-grant coupling this feature introduces, and how `branch:`-scoped
 queries reach this indexed set at query time.
 
+### Removing a repo or branch
+
+Removing a repo from `config.yaml`, deleting a branch upstream, narrowing a `branches:` glob,
+or flipping a repo's default branch all take effect on the **next fully clean index run** — one
+where every selected repo and branch resolves and indexes (or validly skips) without any
+failure, conflict, or truncated branch discovery anywhere in that run. That run's post-fan-out
+reconciliation checkpoint retires the dropped branch's/repo's stale rows; any failure elsewhere
+in the same run leaves the whole corpus untouched rather than partially pruned (stale over
+destructive). A single clean run that would purge more than half of the currently stored repos
+is withheld and logged as an incident signal rather than applied — see
+[`docs/runbooks/multi-branch.md` §7](docs/runbooks/multi-branch.md#7-clean-run-corpus-reconciliation)
+for the full gate, the shrink guard, and how to complete a large intentional repo removal.
+
 ### `exclude` rules
 
 | Key | Default | Semantics |

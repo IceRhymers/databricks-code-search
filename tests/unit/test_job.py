@@ -31,10 +31,24 @@ import pytest
 
 from app.config import Settings
 from app.db.models import INDEX_SEMANTICS_VERSION
-from indexer.job import read_github_token, run
+from indexer.job import (
+    BranchOutcome,
+    RepoOutcome,
+    _decide_reconciliation,
+    _reconcile,
+    _reconciliation_skip_reason,
+    read_github_token,
+    run,
+)
 from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
 from indexer.repo_config import ConfigError, RepoConfig, load_config
-from indexer.store import StaleIndexError
+from indexer.resolve import RepoEntry
+from indexer.store import (
+    ReconcileCounts,
+    StaleIndexError,
+    reconcile_removed_repos,
+    reconcile_retired_branches,
+)
 
 # --- read_github_token ------------------------------------------------------
 
@@ -182,11 +196,15 @@ class _StampRow(NamedTuple):
 
 
 class _FakeResult:
-    def __init__(self, rows: list[_StampRow]) -> None:
+    def __init__(self, rows: list[Any]) -> None:
         self._rows = rows
 
-    def all(self) -> list[_StampRow]:
+    def all(self) -> list[Any]:
         return self._rows
+
+    def scalars(self) -> _FakeResult:
+        """Answers the reconciliation checkpoint's ``select(Repo.name)`` (stored repos)."""
+        return self
 
 
 class _FakeConn:
@@ -199,24 +217,43 @@ class _FakeConn:
     def __exit__(self, *exc: Any) -> bool:
         return False
 
+    def rollback(self) -> None:
+        """No-op: real code clears the purge-guard read's autobegun txn here."""
+
     def execute(self, stmt: Any) -> _FakeResult:
         assert self._engine is not None
         self._engine.executed.append(stmt)
-        return _FakeResult(self._engine.stamp_rows)
+        # Routed by statement shape, not identity: the pre-fan-out stamp SELECT
+        # joins repo_branches (see _read_stamps); the reconciliation checkpoint's
+        # stored-repo-names SELECT (job.py's _reconcile) does not. Real
+        # reconcile_retired_fn/reconcile_removed_fn primitives issue raw text()
+        # DML and are never exercised here -- _run() default-injects no-op fakes
+        # for both (see _noop_retired_fn/_noop_removed_fn) precisely so this fake
+        # conn never has to answer them.
+        if "repo_branches" in str(stmt):
+            return _FakeResult(self._engine.stamp_rows)
+        return _FakeResult(self._engine.repo_names)
 
 
 class _FakeEngine:
-    """Fake Engine that also answers ``_read_stamps``' batched SELECT.
+    """Fake Engine that also answers ``_read_stamps``' and ``_reconcile``'s batched SELECTs.
 
     ``stamps`` maps a ``(repo name, branch)`` pair to its stored
     ``(last_indexed_commit, index_semantics_version)``; an absent pair is simply
     not returned, which is the "never indexed" shape. Every test repo here
     resolves to just its "main" branch (no ``branches:`` configured), so a
     stamp is keyed ``(name, "main")``.
+
+    ``repo_names`` answers the reconciliation checkpoint's unfiltered
+    ``select(Repo.name)`` (the purge shrink guard's "what's currently stored"
+    read) -- defaults to empty, which keeps the guard a no-op (nothing stored ->
+    nothing can be a majority of it) for every test that does not care about it.
     """
 
     def __init__(
-        self, stamps: dict[tuple[str, str], tuple[str | None, int | None]] | None = None
+        self,
+        stamps: dict[tuple[str, str], tuple[str | None, int | None]] | None = None,
+        repo_names: list[str] | None = None,
     ) -> None:
         self.disposed = False
         self.disposed_at: float | None = None
@@ -225,6 +262,7 @@ class _FakeEngine:
             _StampRow(name, branch, commit, version)
             for (name, branch), (commit, version) in (stamps or {}).items()
         ]
+        self.repo_names = repo_names or []
 
     def connect(self) -> _FakeConn:
         return _FakeConn(self)
@@ -261,6 +299,52 @@ class _RecordingIndex:
         return counts
 
 
+def _noop_retired_fn(conn: Any, *, name: str, retired_branches: Any) -> ReconcileCounts:
+    return ReconcileCounts(branches_removed=0, files_stripped=0, files_deleted=0)
+
+
+def _noop_removed_fn(conn: Any, *, desired_repos: Any) -> list[str]:
+    return []
+
+
+class _RecordingReconcile:
+    """Fake ``reconcile_retired_fn``/``reconcile_removed_fn`` pair, explicitly opted into.
+
+    Records every call (sorted, so assertions don't depend on set/dict
+    iteration order) instead of touching a real Postgres connection. Pass
+    ``retired_result``/``removed_result`` to script a return value, or
+    ``retired_raises``/``removed_raises`` to have that side raise instead --
+    used by the failure-handling tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        retired_result: ReconcileCounts | None = None,
+        removed_result: list[str] | None = None,
+        retired_raises: Exception | None = None,
+        removed_raises: Exception | None = None,
+    ) -> None:
+        self.retired_calls: list[tuple[str, list[str]]] = []
+        self.removed_calls: list[list[str]] = []
+        self._retired_result = retired_result or ReconcileCounts(0, 0, 0)
+        self._removed_result = [] if removed_result is None else removed_result
+        self._retired_raises = retired_raises
+        self._removed_raises = removed_raises
+
+    def retired_fn(self, conn: Any, *, name: str, retired_branches: Any) -> ReconcileCounts:
+        self.retired_calls.append((name, sorted(retired_branches)))
+        if self._retired_raises is not None:
+            raise self._retired_raises
+        return self._retired_result
+
+    def removed_fn(self, conn: Any, *, desired_repos: Any) -> list[str]:
+        self.removed_calls.append(sorted(desired_repos))
+        if self._removed_raises is not None:
+            raise self._removed_raises
+        return self._removed_result
+
+
 def _run(
     config: RepoConfig,
     index_fn: Any,
@@ -269,8 +353,18 @@ def _run(
     embed_fn: Any = None,
     github: _GitHub | None = None,
     engine: _FakeEngine | None = None,
+    reconcile_retired_fn: Any = _noop_retired_fn,
+    reconcile_removed_fn: Any = _noop_removed_fn,
 ) -> int:
-    """Drive run() with a faked config read but a REAL resolve_repos."""
+    """Drive run() with a faked config read but a REAL resolve_repos.
+
+    ``reconcile_retired_fn``/``reconcile_removed_fn`` default to no-ops: a clean
+    run now always reaches the post-fan-out reconciliation checkpoint, and
+    without an override here it would call the REAL ``indexer.store`` primitives
+    against ``_FakeEngine``/``_FakeConn`` (neither implements ``conn.begin()``).
+    Tests that assert on reconciliation itself pass an explicit
+    :class:`_RecordingReconcile`'s bound methods.
+    """
     wc = _FakeWorkspaceClient("tok")
     engine = engine if engine is not None else _FakeEngine()
     handler = github if github is not None else _GitHub()
@@ -288,6 +382,8 @@ def _run(
             cfg=cfg,
             embed_fn=embed_fn,
             config_loader=lambda _client, _path: config,
+            reconcile_retired_fn=reconcile_retired_fn,
+            reconcile_removed_fn=reconcile_removed_fn,
         )
 
 
@@ -796,8 +892,11 @@ def test_stamp_read_is_a_single_query_bounded_by_an_in_clause() -> None:
     engine = _FakeEngine()
     code = _run(_config(repos=["acme/widgets", "acme/gadgets"]), idx, engine=engine)
     assert code == 0
-    assert len(engine.executed) == 1
-    sql = str(engine.executed[0])
+    # Exactly one STAMPS query (this test's subject); the reconciliation
+    # checkpoint's separate stored-repo-names SELECT is asserted elsewhere.
+    stamp_queries = [stmt for stmt in engine.executed if "repo_branches" in str(stmt)]
+    assert len(stamp_queries) == 1
+    sql = str(stamp_queries[0])
     assert "repos.name IN " in sql
     assert "repo_branches.last_indexed_commit" in sql
     assert "repo_branches.index_semantics_version" in sql
@@ -1165,6 +1264,8 @@ def test_engine_is_disposed_only_after_every_worker_returned(
             config_loader=lambda _c, _p: _config(
                 repos=["acme/widgets", "acme/gadgets"], index_concurrency=2
             ),
+            reconcile_retired_fn=_noop_retired_fn,
+            reconcile_removed_fn=_noop_removed_fn,
         )
     assert code == 0
     assert engine.disposed is True
@@ -1361,6 +1462,8 @@ def _engine_kwargs(
             index_fn=_RecordingIndex(),
             cfg=cfg,
             config_loader=lambda _c, _p: config,
+            reconcile_retired_fn=_noop_retired_fn,
+            reconcile_removed_fn=_noop_removed_fn,
         )
     assert code == 0
     assert len(recorded) == 1
@@ -1474,3 +1577,447 @@ def test_starved_repo_fails_alone_and_downloads_nothing(
     # Not one byte was fetched for the starved repo.
     assert github.tarball_requests == ["/repos/acme/widgets/tarball/sha_widgets"]
     assert "failed to index acme/gadgets" in caplog.text
+
+
+# --- Reconciliation checkpoint (#59) ----------------------------------------
+
+
+def _repo_entry(name: str) -> RepoEntry:
+    return RepoEntry(name=name, branch_globs=frozenset())
+
+
+def _ok_outcome(
+    name: str, *, branches: list[str] | None = None, discovery_complete: bool = True
+) -> RepoOutcome:
+    branches = branches or ["main"]
+    return RepoOutcome(
+        name=name,
+        discovery_complete=discovery_complete,
+        outcomes=[
+            BranchOutcome(
+                branch=b, status="indexed", counts=IndexCounts(files=1, symbols=0, swept=0)
+            )
+            for b in branches
+        ],
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "failures,conflicts,outcome_count,entry_count,discovery_complete,expected",
+    [
+        (0, 0, 1, 1, True, True),  # clean run: gate passes
+        (1, 0, 1, 1, True, False),  # any failure blocks
+        (0, 1, 1, 1, True, False),  # any conflict blocks
+        (0, 0, 1, 2, True, False),  # fewer outcomes than entries blocks
+        (0, 0, 1, 1, False, False),  # incomplete branch discovery blocks
+    ],
+)
+def test_decide_reconciliation_truth_table(
+    failures: int,
+    conflicts: int,
+    outcome_count: int,
+    entry_count: int,
+    discovery_complete: bool,
+    expected: bool,
+) -> None:
+    entries = [_repo_entry(f"acme/r{i}") for i in range(entry_count)]
+    repo_outcomes = [
+        _ok_outcome(f"acme/r{i}", discovery_complete=discovery_complete)
+        for i in range(outcome_count)
+    ]
+    assert (
+        _decide_reconciliation(
+            failures=failures,
+            conflicts=conflicts,
+            repo_outcomes=repo_outcomes,
+            entries=entries,
+        )
+        is expected
+    )
+
+
+@pytest.mark.unit
+def test_retires_only_persisted_minus_resolved_branches() -> None:
+    """A stale persisted branch is retired; a branch still resolved this run is not.
+
+    Also covers a first-ever repo (``acme/gadgets``, nothing persisted): it is
+    never itself "retired" -- there is nothing in ``stamps`` to subtract from.
+    """
+    rec = _RecordingReconcile()
+    engine = _FakeEngine(
+        stamps={
+            ("acme/widgets", "main"): ("sha_widgets", INDEX_SEMANTICS_VERSION),
+            ("acme/widgets", "stale"): (None, None),
+        }
+    )
+    code = _run(
+        _config(repos=["acme/widgets", "acme/gadgets"]),
+        _RecordingIndex(),
+        engine=engine,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0
+    assert rec.retired_calls == [("acme/widgets", ["stale"])]
+
+
+@pytest.mark.unit
+def test_skipped_branches_permit_reconciliation() -> None:
+    rec = _RecordingReconcile()
+    engine = _FakeEngine(
+        stamps={("acme/widgets", "main"): ("sha_widgets", INDEX_SEMANTICS_VERSION)}
+    )
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _RecordingIndex(),
+        engine=engine,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0  # the branch was skipped, not indexed -- still counts as success
+    assert rec.removed_calls == [["acme/widgets"]]
+
+
+@pytest.mark.unit
+def test_desired_repos_passed_to_removed_fn_is_exact_and_sorted() -> None:
+    rec = _RecordingReconcile()
+    engine = _FakeEngine(
+        stamps={("acme/widgets", "main"): ("sha_widgets", INDEX_SEMANTICS_VERSION)}
+    )
+    code = _run(
+        _config(repos=["acme/widgets", "acme/gadgets"]),
+        _RecordingIndex(),
+        engine=engine,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0
+    # acme/widgets' only outcome this run was "skipped" -- still in desired_repos.
+    assert rec.removed_calls == [["acme/gadgets", "acme/widgets"]]
+
+
+@pytest.mark.unit
+def test_branch_failure_blocks_reconciliation() -> None:
+    def _failing_index(conn: Any, *, name: str, items: Any, **_: Any) -> IndexCounts:
+        list(items)
+        raise RuntimeError("boom")
+
+    rec = _RecordingReconcile()
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _failing_index,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 1
+    assert rec.retired_calls == []
+    assert rec.removed_calls == []
+
+
+@pytest.mark.unit
+def test_branch_conflict_blocks_reconciliation_but_exits_zero(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def _conflicting_index(conn: Any, *, name: str, items: Any, **_: Any) -> IndexCounts:
+        list(items)
+        raise StaleIndexError("changed mid-transaction")
+
+    rec = _RecordingReconcile()
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _conflicting_index,
+            reconcile_retired_fn=rec.retired_fn,
+            reconcile_removed_fn=rec.removed_fn,
+        )
+    assert code == 0  # conflicts self-heal -- they don't fail the run
+    assert rec.retired_calls == []
+    assert rec.removed_calls == []
+    lines = [
+        r.getMessage() for r in caplog.records if "corpus reconciliation skipped" in r.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "conflict" in lines[0]
+
+
+@pytest.mark.unit
+def test_repo_level_failure_blocks_reconciliation() -> None:
+    github = _GitHub(missing={"acme/broken"})
+    rec = _RecordingReconcile()
+    code = _run(
+        _config(repos=["acme/widgets", "acme/broken"]),
+        _RecordingIndex(),
+        github=github,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 1
+    assert rec.retired_calls == []
+    assert rec.removed_calls == []
+
+
+@pytest.mark.unit
+def test_soft_cap_truncated_discovery_blocks_reconciliation() -> None:
+    from indexer.branches import SOFT_BRANCH_CAP
+
+    extra = [f"b{i:02d}" for i in range(SOFT_BRANCH_CAP + 5)]
+    idx = _RecordingIndex()
+    github = _GitHub(branches={"acme/widgets": ["main", *extra]})
+    rec = _RecordingReconcile()
+    code = _run(
+        _config(repos=["acme/widgets"], branches=["*"]),
+        idx,
+        github=github,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0  # truncation alone does not fail the run
+    assert rec.retired_calls == []
+    assert rec.removed_calls == []  # but corpus-wide reconciliation is blocked
+
+
+@pytest.mark.unit
+def test_reconciliation_runs_after_fanout_drains() -> None:
+    """An ordering probe: every index call happens before any reconcile call."""
+    order: list[str] = []
+
+    def _index_fn(conn: Any, *, name: str, items: Any, **_: Any) -> IndexCounts:
+        list(items)
+        order.append(f"index:{name}")
+        return IndexCounts(files=1, symbols=0, swept=0)
+
+    class _OrderedReconcile(_RecordingReconcile):
+        def removed_fn(self, conn: Any, *, desired_repos: Any) -> list[str]:
+            order.append("removed")
+            return super().removed_fn(conn, desired_repos=desired_repos)
+
+    rec = _OrderedReconcile()
+    code = _run(
+        _config(repos=["acme/widgets", "acme/gadgets"]),
+        _index_fn,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0
+    index_positions = [i for i, e in enumerate(order) if e.startswith("index:")]
+    assert len(index_positions) == 2
+    assert max(index_positions) < order.index("removed")
+
+
+@pytest.mark.unit
+def test_reconcile_fns_never_referenced_from_worker_source() -> None:
+    """Source-level tripwire: reconciliation is never reachable from worker-thread code."""
+    import indexer.job as job
+
+    worker_src = "".join(
+        inspect.getsource(fn)
+        for fn in (job._index_one, job._index_one_inner, job._index_one_branch)
+    )
+    forbidden = (
+        "reconcile_retired_fn",
+        "reconcile_removed_fn",
+        "reconcile_retired_branches",
+        "reconcile_removed_repos",
+        "_reconcile(",
+        "_decide_reconciliation",
+    )
+    for needle in forbidden:
+        assert needle not in worker_src, f"{needle!r} referenced from worker-thread source"
+
+
+@pytest.mark.unit
+def test_reconciliation_complete_summary_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    rec = _RecordingReconcile(
+        retired_result=ReconcileCounts(branches_removed=2, files_stripped=3, files_deleted=1),
+        removed_result=["acme/old-repo"],
+    )
+    engine = _FakeEngine(stamps={("acme/widgets", "stale-branch"): (None, None)})
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            engine=engine,
+            reconcile_retired_fn=rec.retired_fn,
+            reconcile_removed_fn=rec.removed_fn,
+        )
+    assert code == 0
+    assert rec.retired_calls == [("acme/widgets", ["stale-branch"])]
+    lines = [
+        r.getMessage() for r in caplog.records if "corpus reconciliation complete" in r.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "2 branch(es) retired" in lines[0]
+    assert "3 file(s) stripped" in lines[0]
+    assert "1 deleted" in lines[0]
+    assert "1 repo(s) purged" in lines[0]
+
+
+@pytest.mark.unit
+def test_reconciliation_skipped_summary_includes_reasons(caplog: pytest.LogCaptureFixture) -> None:
+    github = _GitHub(missing={"acme/broken"})
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets", "acme/broken"]), _RecordingIndex(), github=github
+        )
+    assert code == 1
+    lines = [
+        r.getMessage() for r in caplog.records if "corpus reconciliation skipped" in r.getMessage()
+    ]
+    assert len(lines) == 1
+    assert "1 repo/branch failure(s)" in lines[0]
+    assert "1 repo(s) never completed" in lines[0]
+
+
+@pytest.mark.unit
+def test_reconciliation_skip_reason_never_empty_when_gate_fails() -> None:
+    """Companion unit check for _reconciliation_skip_reason directly (no run() plumbing)."""
+    entries = [_repo_entry("acme/widgets")]
+    reason = _reconciliation_skip_reason(failures=1, conflicts=0, repo_outcomes=[], entries=entries)
+    assert "1 repo/branch failure(s)" in reason
+
+
+@pytest.mark.unit
+def test_committed_any_false_logs_left_stale(caplog: pytest.LogCaptureFixture) -> None:
+    """Nothing committed before the failure -> "left stale", never "PARTIALLY"."""
+    rec = _RecordingReconcile(removed_raises=RuntimeError("boom"))
+    with caplog.at_level(logging.ERROR, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            reconcile_retired_fn=rec.retired_fn,
+            reconcile_removed_fn=rec.removed_fn,
+        )
+    assert code == 1
+    assert (
+        rec.retired_calls == []
+    )  # nothing to retire -> never called -> committed_any stayed False
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("left stale" in m for m in errors)
+    assert not any("PARTIALLY" in m for m in errors)
+
+
+@pytest.mark.unit
+def test_committed_any_true_logs_partially_reconciled(caplog: pytest.LogCaptureFixture) -> None:
+    """A commit before the failure -> "PARTIALLY reconciled", not "left stale"."""
+    rec = _RecordingReconcile(removed_raises=RuntimeError("boom"))
+    engine = _FakeEngine(stamps={("acme/widgets", "stale-branch"): (None, None)})
+    with caplog.at_level(logging.ERROR, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            engine=engine,
+            reconcile_retired_fn=rec.retired_fn,
+            reconcile_removed_fn=rec.removed_fn,
+        )
+    assert code == 1
+    assert rec.retired_calls == [("acme/widgets", ["stale-branch"])]  # committed before the raise
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("PARTIALLY reconciled" in m for m in errors)
+    assert not any("left stale" in m for m in errors)
+
+
+@pytest.mark.unit
+def test_purge_shrink_guard_withholds_majority_purge(caplog: pytest.LogCaptureFixture) -> None:
+    rec = _RecordingReconcile(
+        retired_result=ReconcileCounts(branches_removed=1, files_stripped=1, files_deleted=0)
+    )
+    engine = _FakeEngine(
+        stamps={("acme/a", "stale"): (None, None)},
+        repo_names=["acme/a", "acme/b", "acme/c", "acme/d"],
+    )
+    with caplog.at_level(logging.ERROR, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/a"]),
+            _RecordingIndex(),
+            engine=engine,
+            reconcile_retired_fn=rec.retired_fn,
+            reconcile_removed_fn=rec.removed_fn,
+        )
+    assert code == 1
+    # The surviving repo's OWN retired-branch cleanup still ran...
+    assert rec.retired_calls == [("acme/a", ["stale"])]
+    # ...but the corpus-wide purge was withheld entirely.
+    assert rec.removed_calls == []
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("withheld" in m and "3/4" in m for m in errors)
+
+
+@pytest.mark.unit
+def test_purge_shrink_guard_boundary_exactly_half_proceeds() -> None:
+    """Strict ``>``: a purge removing EXACTLY half of stored repos is NOT withheld."""
+    rec = _RecordingReconcile()
+    engine = _FakeEngine(repo_names=["acme/a", "acme/b", "acme/c", "acme/d"])
+    code = _run(
+        _config(repos=["acme/a", "acme/b"]),
+        _RecordingIndex(),
+        engine=engine,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0
+    assert rec.removed_calls == [["acme/a", "acme/b"]]
+
+
+@pytest.mark.unit
+def test_primitive_failure_logs_safe_fields_only(caplog: pytest.LogCaptureFixture) -> None:
+    secret_message = "leak-marker-9f3c db=prod user=admin"
+    rec = _RecordingReconcile(removed_raises=RuntimeError(secret_message))
+    with caplog.at_level(logging.ERROR, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            reconcile_retired_fn=rec.retired_fn,
+            reconcile_removed_fn=rec.removed_fn,
+        )
+    assert code == 1
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("RuntimeError" in m for m in errors)
+    assert not any(secret_message in m for m in errors)
+    for record in caplog.records:
+        assert secret_message not in record.getMessage()
+        for arg in record.args or ():
+            assert secret_message not in str(arg)
+
+
+@pytest.mark.unit
+def test_reconcile_fn_defaults_are_the_real_primitives() -> None:
+    sig = inspect.signature(run)
+    assert sig.parameters["reconcile_retired_fn"].default is reconcile_retired_branches
+    assert sig.parameters["reconcile_removed_fn"].default is reconcile_removed_repos
+
+
+@pytest.mark.unit
+def test_retired_branch_names_are_never_casefolded() -> None:
+    """``stamps`` keys are casefolded on the name component only -- never the branch."""
+    rec = _RecordingReconcile()
+    engine = _FakeEngine(stamps={("acme/widgets", "Release-3.2"): (None, None)})
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _RecordingIndex(),
+        engine=engine,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert code == 0
+    assert rec.retired_calls == [("acme/widgets", ["Release-3.2"])]
+
+
+@pytest.mark.unit
+def test_reconcile_unit_level_partial_progress_on_mid_sequence_failure() -> None:
+    """Unit-level (no run() plumbing): _reconcile itself returns an accurate partial progress."""
+    rec = _RecordingReconcile(removed_raises=RuntimeError("boom"))
+    repo_outcomes = [_ok_outcome("acme/widgets")]
+    stamps = {("acme/widgets", "stale"): (None, None)}
+    engine = _FakeEngine(stamps=stamps)
+    progress, failed = _reconcile(
+        engine,
+        repo_outcomes=repo_outcomes,
+        stamps=stamps,
+        reconcile_retired_fn=rec.retired_fn,
+        reconcile_removed_fn=rec.removed_fn,
+    )
+    assert failed is True
+    assert progress.committed_any is True
+    assert progress.purge_blocked is False
+    assert progress.purged_repos == []

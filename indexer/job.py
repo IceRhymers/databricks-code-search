@@ -89,7 +89,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -115,10 +115,27 @@ from indexer.languages import Chunk, IndexCounts, ParsedFile
 from indexer.parse import iter_chunks, iter_source_files
 from indexer.repo_config import RepoConfig, effective_workers, load_config, normalize_repo
 from indexer.resolve import MAX_REPOS, RepoEntry, resolve_repos
-from indexer.store import ChunkWriter, StaleIndexError, index_repo
+from indexer.store import (
+    ChunkWriter,
+    ReconcileCounts,
+    StaleIndexError,
+    index_repo,
+    reconcile_removed_repos,
+    reconcile_retired_branches,
+)
 from indexer.symbols import extract_symbols
 
 logger = logging.getLogger("indexer.job")
+
+# Corpus-wide desired-state reconciliation (#56/#59) withholds the repo purge --
+# but NOT retired-branch cleanup on surviving repos -- when it would remove more
+# than this fraction of currently stored repos in one clean run. A narrowed
+# GitHub token/org scope returns a clean HTTP 200 with fewer repos than before,
+# which is indistinguishable from a legitimate mass decommission by count alone;
+# this guard converts a silent mass purge into a loud, recoverable incident
+# instead. Strict ``>``: a purge removing EXACTLY half proceeds. No config knob --
+# see indexer/AGENTS.md for the rationale and the staged-removal remedy.
+MAX_PURGE_SHRINK_FRACTION = 0.5
 
 
 @dataclass(frozen=True)
@@ -163,6 +180,35 @@ class RepoOutcome:
     name: str
     discovery_complete: bool
     outcomes: list[BranchOutcome]
+
+
+@dataclass
+class ReconcileProgress:
+    """Mutable accumulator for the post-fan-out reconciliation checkpoint (#59).
+
+    Deliberately NOT frozen: ``_reconcile`` mutates one instance in place as it
+    walks the retired-branch loop and then the purge decision, so a mid-sequence
+    exception still leaves an accurate partial record for the failure-message
+    split below.
+
+    ``committed_any`` is the field that split hinges on: it is set ``True`` as
+    the FIRST statement immediately after each of ``reconcile_retired_fn`` /
+    ``reconcile_removed_fn`` RETURNS -- both primitives are proven in
+    ``indexer/store.py`` to either fully commit and return or roll back and
+    raise, never partially commit, so "the call returned" is exactly equivalent
+    to "that primitive's transaction committed". A later exception (from a
+    *different* call) with ``committed_any=True`` means the corpus is honestly
+    PARTIALLY reconciled, not silently stale -- see ``_reconcile``.
+    """
+
+    committed_any: bool = False
+    branches_removed: int = 0
+    files_stripped: int = 0
+    files_deleted: int = 0
+    purged_repos: list[str] = field(default_factory=list)
+    purge_blocked: bool = False
+    would_purge_count: int = 0
+    stored_count: int = 0
 
 
 # Per-repo log context. Set by _index_one so that records emitted by
@@ -211,19 +257,30 @@ def run(
     embed_fn: EmbedFn | None = None,
     config_loader: Callable[[Any, str], RepoConfig] = load_config,
     max_repos: int = MAX_REPOS,
+    reconcile_retired_fn: Callable[..., ReconcileCounts] = reconcile_retired_branches,
+    reconcile_removed_fn: Callable[..., list[str]] = reconcile_removed_repos,
 ) -> int:
     """Index every configured repo and return a process exit code (0 = all ok).
 
     Boundaries are injectable for tests: ``workspace_client`` (secret + config
     read), ``http_client`` (GitHub HTTP), ``engine`` (DB), ``index_fn`` (the
-    store), ``embed_fn`` (issue #14 semantic chunking), and ``config_loader``
-    (so orchestration tests need no SDK fake). ``cfg`` defaults to the
+    store), ``embed_fn`` (issue #14 semantic chunking), ``config_loader`` (so
+    orchestration tests need no SDK fake), and ``reconcile_retired_fn`` /
+    ``reconcile_removed_fn`` (the #57/#58 storage primitives the post-fan-out
+    checkpoint below invokes -- mirroring ``index_fn``'s injection so
+    reconciliation tests need no real Postgres either). ``cfg`` defaults to the
     process-cached :func:`app.config.get_settings`.
 
     ``resolve_repos`` is deliberately **not** injectable: the existing
     ``httpx.MockTransport`` seam already lets tests drive enumeration outcomes
     through the real resolver, and a fake one would let the fail-fast contract
     pass without exercising the wiring it exists to prove.
+
+    Reconciliation (#56/#59) is invoked ONLY from this function's post-fan-out
+    checkpoint, main-thread, after every worker has joined -- never from
+    ``_index_one``/``_index_one_inner``/``_index_one_branch``. See
+    ``test_reconcile_fns_never_referenced_from_worker_source`` in
+    ``tests/unit/test_job.py`` for the tripwire that enforces it.
     """
     run_started = time.monotonic()
     if cfg is None:
@@ -322,6 +379,11 @@ def run(
     # docs/runbooks/indexing-parallelism.md gets a real number to check against
     # -- and how a shrunken disk becomes visible before it becomes an outage.
     ok = skipped = conflicts = failures = 0
+    repo_outcomes: list[RepoOutcome] = []
+    reconciliation_attempted = False
+    reconciliation_failed = False
+    reconcile_skip_reason = ""
+    progress = ReconcileProgress()
     try:
         # Inside the try for the same reason as the stamp read below: shutil
         # .disk_usage raises if tmp is missing or unmounted, and above the try
@@ -372,6 +434,7 @@ def run(
                     failures += 1
                     logger.exception("failed to index %s", entry.name)
                     continue
+                repo_outcomes.append(repo_outcome)
                 for outcome in repo_outcome.outcomes:
                     if outcome.status == "skipped":
                         skipped += 1
@@ -390,6 +453,44 @@ def run(
                             outcome.counts.symbols,
                             outcome.counts.swept,
                         )
+
+        # Desired-state reconciliation checkpoint (#56/#59). MUST stay HERE: after
+        # the ThreadPoolExecutor `with` above has exited (every worker joined --
+        # __exit__ calls shutdown(wait=True)) and before the `finally` below (the
+        # engine is still open). `stamps` is the snapshot _read_stamps took BEFORE
+        # fan-out, reused as-is -- NOT re-read now. That is only sound because of
+        # the SAME single-writer invariant this module's docstring names:
+        # resources/job.yml pins max_concurrent_runs: 1 and there is no in-run
+        # sharding, so from the moment `stamps` was read to this line, the only
+        # writer that could have touched `repo_branches` is THIS run's own workers
+        # -- and they only ever ADD a row for a branch they just resolved and
+        # indexed, never remove one. So "persisted minus this run's resolved set"
+        # reads identically off the pre-fan-out snapshot as it would off a fresh
+        # post-join read. Raising max_concurrent_runs, adding per-repo/per-branch
+        # task sharding, or any writer outside this job (see
+        # docs/runbooks/indexing-parallelism.md §1.1) would invalidate this reuse
+        # -- do not relax it without re-deriving this proof.
+        reconciliation_attempted = _decide_reconciliation(
+            failures=failures,
+            conflicts=conflicts,
+            repo_outcomes=repo_outcomes,
+            entries=entries,
+        )
+        if reconciliation_attempted:
+            progress, reconciliation_failed = _reconcile(
+                engine,
+                repo_outcomes=repo_outcomes,
+                stamps=stamps,
+                reconcile_retired_fn=reconcile_retired_fn,
+                reconcile_removed_fn=reconcile_removed_fn,
+            )
+        else:
+            reconcile_skip_reason = _reconciliation_skip_reason(
+                failures=failures,
+                conflicts=conflicts,
+                repo_outcomes=repo_outcomes,
+                entries=entries,
+            )
     finally:
         if owns_http:
             http_client.close()
@@ -411,7 +512,25 @@ def run(
     # Note this trades a paging signal for one run of staleness on that branch;
     # the WARNING logged at the conflict site is the record. It is NOT that the
     # work was redundant.
-    return 1 if failures else 0
+
+    # Exactly one reconciliation summary line, always after "indexing complete".
+    # The failure/withheld path already logged its own ERROR incident line
+    # inside _reconcile -- this branch must not double-log it.
+    if reconciliation_failed or progress.purge_blocked:
+        pass
+    elif reconciliation_attempted:
+        logger.info(
+            "corpus reconciliation complete: %d branch(es) retired (%d file(s) stripped, "
+            "%d deleted), %d repo(s) purged",
+            progress.branches_removed,
+            progress.files_stripped,
+            progress.files_deleted,
+            len(progress.purged_repos),
+        )
+    else:
+        logger.info("corpus reconciliation skipped: %s", reconcile_skip_reason)
+
+    return 1 if (failures or reconciliation_failed or progress.purge_blocked) else 0
 
 
 def _read_stamps(
@@ -464,6 +583,173 @@ def _read_stamps(
         (r.name.casefold(), r.branch): (r.last_indexed_commit, r.index_semantics_version)
         for r in rows
     }
+
+
+def _decide_reconciliation(
+    *,
+    failures: int,
+    conflicts: int,
+    repo_outcomes: list[RepoOutcome],
+    entries: list[RepoEntry],
+) -> bool:
+    """Pure gate: may this run's post-fan-out checkpoint reconcile desired state?
+
+    Fail-closed by construction -- every conjunct must hold:
+
+    - ``failures == 0``: no repo-level failure and no branch ``failed`` outcome
+      (both already fold into this counter in ``run()``'s drain loop).
+    - ``conflicts == 0``: a CAS conflict means that branch was NOT indexed this
+      run, so its true current state is unknown; it self-heals next run (see
+      ``run()``'s conflict comment) but must not authorize reconciliation now.
+    - ``len(repo_outcomes) == len(entries)``: every resolved repo produced a
+      :class:`RepoOutcome` (a pre-outcome exception already counts as a
+      failure and is excluded above) -- redundant with ``failures == 0`` given
+      ``run()``'s current control flow, kept anyway as defence-in-depth against
+      a future refactor that decouples the two.
+    - ``all(o.discovery_complete for o in repo_outcomes)``: a soft-branch-cap
+      truncation (see :class:`indexer.branches.BranchResolution`) means that
+      repo's resolved branch set is not its FULL membership, so branches
+      outside the cap must never be treated as retired.
+
+    ``skipped`` branch outcomes count as success -- they are not represented in
+    any of these counters, so a fully-skipped run passes the gate.
+    """
+    return (
+        failures == 0
+        and conflicts == 0
+        and len(repo_outcomes) == len(entries)
+        and all(o.discovery_complete for o in repo_outcomes)
+    )
+
+
+def _reconciliation_skip_reason(
+    *,
+    failures: int,
+    conflicts: int,
+    repo_outcomes: list[RepoOutcome],
+    entries: list[RepoEntry],
+) -> str:
+    """Aggregate, human-readable reason(s) :func:`_decide_reconciliation` returned ``False``.
+
+    Ordered to mirror that function's conjuncts so the two can never silently
+    drift apart. Falls back to ``"unknown"`` only as a defensive catch-all --
+    every path that can make the gate fail is enumerated above it and should
+    always contribute at least one reason.
+    """
+    reasons: list[str] = []
+    if failures:
+        reasons.append(f"{failures} repo/branch failure(s)")
+    if conflicts:
+        reasons.append(f"{conflicts} branch conflict(s)")
+    missing = len(entries) - len(repo_outcomes)
+    if missing:
+        reasons.append(f"{missing} repo(s) never completed")
+    incomplete = sum(1 for o in repo_outcomes if not o.discovery_complete)
+    if incomplete:
+        reasons.append(f"{incomplete} repo(s) with incomplete branch discovery")
+    return "; ".join(reasons) if reasons else "unknown"
+
+
+def _reconcile(
+    engine: Any,
+    *,
+    repo_outcomes: list[RepoOutcome],
+    stamps: dict[tuple[str, str], tuple[str | None, int | None]],
+    reconcile_retired_fn: Callable[..., ReconcileCounts],
+    reconcile_removed_fn: Callable[..., list[str]],
+) -> tuple[ReconcileProgress, bool]:
+    """Run the post-fan-out reconciliation phase. Called only when the gate has already passed.
+
+    One connection for the whole checkpoint, but each primitive keeps its OWN
+    ``with conn.begin():`` transaction (see ``indexer/store.py``) -- retired
+    branches for every repo are reconciled first, then the repo-level purge is
+    decided and (maybe) applied; the two are never wrapped in one shared outer
+    transaction.
+
+    Returns ``(progress, reconciliation_failed)``. On success ``progress``
+    records what was committed; on a primitive raising mid-sequence, the ERROR
+    is logged HERE (safe fields only: phase, repo, and the exception's type
+    name -- never ``str(exc)`` or ``exc_info``, matching this module's existing
+    redaction discipline) and ``reconciliation_failed=True`` is returned so
+    ``run()`` can fail the process without re-deriving what happened.
+    """
+    progress = ReconcileProgress()
+    desired_repos = sorted({o.name for o in repo_outcomes})
+    phase = "retired-branches"
+    repo_name = "-"
+    try:
+        with engine.connect() as conn:
+            for outcome in repo_outcomes:
+                repo_name = outcome.name
+                persisted = {b for (n, b) in stamps if n == outcome.name.casefold()}
+                resolved = {bo.branch for bo in outcome.outcomes}
+                retired = sorted(persisted - resolved)
+                if not retired:
+                    continue
+                counts = reconcile_retired_fn(conn, name=outcome.name, retired_branches=retired)
+                # FIRST statement after the call returns -- see ReconcileProgress's docstring.
+                progress.committed_any = True
+                progress.branches_removed += counts.branches_removed
+                progress.files_stripped += counts.files_stripped
+                progress.files_deleted += counts.files_deleted
+
+            phase = "removed-purge"
+            repo_name = "-"
+            # Deliberately UNFILTERED: victims are rows OUTSIDE this run's desired
+            # set entirely, so a `.where(Repo.name.in_(...))` bound read (like
+            # _read_stamps') would hide exactly the rows this guard exists to see.
+            stored = set(conn.execute(select(Repo.name)).scalars().all())
+            # This SELECT autobegins a transaction on `conn` (no prior statement in
+            # this scope started one) that reconcile_removed_fn's own `with
+            # conn.begin():` would otherwise collide with (SQLAlchemy raises
+            # InvalidRequestError: a transaction is already begun on this
+            # Connection) -- clear it first, matching the same idiom
+            # tests/integration/test_reconcile.py uses after every read on a
+            # connection a reconcile primitive will next call conn.begin() on.
+            conn.rollback()
+            would_purge = stored - set(desired_repos)
+            progress.stored_count = len(stored)
+            progress.would_purge_count = len(would_purge)
+            if would_purge and len(would_purge) > MAX_PURGE_SHRINK_FRACTION * len(stored):
+                # A withhold is a POLICY decision, not an exception -- log it here
+                # (not in the except below) and leave committed_any/reconciliation_failed
+                # alone; run() reads purge_blocked separately to fail the process.
+                progress.purge_blocked = True
+                logger.error(
+                    "reconciliation withheld: purge would remove %d/%d stored repos, exceeding "
+                    "the %.0f%% shrink guard -- check the GitHub token's org/repo scope before "
+                    "assuming this is a legitimate mass decommission; stage repo removal across "
+                    "multiple clean runs to purge more than half of the corpus at once",
+                    progress.would_purge_count,
+                    progress.stored_count,
+                    MAX_PURGE_SHRINK_FRACTION * 100,
+                )
+            else:
+                purged = reconcile_removed_fn(conn, desired_repos=desired_repos)
+                progress.committed_any = True
+                progress.purged_repos = purged
+    except Exception as exc:
+        if progress.committed_any:
+            logger.error(
+                "corpus PARTIALLY reconciled before an error in the %s phase (repo=%s; %d "
+                "branch(es) retired so far, %d repo(s) purged so far); remaining reconciliation "
+                "completes on the next clean run (primitives are idempotent) [%s]",
+                phase,
+                repo_name,
+                progress.branches_removed,
+                len(progress.purged_repos),
+                type(exc).__name__,
+            )
+        else:
+            logger.error(
+                "corpus left stale: no reconciliation committed (failed in the %s phase, "
+                "repo=%s) [%s]",
+                phase,
+                repo_name,
+                type(exc).__name__,
+            )
+        return progress, True
+    return progress, False
 
 
 def _precompute_chunk_writer(
