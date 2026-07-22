@@ -8,6 +8,91 @@ It exists so an agent can grep a codebase it has never cloned. The corpus is sha
 read-only at query time; there is no per-user filtering, so only index repositories every
 caller of the MCP endpoint is allowed to read.
 
+## Quick start
+
+```bash
+git clone git@github.com:IceRhymers/databricks-code-search.git && cd databricks-code-search
+make install                 # needs Python 3.12+ and uv
+$EDITOR config.yaml          # pick what to index — the template ships with nothing selected
+export GITHUB_TOKEN=ghp_...  # so deploy can seed the secret scope
+make deploy TARGET=dev       # full pipeline: deploy, migrate, activate, grants, first index
+```
+
+Deployed with `config.yaml` unedited, the indexer fails fast with `connection selects
+nothing` and the corpus stays empty — uncomment `users:`/`orgs:`/`repos:` and fill in
+your own first. See [Configuring what gets indexed](#configuring-what-gets-indexed).
+
+`make deploy` needs an authenticated Databricks CLI (`databricks auth login`), and a few
+one-time pieces cannot be scripted at all — those are next.
+
+## Manual prerequisites
+
+Four things the bundle cannot create, and which mostly need a human (or an account
+admin). The first three gate a working MCP endpoint; the fourth gates
+`make migrate`/`make deploy` (the core chain creates the semantic `chunks` schema).
+
+**1. Pre-created service principals.** An account admin creates the service principals
+once; their client IDs become `app_sp_client_id` and `job_run_as_sp`. The bundle does not
+create service principals. For prod, `make deploy-prod` refuses to run unless
+`JOB_RUN_AS_SP=<client-id>` is set — that SP is declared as the `code-search-job-writer`
+Postgres role and is what the indexing job runs as.
+
+**2. Account-admin OAuth app connection.** MCP client auth on Databricks Apps is
+**OAuth-only — there is no PAT path**. An account admin must register a Databricks OAuth
+app connection (Account Console → Settings → App Connections) with the client's redirect
+URLs, e.g. `http://localhost:<port>/oauth/callback` for Claude Code or Claude Desktop.
+Until this exists, no external MCP client can reach `/mcp` over native OAuth — requests get
+an OAuth redirect instead of a response.
+
+This prerequisite is **avoidable**: the recommended client setup uses `uc-mcp-proxy`, which
+borrows your Databricks CLI credentials instead of running the MCP OAuth flow, so it needs
+no app connection and no redirect URLs. Only take on prerequisite 2 if you specifically want
+native per-client OAuth. See [Connecting a client](#connecting-a-client).
+
+`make smoke ARGS=--enable-mcp` is not blocked by this: it authenticates with your own
+Databricks login (`WorkspaceClient().config.authenticate()`), so it needs `CAN_USE` on the
+app but not the app connection. `deploy.sh`'s step-11 reminder says no client can reach
+`/mcp` without the app connection; that holds for external MCP clients but not for
+`make smoke`.
+
+**3. GitHub token.** `make set-secrets` writes `GITHUB_TOKEN` into the bundle-created
+secret scope (`code-search` / `github_token` by default). `make deploy` will do this for
+you if `GITHUB_TOKEN` is exported; without it the deploy still succeeds and the app still
+serves, but indexing has no credential and the corpus stays empty.
+
+**4. Lakebase Search preload (stated project assumption).** The Lakebase project's
+Databricks-managed `shared_preload_libraries` must already include
+`lakebase_vector,lakebase_text` — semantic search is default-on and its DDL rides
+`make migrate`, which fails loudly (`must be loaded via shared_preload_libraries`) on a
+project without it. Not settable through the bundle or the API; requested out-of-band per
+project, and **irreversible**. See
+[`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
+
+## Setting this up with an agent
+
+Setup splits cleanly between what a coding agent can do and what needs a human. If you
+are an agent bootstrapping this project, do the following yourself:
+
+1. Clone the repo and run `make install` (needs Python 3.12+ and `uv`).
+2. Edit `config.yaml`: uncomment and fill `users:` / `orgs:` / `repos:` under
+   `connections`. The file documents every knob inline.
+3. Run `make lint && make test` to verify the checkout.
+4. Deploy with `make deploy TARGET=dev` (add `PROFILE=<name>` for a non-default
+   Databricks CLI profile).
+5. Once you have a token (below): `export GITHUB_TOKEN=<token> && make set-secrets`,
+   then `make index TARGET=dev` to populate the corpus.
+6. Verify with `make smoke TARGET=dev ARGS=--expect-indexed`.
+
+Ask your human for the pieces you cannot do yourself:
+
+- **A GitHub token** that can read the repositories being indexed. The human only
+  supplies the value; you write it into the secret scope with `make set-secrets`
+  (scope `code-search`, key `github_token` by default).
+- **Databricks CLI auth** — `databricks auth login --host https://<workspace-host>` is
+  an interactive browser flow.
+- **The account-admin prerequisites above** — service principals (always), the OAuth
+  app connection (only for native MCP OAuth), and the Lakebase preload confirmation.
+
 ## Architecture
 
 <img src="docs/diagrams/architecture.png" alt="GitHub to indexing job to Lakebase Postgres to MCP server to MCP client" width="450">
@@ -179,7 +264,7 @@ connect-but-not-select fails as 503 instead of shipping green.
 
 ## Web UI
 
-`webui` (issue #35) is a second Databricks App, deployed and activated by the same
+`webui` is a second Databricks App, deployed and activated by the same
 `make deploy` pipeline as the MCP server. It is a browser-facing search UI: a FastAPI
 backend that imports the same `app.*` search stack in-process (own engine singleton, same
 `/api/search` → `search_code_payload` path plus keyset-cursor pagination for "load more"),
@@ -194,70 +279,18 @@ open the app URL in a browser. See
 rebuilding the frontend (`make webui-build`), and the wheel-packaging mechanism that lets
 webui import `app.*` without duplicating it.
 
-## Out-of-band prerequisites
-
-Four things the bundle cannot create. The first three gate a working MCP endpoint; the
-fourth gates `make migrate`/`make deploy` (the core chain now creates the semantic
-`chunks` schema).
-
-**1. Pre-created service principals.** An account admin creates the service principals
-once; their client IDs become `app_sp_client_id` and `job_run_as_sp`. The bundle does not
-create service principals. For prod, `make deploy-prod` refuses to run unless
-`JOB_RUN_AS_SP=<client-id>` is set — that SP is declared as the `code-search-job-writer`
-Postgres role and is what the indexing job runs as.
-
-**2. Account-admin OAuth app connection.** MCP client auth on Databricks Apps is
-**OAuth-only — there is no PAT path**. An account admin must register a Databricks OAuth
-app connection (Account Console → Settings → App Connections) with the client's redirect
-URLs, e.g. `http://localhost:<port>/oauth/callback` for Claude Code or Claude Desktop.
-Until this exists, no external MCP client can reach `/mcp` over native OAuth — requests get
-an OAuth redirect instead of a response.
-
-This prerequisite is **avoidable**: the recommended client setup uses `uc-mcp-proxy`, which
-borrows your Databricks CLI credentials instead of running the MCP OAuth flow, so it needs
-no app connection and no redirect URLs. Only take on prerequisite 2 if you specifically want
-native per-client OAuth. See [Connecting a client](#connecting-a-client).
-
-`make smoke ARGS=--enable-mcp` is not blocked by this: it authenticates with your own
-Databricks login (`WorkspaceClient().config.authenticate()`), so it needs `CAN_USE` on the
-app but not the app connection. `deploy.sh`'s step-11 reminder says no client can reach
-`/mcp` without the app connection; that holds for external MCP clients but not for
-`make smoke`.
-
-**3. GitHub token.** `make set-secrets` writes `GITHUB_TOKEN` into the bundle-created
-secret scope (`code-search` / `github_token` by default). `make deploy` will do this for
-you if `GITHUB_TOKEN` is exported; without it the deploy still succeeds and the app still
-serves, but indexing has no credential and the corpus stays empty.
-
-**4. Lakebase Search preload (stated project assumption).** The Lakebase project's
-Databricks-managed `shared_preload_libraries` must already include
-`lakebase_vector,lakebase_text` — semantic search is default-on and its DDL rides
-`make migrate`, which fails loudly (`must be loaded via shared_preload_libraries`) on a
-project without it. Not settable through the bundle or the API; requested out-of-band per
-project, and **irreversible**. See
-[`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
-
 ## Deploy
 
-> **Step 1 after cloning: set your own org or user in `config.yaml`.** The template
-> ships with no repositories selected — deployed unedited, the indexer fails fast with
-> `connection selects nothing` and the corpus stays empty. Uncomment `users:`/`orgs:`/
-> `repos:` and fill in your own. See [Configuring what gets indexed](#configuring-what-gets-indexed).
-
-```bash
-make install                      # uv sync --all-groups --all-extras
-export GITHUB_TOKEN=ghp_...       # so deploy can seed the secret scope
-make deploy TARGET=dev            # full ordered pipeline
-```
-
-For prod, the job run-as SP is mandatory:
+`make deploy` (see [Quick start](#quick-start)) runs `scripts/deploy.sh full`, which
+deploys and activates **both** Databricks Apps in the bundle — the MCP server
+(`code_search`) and the [web UI](#web-ui) (`webui`). For prod, the job run-as SP is
+mandatory:
 
 ```bash
 JOB_RUN_AS_SP=<client-id> make deploy-prod
 ```
 
-`make deploy` runs `scripts/deploy.sh full`, which deploys and activates **both** Databricks
-Apps in the bundle — the MCP server (`code_search`) and the [web UI](#web-ui) (`webui`):
+The pipeline, in order:
 
 <img src="docs/diagrams/deploy-pipeline.png" alt="The eleven steps of deploy.sh full, with the migrate and grant steps split around each app's activation" width="720">
 
