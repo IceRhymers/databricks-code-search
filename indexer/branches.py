@@ -40,9 +40,10 @@ class BranchResolution:
     ``branches`` keeps its historical shape and ordering (default-first, then
     alphabetical, capped). ``complete`` is ``True`` iff ``branches`` is the WHOLE
     set the globs resolve to -- ``False`` when the soft cap truncated it, in
-    which case ``dropped`` names exactly what was left out (default-first,
-    alphabetical order, same as the kept list) and ``cap`` is the limit that was
-    applied. ``dropped`` is empty and ``cap`` still reports the limit that was
+    which case ``dropped`` names exactly what was left out, in the same
+    alphabetical order as the kept list (the default branch is never dropped,
+    so ``dropped`` is purely alphabetical, not default-first) and ``cap`` is
+    the limit that was applied. ``dropped`` is empty and ``cap`` still reports the limit that was
     checked against (even when nothing was dropped), so a caller never has to
     special-case "no truncation happened" as `cap` being absent.
     """
