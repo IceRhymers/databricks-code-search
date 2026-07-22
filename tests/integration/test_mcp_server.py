@@ -300,6 +300,26 @@ async def test_streamable_http_tools_and_health(seeded_schema: str) -> None:
                 assert sm["line"] == 2
                 assert sm["symbols"] == [{"name": "Handler", "kind": "function"}]
 
+                # A fully-negated query (issue #70): "-foo" is no_content_atom=True over the
+                # real server exactly like a filter-only query -- there is nothing to
+                # highlight, and the exclusion never resurrects a file as a false positive.
+                negated_only = _tool_json(await session.call_tool("search_code", {"query": "-foo"}))
+                assert negated_only["file_count"] == 0
+                assert negated_only["no_content_atom"] is True
+                assert negated_only["zero_width_only_atoms"] is False
+
+                # `-sym:` alongside a real `sym:` atom that excludes nothing: the affirmative
+                # symbol still projects normally end to end (negation on sym: does not
+                # silently swallow the positive leg when the excluded name has no matches).
+                sym_with_noop_exclusion = _tool_json(
+                    await session.call_tool(
+                        "search_code", {"query": "sym:Handler -sym:NoSuchSymbol"}
+                    )
+                )
+                assert sym_with_noop_exclusion["file_count"] == 1
+                (sm2,) = sym_with_noop_exclusion["files"][0]["matches"]
+                assert sm2["symbols"] == [{"name": "Handler", "kind": "function"}]
+
                 repos = _tool_json(await session.call_tool("list_repos", {}))
                 assert repos["count"] == 3
                 assert {r["name"] for r in repos["repos"]} == {

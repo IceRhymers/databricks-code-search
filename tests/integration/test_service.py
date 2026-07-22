@@ -317,6 +317,48 @@ def test_sym_only_query_with_candidates_over_row_limit_still_returns_single_page
     assert payload["truncation_reason"] == "row_cap"
 
 
+# ------------------------------------------------------------------- negation (issue #70)
+
+
+@pytest.mark.integration
+def test_negative_only_query_with_candidates_over_row_limit_still_returns_single_page(
+    seeded: Seeded,
+) -> None:
+    # The negation analog of
+    # test_sym_only_query_with_candidates_over_row_limit_still_returns_single_page: "-bar" is
+    # no_content_atom=True at the grep layer exactly like a filter-only query, and grep's own
+    # candidate scan for it can still row-cap (every "foo"-file here also satisfies "-bar",
+    # since none contain "bar"). Without suppression this would leak a non-null next_cursor and
+    # every continuation page (there is nothing to highlight, ever) would replay another empty
+    # page forever.
+    payload = service.search_code_payload(seeded.engine, seeded.cfg, "-bar", 2, cursor=None)
+    assert payload["next_cursor"] is None
+    assert payload["no_content_atom"] is True
+    assert payload["file_count"] == 0
+
+
+@pytest.mark.integration
+def test_negative_content_atom_excludes_matching_file_end_to_end(seeded: Seeded) -> None:
+    content = "foo and bar together\n"
+    with seeded.engine.connect() as conn:
+        conn.execute(
+            insert(File).values(
+                repo_id=seeded.acme_id,
+                path="src/z_both.go",
+                lang="go",
+                content=content,
+                content_sha=content_sha(content),
+                branches=["HEAD"],
+            )
+        )
+        conn.commit()
+
+    payload = service.search_code_payload(seeded.engine, seeded.cfg, "foo -bar", 200)
+    files = _files(payload)
+    assert "src/z_both.go" not in files
+    assert set(files) == {"src/00_handler.go", "src/a.go", "src/b.go", "src/c.go", "pkg/note.py"}
+
+
 # --------------------------------------------------------------------------- cursor errors
 
 

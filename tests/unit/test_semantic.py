@@ -529,6 +529,7 @@ def test_residual_is_embedded_and_bound_to_qtext(monkeypatch: pytest.MonkeyPatch
         ("case:no bar", "case:"),
         ("commit:abc1234 bar", "commit:"),
         ("/foo/ bar", "regex"),
+        ("-foo bar", "-"),
     ],
 )
 def test_unsupported_atom_yields_structured_payload(query: str, expected_atom: str) -> None:

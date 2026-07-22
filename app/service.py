@@ -378,8 +378,13 @@ def _search_envelope(
 ) -> dict[str, Any]:
     """Build the pinned ``search_code`` envelope (zoekt fields + additive signal fields).
 
-    ``no_content_atom`` -- the query carried no content atom at all (e.g. ``lang:go``), so
-    there was nothing to highlight and zero files is a *shape* outcome, not a true negative.
+    ``no_content_atom`` -- the query carried no AFFIRMATIVE content atom to highlight, so zero
+    files is a *shape* outcome, not a true negative. This covers two structurally different
+    queries identically: a filter-only query (e.g. ``lang:go`` alone -- nothing to highlight)
+    and a fully-negated query (e.g. ``-foo`` alone -- a content atom exists but excludes rather
+    than highlights). Neither has anything to highlight, so one flag suffices for both; the
+    echoed ``query`` field is what a caller uses to recover which one it was, not a second key
+    (issue #70's contract decision -- see :func:`app.search.grep._no_content_atom`).
     ``zero_width_only_atoms`` -- content atoms were present but every one provably matches
     zero-width (e.g. ``/^/``), so every span was dropped. Mutually exclusive by construction.
 
@@ -456,7 +461,10 @@ def search_code_payload(
     so neither fires on a query the symbol leg answered. ``sym:Handler`` is filter-only to grep
     but fully answered here, and ``sym:Handler /^/`` is zero-width-only to grep yet returns
     files -- flagging either would contradict the results sitting beside it and train agents to
-    ignore the signal.
+    ignore the signal. ``no_content_atom`` itself no longer distinguishes filter-only from
+    fully-negated (issue #70): ``lang:go`` and ``-foo`` both set it, and both are equally
+    suppressed here when the symbol leg answers (e.g. ``sym:Handler -foo``); a caller recovers
+    which shape it was from the echoed ``query`` field.
 
     ``sym_answers`` treats an UNKNOWN symbol leg (``sym_result is None``, i.e. the leg timed
     out) as answering, which is a proof rather than a precaution: ``None`` arises only from
@@ -745,17 +753,19 @@ def search_code_payload(
     next_cursor_out: str | None | _Unset = _UNSET
     if pagination_mode:
         if run_symbol_leg and result.no_content_atom:
-            # Filter-only query on page 1 (e.g. a `sym:` atom with no content atom alongside
-            # it): grep's `files` is ALWAYS empty here regardless of how many CANDIDATE files
-            # the filter matched (there is no content pattern to highlight), but grep's own
-            # candidate scan can still hit `row_limit` and row-cap when the filter matches many
-            # files -- e.g. a `sym:` name shared by >= row_limit files. Left alone, that still
+            # Page 1, no AFFIRMATIVE content atom to highlight -- either a filter-only query
+            # (e.g. a `sym:` atom with no content atom alongside it) or a fully-negated one
+            # (e.g. `-foo` alone): grep's `files` is ALWAYS empty here regardless of how many
+            # CANDIDATE files the filter/exclusion matched (there is no content pattern to
+            # highlight), but grep's own candidate scan can still hit `row_limit` and row-cap
+            # when the query matches many files -- e.g. a `sym:` name shared by >= row_limit
+            # files, or `-foo` excluding a rare term from a huge corpus. Left alone, that still
             # sets a non-null `next_cursor` (grep.py:482); the symbol leg only ever folds in on
             # page 1 too (page-1-only, see above), so every continuation page would re-run the
             # same filter-only grep scan, find nothing to highlight, and hand back ANOTHER
             # non-null cursor -- an unbounded sequence of empty pages. Suppressed here instead:
-            # a filter-only query is always exactly one page, with any real "there's more"
-            # signal (e.g. more matching symbols than fit) already carried by
+            # a query with no affirmative content atom is always exactly one page, with any real
+            # "there's more" signal (e.g. more matching symbols than fit) already carried by
             # `truncated`/`truncation_reason`, not `next_cursor`.
             next_cursor_out = None
         else:

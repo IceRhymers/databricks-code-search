@@ -370,3 +370,21 @@ def test_healthy_query_does_not_raise_query_too_broad(seeded: Seeded) -> None:
     result = _search(seeded.conn, "sym:Handler")
     assert result.symbols
     assert result.truncated is False
+
+
+# ------------------------------------------------------------------- negation (issue #70)
+
+
+@pytest.mark.integration
+def test_negated_sym_excludes_candidate_files_without_projecting_negative_name(
+    seeded: Seeded,
+) -> None:
+    # `sym:Handler -sym:Overload`: candidacy requires an affirmative Handler-named symbol AND
+    # no Overload-named symbol in the same file. src/dup.go (Overload only, no Handler) is
+    # excluded by the SQL predicate before projection ever runs; the projection then returns
+    # only Handler-matching definitions -- "Overload" is never a candidate for projection at
+    # all, negated or not.
+    result = _search(seeded.conn, "sym:Handler -sym:Overload")
+    assert result.no_symbol_atom is False
+    assert _pairs(result) == {("src/handler.go", "Handler"), ("src/util.go", "handler")}
+    assert all(name != "Overload" for _, name in _pairs(result))
