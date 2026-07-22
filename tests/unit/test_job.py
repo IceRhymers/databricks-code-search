@@ -1940,7 +1940,13 @@ def test_purge_shrink_guard_withholds_majority_purge(caplog: pytest.LogCaptureFi
     # ...but the corpus-wide purge was withheld entirely.
     assert rec.removed_calls == []
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("withheld" in m and "3/4" in m for m in errors)
+    # The committed survivor cleanup is reported alongside the withhold, not just
+    # the would-purge/stored counts -- an operator must not have to infer what
+    # DID commit from a message that only says what was blocked.
+    assert any(
+        "withheld" in m and "3/4" in m and "1 branch(es)" in m and "1 file(s) stripped" in m
+        for m in errors
+    )
 
 
 @pytest.mark.unit

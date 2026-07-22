@@ -719,10 +719,15 @@ def _reconcile(
                     "reconciliation withheld: purge would remove %d/%d stored repos, exceeding "
                     "the %.0f%% shrink guard -- check the GitHub token's org/repo scope before "
                     "assuming this is a legitimate mass decommission; stage repo removal across "
-                    "multiple clean runs to purge more than half of the corpus at once",
+                    "multiple clean runs to purge more than half of the corpus at once "
+                    "(retired-branch cleanup on survivors already committed: %d branch(es), "
+                    "%d file(s) stripped, %d deleted)",
                     progress.would_purge_count,
                     progress.stored_count,
                     MAX_PURGE_SHRINK_FRACTION * 100,
+                    progress.branches_removed,
+                    progress.files_stripped,
+                    progress.files_deleted,
                 )
             else:
                 purged = reconcile_removed_fn(conn, desired_repos=desired_repos)
