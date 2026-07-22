@@ -249,6 +249,35 @@ def test_api_semantic_not_migrated_returns_schema_missing_payload(
 
 
 @pytest.mark.integration
+def test_api_semantic_filtered_query_returns_scoped_results_with_similarity(
+    semantic_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filter-semantics: the in-query repo:/lang:/etc. grammar passes through the route
+    unchanged (no backend rewriting -- webui/main.py calls the service payload builder
+    verbatim), and every result carries the new ``similarity`` field alongside ``rrf_score``.
+    """
+    monkeypatch.setattr(
+        semantic_module, "get_embedder", lambda cfg: lambda texts: [_vec({0: 1.0})] * len(texts)
+    )
+    app.dependency_overrides[get_engine] = lambda: semantic_engine
+    app.dependency_overrides[get_settings] = _enabled_cfg
+    try:
+        with TestClient(app) as client:
+            resp = client.get("/api/semantic", params={"q": "repo:acme/widgets authentication"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["semantic_enabled"] is True
+    assert body["results"] != []
+    for result in body["results"]:
+        assert result["repo"] == "acme/widgets"
+        assert "similarity" in result
+        assert "rrf_score" in result
+
+
+@pytest.mark.integration
 def test_api_semantic_status_true_when_enabled_without_engine_override() -> None:
     # No get_engine override at all: /api/semantic/status must never touch the DB.
     app.dependency_overrides[get_settings] = _enabled_cfg

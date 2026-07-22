@@ -113,6 +113,11 @@ def _signals(payload: dict[str, Any]) -> dict[str, Any]:
         # Without this, a flag-on-before-migrate misconfiguration is invisible in logs: every
         # semantic query returns empty and reads identically to a genuine zero-result query.
         "semantic_schema_missing": payload.get("semantic_schema_missing"),
+        # Semantic filter-grammar signals (filter-semantics): a rejected atom or an
+        # all-filters/empty query both return zero results legitimately, so without these a
+        # grammar problem is indistinguishable in the logs from a genuine no-match.
+        "unsupported_filter": payload.get("unsupported_filter"),
+        "nothing_to_embed": payload.get("nothing_to_embed"),
     }
 
 
@@ -245,22 +250,38 @@ async def semantic_search(
 ) -> str:
     """Semantic + BM25 hybrid search: rank indexed chunks by relevance to a free-text query.
 
-    Unlike :func:`search_code` (zoekt grammar over lines), this takes a natural-language
-    ``query`` and returns chunk-level results fused from a vector-ANN leg and a BM25 leg via
-    reciprocal-rank fusion. ``branch`` scopes results to files whose indexed branches include
-    the given name (exact match, threaded straight to the SQL predicate -- NOT appended to
-    ``query``, since this tool takes natural language rather than zoekt grammar); omitted,
-    results are scoped to each repo's default branch. ``commit:`` is NOT supported here in v1
-    (the semantic path is a separate raw-SQL implementation and chunks carry no commit
-    provenance): a ``commit:<hash>`` appearing in ``query`` is treated as ordinary
-    natural-language text, never a filter -- use ``branch`` to scope, or :func:`search_code` for
-    commit-scoped lexical search. ``limit`` caps the number of ranked
+    Unlike :func:`search_code` (zoekt grammar over lines), this takes natural-language text --
+    but it ALSO accepts the same ``repo:``/``file:``/``lang:``/``branch:`` scoping atoms
+    ``search_code`` does, with lexical-parity matching semantics: ``repo:<pattern>`` and
+    ``file:<pattern>`` match as case-insensitive regular expressions against the repo name /
+    file path; ``lang:<name>`` matches a normalized (stripped, lowercased) exact language;
+    ``branch:<name>`` matches exact branch membership. Filter atoms are stripped from ``query``
+    before ranking; the REMAINING natural-language text is what gets embedded and searched --
+    filter-then-rank, never post-filtered, so a highly selective filter narrows the candidate
+    pool the ranking draws from, not just the results shown.
+
+    ``sym:``, ``case:``, ``commit:``, and bare ``/regex/`` atoms have no meaning here and are
+    REJECTED (``unsupported_filter`` in the payload, naming the atom, with a remedy in
+    ``reason``): ``sym:``/``commit:`` -> symbol/commit-scoped search is lexical-only, use
+    :func:`search_code`; ``case:`` -> case sensitivity does not apply to semantic ranking,
+    remove it; a bare ``/.../`` -> quote the term to search it as literal text (this also
+    catches innocent absolute-path prose like ``/etc/nginx.conf`` -- quote it:
+    ``"/etc/nginx.conf"``). A query that is only filters, or empty/whitespace-only, leaves
+    nothing to embed and returns ``nothing_to_embed: true`` with no embedding call made.
+
+    ``branch`` is sugar for a ``branch:`` atom -- conjunctive with any ``branch:`` atom already
+    in ``query`` (mirrors ``search_code``'s ``branch`` param) -- restricting to files whose
+    indexed branches include the given name (exact match); with no branch given anywhere,
+    results are scoped to each repo's default branch. ``limit`` caps the number of ranked
     chunks returned (clamped to a server maximum). Registered unconditionally, but gated at
     runtime: when semantic search is explicitly disabled (``CODE_SEARCH_SEMANTIC_ENABLED=0``)
     it returns a clean ``semantic_enabled: false`` payload -- never a 500/503 -- and touches
-    neither the database nor the embedder. Each result carries ``repo``, ``file``,
-    ``chunk_index``, ``content``, ``start_line``/``end_line`` (1-based inclusive; null for
-    chunks indexed before line tracking), and ``rrf_score``.
+    neither the database nor the embedder (nor does it parse ``query`` at all). Each result
+    carries ``repo``, ``file``, ``chunk_index``, ``content``, ``start_line``/``end_line``
+    (1-based inclusive; null for chunks indexed before line tracking), ``rrf_score`` (the fused
+    rank score), and ``similarity`` (raw cosine similarity against the query embedding, defined
+    as ``1 - cosine_distance``; ``null`` for chunks with no embedding) -- ``rrf_score`` alone is
+    not comparable across queries, ``similarity`` is.
     """
     lc = ctx.request_context.lifespan_context
     engine, cfg = lc["engine"], lc["config"]

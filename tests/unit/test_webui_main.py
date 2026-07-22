@@ -476,6 +476,76 @@ def test_api_semantic_enabled_payload_passes_through_byte_identical(
 
 
 @pytest.mark.unit
+def test_api_semantic_new_filter_and_similarity_fields_pass_through_unmodified(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The route body is unchanged for these fields (WS-B, issue semantic-filter-similarity): it
+    # never inspects similarity/query_parse_error/unsupported_filter/nothing_to_embed, it just
+    # forwards whatever app.service returns. Three separate payload shapes, one per new
+    # recoverable state plus the enabled+similarity shape, each asserted byte-identical.
+    similarity_payload = {
+        "query": "repo:acme/widgets how are branch filters compiled to SQL",
+        "semantic_enabled": True,
+        "backend": "standin",
+        "results": [
+            {
+                "repo": "acme/widgets",
+                "file": "src/handler.go",
+                "chunk_index": 0,
+                "content": "func Handle() {}",
+                "rrf_score": 0.0164,
+                "similarity": 0.812,
+            },
+            {
+                "repo": "acme/widgets",
+                "file": "src/legacy.go",
+                "chunk_index": 1,
+                "content": "func Legacy() {}",
+                "rrf_score": 0.011,
+                "similarity": None,
+            },
+        ],
+        "count": 2,
+    }
+    parse_error_payload = {
+        "query": "repo:",
+        "semantic_enabled": True,
+        "results": [],
+        "count": 0,
+        "query_parse_error": "empty value for filter 'repo:'",
+    }
+    unsupported_filter_payload = {
+        "query": "commit:deadbeef",
+        "semantic_enabled": True,
+        "results": [],
+        "count": 0,
+        "unsupported_filter": "commit:",
+        "reason": "commit: is not a semantic filter; use search_code for commit-scoped lookups",
+    }
+    nothing_to_embed_payload = {
+        "query": "repo:acme/widgets",
+        "semantic_enabled": True,
+        "results": [],
+        "count": 0,
+        "nothing_to_embed": True,
+        "reason": "the query has no text left to embed after filters were removed",
+    }
+
+    for payload in (
+        similarity_payload,
+        parse_error_payload,
+        unsupported_filter_payload,
+        nothing_to_embed_payload,
+    ):
+        monkeypatch.setattr(service, "semantic_search_payload", lambda *a, **k: payload)
+
+        resp = client.get("/api/semantic", params={"q": payload["query"] or "foo"})
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+
+
+@pytest.mark.unit
 def test_api_semantic_limit_default_and_clamp_and_branch_threading(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

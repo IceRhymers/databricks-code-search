@@ -1,6 +1,9 @@
+// vitest runs with environment: "node" (vite.config.ts) -- no jsdom, no @testing-library.
+// renderToStaticMarkup gives us plain HTML strings to assert substrings against without either.
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { SemanticResult } from "../api/client";
-import { chunkHref } from "./ChunkCard";
+import { ChunkCard, chunkHref } from "./ChunkCard";
 
 function result(overrides: Partial<SemanticResult>): SemanticResult {
   return {
@@ -11,6 +14,7 @@ function result(overrides: Partial<SemanticResult>): SemanticResult {
     start_line: null,
     end_line: null,
     rrf_score: 0.5,
+    similarity: 0.5,
     ...overrides,
   };
 }
@@ -31,5 +35,18 @@ describe("chunkHref", () => {
     expect(href).toContain("find=");
     expect(href).toContain(encodeURIComponent("a much longer needle line").replace(/%20/g, "+"));
     expect(href).not.toContain("#L");
+  });
+});
+
+describe("ChunkCard", () => {
+  it("renders similarity to three decimal places beside the rrf score", () => {
+    const markup = renderToStaticMarkup(<ChunkCard result={result({ similarity: 0.81234 })} />);
+    expect(markup).toContain("sim 0.812");
+  });
+
+  it("renders an em dash for a null similarity (pre-embedding rows)", () => {
+    const markup = renderToStaticMarkup(<ChunkCard result={result({ similarity: null })} />);
+    expect(markup).toContain("sim —");
+    expect(markup).not.toContain("sim null");
   });
 });

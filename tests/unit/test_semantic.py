@@ -10,12 +10,17 @@ is proven to use ``repr`` (never the invalid ``format(x, "r")`` code) on scienti
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from app.config import Settings
+from app.query.compiler import compile_query
+from app.query.parser import parse
+from app.query.semantic_filters import SemanticFilters
 from app.search import semantic
 
 
@@ -56,15 +61,27 @@ def test_flag_off_returns_disabled_payload_and_never_imports_sdk() -> None:
 
 @pytest.mark.unit
 def test_commit_atom_is_plain_text_not_a_filter() -> None:
-    # AC11: semantic_search does NOT support commit: in v1. A query containing `commit:<hash>` is
-    # treated as ordinary natural-language text -- never parsed as a filter, never resolved, no
-    # error. The engine is never touched (flag off short-circuits), proving no resolution runs.
-    payload = semantic._semantic_search_payload(
+    # filter-semantics ADR consequence: commit: used to be plain prose (flag-off, pre-parsing)
+    # but is now a loud rejection once the feature is enabled -- self-documenting the breaking
+    # change. Flag-off still short-circuits BEFORE any grammar parsing, so the query is carried
+    # through verbatim and the engine is never touched.
+    off_payload = semantic._semantic_search_payload(
         _PoisonedEngine(), _cfg(enabled=False), "commit:abc1234 auth handler", 10
     )
-    assert payload["semantic_enabled"] is False
-    assert payload["query"] == "commit:abc1234 auth handler"  # carried verbatim, not rewritten
-    assert payload["results"] == []
+    assert off_payload["semantic_enabled"] is False
+    assert off_payload["query"] == "commit:abc1234 auth handler"  # carried verbatim
+    assert off_payload["results"] == []
+
+    # Flag-on: commit: is REJECTED loudly, before the (poisoned) engine is ever touched, with a
+    # remedy pointing at search_code.
+    on_payload = semantic._semantic_search_payload(
+        _PoisonedEngine(), _cfg(enabled=True), "commit:abc1234 auth handler", 10
+    )
+    assert on_payload["semantic_enabled"] is True
+    assert on_payload["unsupported_filter"] == "commit:"
+    assert "search_code" in on_payload["reason"]
+    assert on_payload["results"] == []
+    assert on_payload["count"] == 0
 
 
 # --------------------------------------------------------------------- vector literal (M2)
@@ -103,8 +120,13 @@ def test_rrf_sql_fusion_wrapper() -> None:
     # guard is the fast tripwire; the plan itself is only observable on a Lakebase branch.
     assert "ORDER BY c.embedding <=> (:qvec)::vector LIMIT :topk" in sql
     assert ", id LIMIT :topk" not in sql
-    # The ANN metric appears in the inner SELECT and its ORDER BY (index-served ordering).
-    assert sql.count("c.embedding <=> (:qvec)::vector") == 2
+    # The ANN metric appears THREE times (filter-semantics, Decision B1): twice inside the ANN
+    # leg CTE (inner SELECT + inner ORDER BY, index-served ordering) and once more in the OUTER
+    # select as the recomputed `cosine_distance` column -- never inside either leg CTE.
+    assert sql.count("c.embedding <=> (:qvec)::vector") == 3
+    ann_leg_sql, _, outer_sql = sql.partition("fused AS (")
+    assert ann_leg_sql.count("c.embedding <=> (:qvec)::vector") == 2
+    assert outer_sql.count("c.embedding <=> (:qvec)::vector AS cosine_distance") == 1
     # NULL embeddings never earn RRF credit.
     assert "AND c.embedding IS NOT NULL" in sql
     # Each leg's candidate cap lives in an INNER subquery whose ORDER BY repeats the metric
@@ -143,8 +165,11 @@ def test_rrf_sql_bm_leg_uses_bm25_scorer() -> None:
 def test_rrf_sql_explicit_branch_uses_gin_served_membership() -> None:
     sql = str(semantic.build_hybrid_rrf_sql(branch="feature/x"))
     # Explicit branch: opts into the GIN-served exact-membership predicate on BOTH legs,
-    # and the default coalesce predicate must not also be present.
-    assert sql.count("f.branches @> ARRAY[:branch]") == 2
+    # and the default coalesce predicate must not also be present. filter-semantics unifies the
+    # bind mechanism (Decision C1): the `branch` kwarg now routes through the SAME normalized
+    # sem_branch_{i} binds as an in-query `branch:` atom -- the old `:branch` bind is retired.
+    assert sql.count("f.branches @> ARRAY[:sem_branch_0]") == 2
+    assert ":branch" not in sql
     assert "coalesce(r.default_branch" not in sql
 
 
@@ -180,6 +205,116 @@ def test_rrf_sql_inner_subquery_is_c_qualified_outer_window_stays_bare() -> None
     assert sql.count("SELECT id, row_number() OVER (ORDER BY metric, id) AS rank FROM (") == 2
     assert "SELECT c.id, row_number()" not in sql
     assert "ORDER BY c.metric" not in sql
+
+
+# --------------------------------------------------------------- filter-semantics: SQL shape
+
+
+@pytest.mark.unit
+def test_rrf_sql_filters_apply_to_both_legs_inner_where() -> None:
+    filters = SemanticFilters(
+        repo_patterns=("acme/.*",),
+        path_patterns=("src/.*",),
+        langs=("Go",),
+        branches=(),
+        residual="auth",
+    )
+    sql = str(semantic.build_hybrid_rrf_sql(filters))
+
+    # Each predicate appears EXACTLY TWICE: once per leg CTE's inner WHERE.
+    assert sql.count("r.name ~* :sem_repo_0") == 2
+    assert sql.count("f.path ~* :sem_file_0") == 2
+    assert sql.count("f.lang = :sem_lang_0") == 2
+
+    # The single-expression inner ORDER BY invariant survives filtering (no second sort key).
+    assert ", id LIMIT :topk" not in sql
+    assert "ORDER BY c.embedding <=> (:qvec)::vector LIMIT :topk" in sql
+    assert (
+        "ORDER BY c.ts <@> to_bm25query(to_tsvector('english', :qtext), "
+        "'ix_chunks_ts_bm25'::regclass) LIMIT :topk"
+    ) in sql
+
+    # Converse pin: no branch value anywhere -> the default coalesce arm is retained,
+    # byte-identical, on both legs.
+    assert sql.count("coalesce(r.default_branch, 'HEAD') = ANY(f.branches)") == 2
+
+
+@pytest.mark.unit
+def test_filter_params_normalizes_lang_value() -> None:
+    # KD-3 parity: lang values are `.strip().lower()`-ed before binding, matching the compiler.
+    filters = SemanticFilters(
+        repo_patterns=(), path_patterns=(), langs=("  Go  ",), branches=(), residual="x"
+    )
+    assert semantic.filter_params(filters) == {"sem_lang_0": "go"}
+
+
+@pytest.mark.unit
+def test_rrf_sql_branch_atom_and_param_dedupe_to_one_predicate() -> None:
+    # Decision C1: a `branch` kwarg equal to an existing `branch:` atom is a set union, so it
+    # collapses to ONE predicate/bind, not two.
+    filters = SemanticFilters(
+        repo_patterns=(), path_patterns=(), langs=(), branches=("feature",), residual="x"
+    )
+    sql = str(semantic.build_hybrid_rrf_sql(filters, branch="feature"))
+    assert sql.count("f.branches @> ARRAY[:sem_branch_0]") == 2
+    assert "sem_branch_1" not in sql
+    assert semantic.filter_params(filters, branch="feature") == {"sem_branch_0": "feature"}
+
+
+@pytest.mark.unit
+def test_rrf_sql_branch_atom_and_param_conjunction_when_different() -> None:
+    # Decision C1: distinct atom + param values AND together (conjunctive, lexical-parity),
+    # sorted for determinism -- NOT source order.
+    filters = SemanticFilters(
+        repo_patterns=(), path_patterns=(), langs=(), branches=("zzz",), residual="x"
+    )
+    sql = str(semantic.build_hybrid_rrf_sql(filters, branch="aaa"))
+    assert "f.branches @> ARRAY[:sem_branch_0] AND f.branches @> ARRAY[:sem_branch_1]" in sql
+    params = semantic.filter_params(filters, branch="aaa")
+    assert params == {"sem_branch_0": "aaa", "sem_branch_1": "zzz"}  # sorted, not source order
+
+
+@pytest.mark.unit
+def test_drift_seal_bind_names_match_filter_params_exactly() -> None:
+    """The shared-normalizer guarantee (Decision C1), PROVEN not assumed: the `:sem_*` bind
+    names referenced in the builder's own SQL text are EXACTLY the keys `filter_params` returns,
+    for a query mixing repeated repo:/file:/lang: atoms plus both a branch: atom and a branch
+    param.
+    """
+    filters = SemanticFilters(
+        repo_patterns=("a", "b"),
+        path_patterns=("c",),
+        langs=("Python",),
+        branches=("zzz", "aaa"),
+        residual="hello",
+    )
+    sql = str(semantic.build_hybrid_rrf_sql(filters, branch="mmm"))
+    sql_binds = set(re.findall(r":(sem_\w+)", sql))
+    assert sql_binds == set(semantic.filter_params(filters, branch="mmm").keys())
+
+
+@pytest.mark.unit
+def test_parity_pin_operator_tokens_match_lexical_compiler() -> None:
+    """Predicate-level parity byte-check (Decision Principle 1): the semantic builder's
+    hand-written repo:/lang:/branch: predicates use the SAME comparison operator as the
+    compiler-rendered lexical query for the identical atoms -- `~*` for repo:, `=` for lang:,
+    `@>` for branch:. (The semantic side spells its branch RHS as an inline `ARRAY[...]`
+    literal rather than a bound Python list, but the OPERATOR is byte-identical either way.)
+    """
+    lexical_sql = str(
+        compile_query(parse("repo:acme lang:go branch:main")).compile(dialect=postgresql.dialect())
+    )
+    assert "~*" in lexical_sql
+    assert "files.lang = " in lexical_sql
+    assert "@>" in lexical_sql
+
+    filters = SemanticFilters(
+        repo_patterns=("acme",), path_patterns=(), langs=("go",), branches=("main",), residual="x"
+    )
+    semantic_sql = str(semantic.build_hybrid_rrf_sql(filters))
+    assert "r.name ~* :sem_repo_0" in semantic_sql
+    assert "f.lang = :sem_lang_0" in semantic_sql
+    assert "f.branches @> ARRAY[:sem_branch_0]" in semantic_sql
 
 
 # -------------------------------------------------------------- enabled-path envelope shaping
@@ -253,6 +388,7 @@ def test_enabled_payload_shape(monkeypatch: pytest.MonkeyPatch) -> None:
                         start_line=10,
                         end_line=24,
                         rrf_score=0.5,
+                        cosine_distance=0.2,
                     )
                 ]
             ),
@@ -272,6 +408,7 @@ def test_enabled_payload_shape(monkeypatch: pytest.MonkeyPatch) -> None:
             "start_line": 10,
             "end_line": 24,
             "rrf_score": 0.5,
+            "similarity": pytest.approx(0.8),
         }
     ]
     # Transaction-local timeout set on BOTH transactions (schema probe, then the query),
@@ -311,3 +448,134 @@ def test_enabled_but_not_migrated_returns_structured_payload(
     assert payload["results"] == []
     assert payload["count"] == 0
     assert "make migrate" in payload["reason"]
+
+
+@pytest.mark.unit
+def test_similarity_null_for_null_cosine_distance(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AC6, the converse of test_enabled_payload_shape: a NULL cosine_distance (e.g. a BM25-only
+    # row, or a chunk indexed with no embedding) surfaces as similarity: None, not a crash/0.0.
+    monkeypatch.setattr(semantic, "get_embedder", lambda cfg: lambda texts: [[0.1, 0.2]])
+    engine = _FakeEngine(
+        [
+            _FakeResult(["chunks"]),
+            _FakeResult(
+                [
+                    _Row(
+                        id=2,
+                        repo="acme/widgets",
+                        path="src/b.py",
+                        chunk_index=1,
+                        content="y",
+                        start_line=None,
+                        end_line=None,
+                        rrf_score=0.3,
+                        cosine_distance=None,
+                    )
+                ]
+            ),
+        ]
+    )
+
+    payload = semantic._semantic_search_payload(engine, _cfg(enabled=True), "auth flow", 50)
+
+    assert payload["results"][0]["similarity"] is None
+    assert payload["results"][0]["rrf_score"] == 0.3
+
+
+# ------------------------------------------------------------- filter-semantics: payload shaping
+
+
+@pytest.mark.unit
+def test_residual_is_embedded_and_bound_to_qtext(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AC3: the residual (query minus filter atoms) is the ONE string used both as the embedder
+    # input and the :qtext bind -- captured independently and asserted equal.
+    captured_embed_input: list[str] = []
+
+    def _fake_get_embedder(cfg: Any) -> Any:
+        def _embed(texts: list[str]) -> list[list[float]]:
+            captured_embed_input.extend(texts)
+            return [[0.1, 0.2]]
+
+        return _embed
+
+    monkeypatch.setattr(semantic, "get_embedder", _fake_get_embedder)
+
+    captured_params: list[dict[str, Any]] = []
+    real_execute = _FakeConn.execute
+
+    def _spying_execute(self: _FakeConn, *args: object, **kwargs: object) -> _FakeResult:
+        if len(args) > 1 and isinstance(args[1], dict):
+            captured_params.append(args[1])
+        return real_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(_FakeConn, "execute", _spying_execute)
+
+    engine = _FakeEngine([_FakeResult(["chunks"]), _FakeResult([])])
+    payload = semantic._semantic_search_payload(
+        engine, _cfg(enabled=True), "repo:acme auth flow", 50
+    )
+
+    assert captured_embed_input == ["auth flow"]
+    assert captured_params[-1]["qtext"] == "auth flow"
+    assert payload["count"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("query", "expected_atom"),
+    [
+        ("sym:Foo bar", "sym:"),
+        ("case:yes bar", "case:"),
+        ("case:no bar", "case:"),
+        ("commit:abc1234 bar", "commit:"),
+        ("/foo/ bar", "regex"),
+    ],
+)
+def test_unsupported_atom_yields_structured_payload(query: str, expected_atom: str) -> None:
+    # AC4: one unit test per rejected atom -- structured payload, zero results, no exception
+    # escapes, engine never touched (the poisoned engine proves it).
+    payload = semantic._semantic_search_payload(_PoisonedEngine(), _cfg(enabled=True), query, 10)
+
+    assert payload["semantic_enabled"] is True
+    assert payload["results"] == []
+    assert payload["count"] == 0
+    assert payload["unsupported_filter"] == expected_atom
+    assert "reason" in payload
+
+
+@pytest.mark.unit
+def test_bare_repo_field_yields_query_parse_error_payload() -> None:
+    # AC4/empty-value atoms: bare `repo:` raises QueryParseError at scan time (parser.py
+    # _emit_field), surfaced end to end as the query_parse_error payload field.
+    payload = semantic._semantic_search_payload(_PoisonedEngine(), _cfg(enabled=True), "repo:", 10)
+
+    assert payload["semantic_enabled"] is True
+    assert payload["results"] == []
+    assert payload["count"] == 0
+    assert "query_parse_error" in payload
+
+
+@pytest.mark.unit
+def test_filter_only_query_never_embeds() -> None:
+    # AC5: a filter-only query (no residual text) never calls the embedder and never runs an
+    # RRF query -- proven with a poisoned engine AND a poisoned get_embedder in the same test.
+    payload = semantic._semantic_search_payload(
+        _PoisonedEngine(), _cfg(enabled=True), "repo:acme lang:python", 10
+    )
+
+    assert payload["nothing_to_embed"] is True
+    assert payload["reason"] == "query contains only filters; add text to search for"
+    assert payload["results"] == []
+    assert payload["count"] == 0
+
+
+@pytest.mark.unit
+def test_empty_query_nothing_to_embed_wording() -> None:
+    # AC5, the second wording: an empty/whitespace-only query (no atoms at all) is worded
+    # differently from the filters-only case above, so the caller sees WHY it is empty.
+    payload = semantic._semantic_search_payload(_PoisonedEngine(), _cfg(enabled=True), "   ", 10)
+
+    assert payload["nothing_to_embed"] is True
+    assert payload["reason"] == "empty query; provide text to search for"
+    assert payload["results"] == []
+    assert payload["count"] == 0
