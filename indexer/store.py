@@ -478,7 +478,7 @@ def reconcile_removed_repos(conn: Connection, *, desired_repos: Collection[str])
        ``repo_branches`` are direct ``ON DELETE CASCADE`` foreign keys
        (``app/db/models.py``), ``files`` -> ``symbols`` is the same, and
        ``files`` -> ``chunks`` cascades via the raw DDL in
-       ``app/alembic/versions/0004_semantic_search.py`` -- so a two-hop
+       ``app/alembic/versions/0004_semantic_chunks.py`` -- so a two-hop
        ``repos`` -> ``files`` -> ``chunks`` delete fires as one statement.
        ``RETURNING name`` reads back only ``repos`` rows, i.e. exactly the
        purged repo names, with no separate count query needed. The job role
