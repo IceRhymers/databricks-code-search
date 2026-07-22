@@ -12,6 +12,7 @@ until #59).
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -19,13 +20,19 @@ from typing import Any
 import pytest
 from sqlalchemy import Connection, text
 
-from app.config import SEMANTIC_EMBEDDING_DIM
+from app import service
+from app.config import SEMANTIC_EMBEDDING_DIM, Settings
 from app.db.client import create_db_engine
 from app.db.grants import build_job_grants
 from app.db.models import Base
 from indexer.chunk_store import write_chunks
 from indexer.languages import ExtractedSymbol, ParsedFile
-from indexer.store import ReconcileCounts, index_repo, reconcile_retired_branches
+from indexer.store import (
+    ReconcileCounts,
+    index_repo,
+    reconcile_removed_repos,
+    reconcile_retired_branches,
+)
 
 SCHEMA = "test_reconcile"
 
@@ -124,6 +131,21 @@ def _branches_of(conn: Connection, path: str, repo: str = "acme/widgets") -> lis
     )
 
 
+def _repo_names(conn: Connection) -> set[str]:
+    return set(conn.execute(text("SELECT name FROM repos")).scalars().all())
+
+
+def _cfg() -> Settings:
+    return Settings(
+        lakebase_endpoint=None,
+        statement_timeout_ms=5000,
+        max_content_bytes=8 * 1024 * 1024,
+        row_limit=200,
+        max_row_limit=1000,
+        semantic_enabled=False,
+    )
+
+
 def _repo_branch_names(conn: Connection, name: str) -> set[str]:
     rows = (
         conn.execute(
@@ -155,6 +177,30 @@ class _FailOnStatementConnection:
         if self._poison in str(clause):
             raise RuntimeError("injected failure")
         return self._conn.execute(clause, *args, **kwargs)
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._conn, item)
+
+
+class _ExecuteThenFailConnection:
+    """Wraps a real Connection: runs the statement for real, THEN raises if it matches ``poison``.
+
+    Stronger than ``_FailOnStatementConnection`` for a single-statement helper like
+    ``reconcile_removed_repos``: poisoning before execution would prove nothing (the
+    DELETE never ran), so this lets the DELETE...RETURNING and its cascades genuinely
+    fire in-transaction, THEN fails -- proving ``conn.begin()``'s rollback restores
+    everything the statement (and its FK cascades) just did.
+    """
+
+    def __init__(self, conn: Connection, poison: str) -> None:
+        self._conn = conn
+        self._poison = poison
+
+    def execute(self, clause: Any, *args: Any, **kwargs: Any) -> Any:
+        result = self._conn.execute(clause, *args, **kwargs)
+        if self._poison in str(clause):
+            raise RuntimeError("injected failure after execute")
+        return result
 
     def __getattr__(self, item: str) -> Any:
         return getattr(self._conn, item)
@@ -434,3 +480,319 @@ def test_reconcile_runs_under_the_actual_job_role(conn: Connection) -> None:
         conn.execute(text(f"DROP OWNED BY {job_role} CASCADE"))
         conn.execute(text(f"DROP ROLE IF EXISTS {job_role}"))
         conn.commit()
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_purges_repo_and_cascades_all_five_tables(
+    conn: Connection,
+) -> None:
+    index_repo(
+        conn,
+        name="acme/kept",
+        branch="main",
+        is_default=True,
+        head_sha="sha_kept",
+        items=_items(MAIN),
+        chunk_writer=_stub_chunk_writer,
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_removed",
+        items=_items(FEATURE_ONLY),
+        chunk_writer=_stub_chunk_writer,
+    )
+    conn.rollback()
+
+    # Capture the victim's file_id(s) BEFORE the purge -- once the repo row is gone,
+    # post-hoc reconstruction via a repo-name JOIN is impossible.
+    removed_file_id = _file_id(conn, "only_feature.py", repo="acme/removed")
+    assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 1
+    assert _count(conn, "chunks", f"file_id = {removed_file_id}") == 1
+    conn.rollback()  # clear the reads' autobegun txn before reconcile's own conn.begin()
+
+    deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+
+    assert deleted == ["acme/removed"]
+    assert _count(conn, "repos", "name = 'acme/removed'") == 0
+    assert _repo_branch_names(conn, "acme/removed") == set()
+    assert _count(conn, "files", "path = 'only_feature.py'") == 0
+    assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 0  # cascade
+    assert _count(conn, "chunks", f"file_id = {removed_file_id}") == 0  # cascade
+
+    # acme/kept is completely untouched.
+    assert _count(conn, "repos", "name = 'acme/kept'") == 1
+    assert _count(conn, "files", "path = 'main.py'") == 1
+    assert _branches_of(conn, "main.py", repo="acme/kept") == ["main"]
+    assert _repo_branch_names(conn, "acme/kept") == {"main"}
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_cross_repo_boundary_same_path_and_content(
+    conn: Connection,
+) -> None:
+    """Two repos share an identical (path, content) -- distinct rows via repo_id, not shared."""
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_a", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_b",
+        items=_items(MAIN),
+    )
+    conn.rollback()
+
+    kept_file_id = _file_id(conn, "main.py", repo="acme/kept")
+    removed_file_id = _file_id(conn, "main.py", repo="acme/removed")
+    assert kept_file_id != removed_file_id
+    conn.rollback()
+
+    deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+
+    assert deleted == ["acme/removed"]
+    assert _count(conn, "files", f"id = {kept_file_id}") == 1
+    assert _count(conn, "files", f"id = {removed_file_id}") == 0
+    assert _branches_of(conn, "main.py", repo="acme/kept") == ["main"]
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_multi_branch_victim_loses_every_repo_branch_row(
+    conn: Connection,
+) -> None:
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_r1",
+        items=_items(MAIN),
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="feature",
+        is_default=False,
+        head_sha="sha_r2",
+        items=_items(MAIN, FEATURE_ONLY),
+    )
+    conn.rollback()
+
+    assert _repo_branch_names(conn, "acme/removed") == {"main", "feature"}
+    conn.rollback()
+
+    deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+
+    assert deleted == ["acme/removed"]
+    assert _repo_branch_names(conn, "acme/removed") == set()
+    assert _repo_branch_names(conn, "acme/kept") == {"main"}
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_is_idempotent(conn: Connection) -> None:
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_r",
+        items=_items(FEATURE_ONLY),
+    )
+    conn.rollback()
+
+    first = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+    assert first == ["acme/removed"]
+
+    second = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+    assert second == []
+    assert _repo_names(conn) == {"acme/kept"}
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_all_desired_present_is_a_noop(conn: Connection) -> None:
+    index_repo(
+        conn, name="acme/a", branch="main", is_default=True, head_sha="sha_a", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn, name="acme/b", branch="main", is_default=True, head_sha="sha_b", items=_items(UTIL)
+    )
+    conn.rollback()
+
+    repos_before = _repo_names(conn)
+    conn.rollback()
+
+    deleted = reconcile_removed_repos(conn, desired_repos=["acme/a", "acme/b"])
+
+    assert deleted == []
+    assert _repo_names(conn) == repos_before
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_two_victims_returns_sorted_names(conn: Connection) -> None:
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn, name="acme/y", branch="main", is_default=True, head_sha="sha_y", items=_items(UTIL)
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/x",
+        branch="main",
+        is_default=True,
+        head_sha="sha_x",
+        items=_items(FEATURE_ONLY),
+    )
+    conn.rollback()
+
+    deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+
+    assert deleted == ["acme/x", "acme/y"]
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_empty_desired_set_raises_and_corpus_is_intact(
+    conn: Connection,
+) -> None:
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.rollback()
+
+    repos_before = _repo_names(conn)
+    conn.rollback()
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        reconcile_removed_repos(conn, desired_repos=[])
+
+    assert _repo_names(conn) == repos_before
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_injected_failure_after_delete_rolls_back(
+    conn: Connection,
+) -> None:
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_r",
+        items=_items(FEATURE_ONLY),
+    )
+    conn.rollback()
+
+    repos_before = _repo_names(conn)
+    files_before = _count(conn, "files")
+    conn.rollback()
+
+    poisoned = _ExecuteThenFailConnection(conn, poison="DELETE FROM repos")
+    with pytest.raises(RuntimeError, match="injected failure"):
+        reconcile_removed_repos(poisoned, desired_repos=["acme/kept"])  # type: ignore[arg-type]
+
+    # The DELETE...RETURNING and its FK cascades genuinely fired in-transaction; the
+    # subsequent raise inside `with conn.begin():` rolls all of it back.
+    assert _repo_names(conn) == repos_before
+    assert _count(conn, "files") == files_before
+    assert _count(conn, "files", "path = 'only_feature.py'") == 1
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_runs_under_the_actual_job_role(conn: Connection) -> None:
+    job_role = f"test_job_rr_{uuid.uuid4().hex[:12]}"
+    conn.execute(text(f"CREATE ROLE {job_role} NOLOGIN"))
+    for stmt in build_job_grants(SCHEMA, job_role):
+        conn.execute(text(stmt))
+    conn.commit()
+
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_r",
+        items=_items(FEATURE_ONLY),
+    )
+    conn.commit()
+
+    try:
+        conn.execute(text(f"SET ROLE {job_role}"))
+        conn.execute(text(f"SET search_path TO {SCHEMA}, public"))
+        conn.commit()
+
+        deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+        conn.commit()
+
+        assert deleted == ["acme/removed"]
+        assert _repo_names(conn) == {"acme/kept"}
+    finally:
+        conn.rollback()
+        conn.execute(text("RESET ROLE"))
+        conn.execute(text(f"DROP OWNED BY {job_role} CASCADE"))
+        conn.execute(text(f"DROP ROLE IF EXISTS {job_role}"))
+        conn.commit()
+
+
+@pytest.mark.integration
+def test_reconcile_removed_repos_purge_is_visible_to_the_serving_surface(
+    conn: Connection,
+) -> None:
+    """The purge commits via conn.begin(), so a second connection sees it (list_repos_payload)."""
+    index_repo(
+        conn, name="acme/kept", branch="main", is_default=True, head_sha="sha_k", items=_items(MAIN)
+    )
+    conn.commit()
+    index_repo(
+        conn,
+        name="acme/removed",
+        branch="main",
+        is_default=True,
+        head_sha="sha_r",
+        items=_items(FEATURE_ONLY),
+    )
+    conn.commit()
+
+    deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
+    conn.commit()
+    assert deleted == ["acme/removed"]
+
+    prev_pgoptions = os.environ.get("PGOPTIONS")
+    os.environ["PGOPTIONS"] = f"-c search_path={SCHEMA},public"
+    engine = create_db_engine()
+    try:
+        payload = service.list_repos_payload(engine, _cfg())
+    finally:
+        engine.dispose()
+        if prev_pgoptions is None:
+            os.environ.pop("PGOPTIONS", None)
+        else:
+            os.environ["PGOPTIONS"] = prev_pgoptions
+
+    names = {repo["name"] for repo in payload["repos"]}
+    assert names == {"acme/kept"}

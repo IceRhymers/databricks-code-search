@@ -1,4 +1,4 @@
-"""Unit tests for indexer.store.reconcile_retired_branches's pre-transaction guards.
+"""Unit tests for indexer.store's reconcile helpers' pre-transaction guards.
 
 Mirrors the #14 Phase 2 unit/integration split: these tests prove the sanitizer
 and no-op paths never open a transaction or touch the connection at all -- the
@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from indexer.store import ReconcileCounts, reconcile_retired_branches
+from indexer.store import ReconcileCounts, reconcile_removed_repos, reconcile_retired_branches
 
 
 class _PoisonConnection:
@@ -67,3 +67,57 @@ def test_reconcile_counts_is_a_frozen_dataclass() -> None:
     assert (counts.branches_removed, counts.files_stripped, counts.files_deleted) == (1, 2, 3)
     with pytest.raises(AttributeError):
         counts.branches_removed = 9  # type: ignore[misc]
+
+
+@pytest.mark.unit
+def test_reconcile_removed_repos_empty_desired_set_raises_without_touching_conn() -> None:
+    """The inverted guard: an empty *keep* set must REJECT, never filter-to-no-op.
+
+    Unlike reconcile_retired_branches's empty-input no-op, an empty desired_repos
+    would make `<> ALL('{}')` vacuously true for every row -- delete the whole
+    corpus. This must raise before any connection attribute access.
+    """
+    with pytest.raises(ValueError, match="must not be empty"):
+        reconcile_removed_repos(_PoisonConnection(), desired_repos=[])  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_reconcile_removed_repos_none_element_raises_and_proves_no_filtering() -> None:
+    """A None entry must raise, not be silently filtered out like the sibling helper's sanitizer."""
+    with pytest.raises(ValueError, match="non-empty strings"):
+        reconcile_removed_repos(
+            _PoisonConnection(),  # type: ignore[arg-type]
+            desired_repos=["acme/widgets", None],  # type: ignore[list-item]
+        )
+
+
+@pytest.mark.unit
+def test_reconcile_removed_repos_blank_string_element_raises() -> None:
+    with pytest.raises(ValueError, match="non-empty strings"):
+        reconcile_removed_repos(
+            _PoisonConnection(),  # type: ignore[arg-type]
+            desired_repos=["acme/widgets", ""],
+        )
+
+
+@pytest.mark.unit
+def test_reconcile_removed_repos_non_string_element_raises() -> None:
+    with pytest.raises(ValueError, match="non-empty strings"):
+        reconcile_removed_repos(
+            _PoisonConnection(),  # type: ignore[arg-type]
+            desired_repos=["acme/widgets", 42],  # type: ignore[list-item]
+        )
+
+
+@pytest.mark.unit
+def test_reconcile_removed_repos_valid_set_reaches_the_connection() -> None:
+    """A fully valid desired_repos must pass the guard and attempt real work.
+
+    The poison connection raises AssertionError on any attribute access, so
+    this proves the guard does not over-block legitimate input.
+    """
+    with pytest.raises(AssertionError, match="must not be touched"):
+        reconcile_removed_repos(
+            _PoisonConnection(),  # type: ignore[arg-type]
+            desired_repos=["acme/widgets", "acme/other"],
+        )

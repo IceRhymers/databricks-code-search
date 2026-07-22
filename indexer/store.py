@@ -443,3 +443,92 @@ def reconcile_retired_branches(
         files_stripped=files_stripped,
         files_deleted=files_deleted,
     )
+
+
+def reconcile_removed_repos(conn: Connection, *, desired_repos: Collection[str]) -> list[str]:
+    """Purge every ``repos`` row whose name is absent from ``desired_repos``.
+
+    Phase 2 of the corpus-reconciliation epic (#56): the counterpart to
+    ``reconcile_retired_branches`` at the repo level -- a repo dropped entirely
+    from the resolved corpus config (renamed, deleted upstream, or narrowed out
+    of the config) is never revisited by any per-branch ``index_repo`` call, so
+    nothing else in this module ever removes its row. This helper does not
+    decide which repos are desired; the caller supplies the full resolved set
+    (see #59), and it does not infer membership from anything already stored.
+
+    **Guard is a deliberate INVERSION of ``reconcile_retired_branches``'s
+    sanitizer.** There, ``retired_branches`` is the branches to *remove*, so
+    filtering out poison entries is conservative (fewer removals). Here,
+    ``desired_repos`` is the *keep* set: silently dropping an entry would
+    *increase* what gets deleted. So this guard rejects instead of filtering --
+    an empty collection, or any element that is not a non-empty ``str``, raises
+    ``ValueError`` before any connection attribute is touched. This also closes
+    the delete-everything hole: ``name <> ALL(CAST('{}' AS text[]))`` is
+    vacuously true for every row, so an empty array reaching the DML below
+    would purge the entire corpus. An empty ``desired_repos`` is always a
+    caller bug (``resolve_repos`` already raises ``EmptyConfigError`` on an
+    empty config), never a legitimate "delete everything" request.
+
+    Runs as a single ``with conn.begin():`` transaction:
+
+    1. ``DELETE FROM repos WHERE name <> ALL(CAST(:desired AS text[]))
+       RETURNING name`` -- one atomic statement, no prior ``SELECT``. Every
+       victim row's cascade is proven at the database level, not the ORM:
+       ``repos`` -> ``files`` and ``repos`` -> ``symbols`` and ``repos`` ->
+       ``repo_branches`` are direct ``ON DELETE CASCADE`` foreign keys
+       (``app/db/models.py``), ``files`` -> ``symbols`` is the same, and
+       ``files`` -> ``chunks`` cascades via the raw DDL in
+       ``app/alembic/versions/0004_semantic_search.py`` -- so a two-hop
+       ``repos`` -> ``files`` -> ``chunks`` delete fires as one statement.
+       ``RETURNING name`` reads back only ``repos`` rows, i.e. exactly the
+       purged repo names, with no separate count query needed. The job role
+       already holds ``DELETE`` on every table in this schema
+       (``app/db/grants.py``), so no new grant is required.
+    2. Matching is exact and case-sensitive, consistent with ``index_repo``'s
+       upsert key and ``repos.name``'s unique constraint: a config respelling
+       (``Acme/Widgets`` -> ``acme/widgets``) indexes a new row on the next
+       clean run and this helper correctly purges the old-spelling row as a
+       distinct name, rather than treating the two as the same repo.
+
+    Invariants: never mutates or reads any row for a name in ``desired_repos``
+    or any of their branches; never infers desired membership from what is
+    already stored (the caller owns that decision); idempotent (re-running
+    with the same ``desired_repos`` after a purge returns ``[]``); no engine
+    construction, network I/O, or ``TEMP TABLE``; no Alembic migration; no
+    ``INDEX_SEMANTICS_VERSION`` bump (this is not an indexing run); no
+    ``FOR UPDATE``/advisory lock -- the victim rows are disjoint from whatever
+    ``index_repo``/``reconcile_retired_branches`` may be locking concurrently,
+    and #60 already serializes indexer runs so this and a live indexing run
+    never overlap in practice.
+
+    A ``NULL`` element could never reach this DML: unlike
+    ``reconcile_retired_branches``'s ``<> ALL`` poison risk (where an
+    unsanitized ``NULL`` silently strands a row's membership untouched), this
+    guard rejects any non-``str``/blank element outright before the query
+    runs, so the under-deletion failure mode SQL's three-valued logic would
+    otherwise produce here (a stray ``NULL`` making ``<> ALL`` evaluate
+    ``UNKNOWN`` and the row survive) can never occur -- the caller gets a loud
+    ``ValueError`` instead of a silently incomplete purge.
+    """
+    if not desired_repos:
+        raise ValueError("desired_repos must not be empty (refusing to purge the entire corpus)")
+    desired: list[str] = []
+    for entry in desired_repos:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(f"desired_repos must contain only non-empty strings, got {entry!r}")
+        desired.append(entry)
+    desired = sorted(set(desired))
+
+    with conn.begin():
+        deleted = (
+            conn.execute(
+                text(
+                    "DELETE FROM repos WHERE name <> ALL(CAST(:desired AS text[])) RETURNING name"
+                ),
+                {"desired": desired},
+            )
+            .scalars()
+            .all()
+        )
+
+    return sorted(deleted)
