@@ -161,6 +161,8 @@ def test_or_between_two_repo_atoms_is_prose_not_boolean_structure() -> None:
         ("case:no bar", "case:"),
         ("commit:abc1234 bar", "commit:"),
         ("/foo.*bar/ baz", "regex"),
+        ("-repo:foo bar", "-"),
+        ("-foo bar", "-"),
     ],
 )
 def test_unsupported_atom_raises_with_position(query: str, expected_atom: str) -> None:
@@ -169,6 +171,15 @@ def test_unsupported_atom_raises_with_position(query: str, expected_atom: str) -
     assert exc_info.value.atom == expected_atom
     # Every parametrized query puts the offending atom at the very start.
     assert exc_info.value.position == 0
+
+
+@pytest.mark.unit
+def test_negation_atom_rejected_even_mid_query() -> None:
+    # A token-initial '-' anywhere (not just the first token) rejects with atom "-" at its column.
+    with pytest.raises(UnsupportedSemanticAtomError) as exc_info:
+        split_semantic_query("auth -repo:acme")
+    assert exc_info.value.atom == "-"
+    assert exc_info.value.position == 5
 
 
 # ------------------------------------------------------------------------- QueryParseError

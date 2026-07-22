@@ -71,6 +71,14 @@ export function recognize(query: string): QueryModel {
     if (c === "(" || c === ")") return { safe: false };
     // A regex or quoted literal in operand position -- unsafe (chips never edit these).
     if (c === "/" || c === '"') return { safe: false };
+    // A token-initial '-' is lexical negation on the Python side (parses to a Not(...) node),
+    // whose structure a flat atom-rewrite cannot represent -- unsafe. Mirror the Python
+    // scanner's exact trigger: the next char must exist, be non-whitespace, and not be ')'.
+    // Any other '-' (at EOF, or before whitespace/')' ) is a literal and falls through. This
+    // runs at every token start (not just i === 0), so a leading '-' on ANY operand triggers it.
+    if (c === "-" && i + 1 < n && !isWhitespace(query[i + 1]) && query[i + 1] !== ")") {
+      return { safe: false };
+    }
 
     const start = i;
     // Mirror tokenize's field-prefix scan: leading [a-z]+ followed by ':'.

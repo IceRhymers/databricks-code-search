@@ -514,6 +514,83 @@ def test_null_default_branch_resolves_to_head(branch_seeded: BranchSeeded) -> No
     assert _paths(branch_seeded.conn, "repo:^branch/null-default") == {"src/head_file.go"}
 
 
+# ------------------------------------------------------------------ negation (issue #69)
+#
+# Candidate-set shapes for positive+negative combinations. Written now per the plan; run in CI
+# (needs live Lakebase). The nullable-NULL case is explicitly NOT a merge gate -- see its note.
+
+
+@pytest.mark.integration
+def test_negated_content_atom_excludes_matching_rows(seeded: Seeded) -> None:
+    # `lang:go -handler`: go files EXCEPT those whose content matches "handler". handler.go
+    # ("Handler") and util.go ("handler" comment) are excluded; the rest of the go set remains.
+    assert _paths(seeded.conn, "lang:go -handler") == {
+        "src/escape1.go",
+        "src/escape2.go",
+        "src/regex_lower.go",
+        "SRC/UpperCase.go",
+    }
+
+
+@pytest.mark.integration
+def test_negated_path_filter_excludes_matching_rows(seeded: Seeded) -> None:
+    # `lang:go -file:handler`: go files whose PATH does not match the regex "handler".
+    assert _paths(seeded.conn, "lang:go -file:handler") == {
+        "src/util.go",
+        "src/escape1.go",
+        "src/escape2.go",
+        "src/regex_lower.go",
+        "SRC/UpperCase.go",
+    }
+
+
+@pytest.mark.integration
+def test_negated_lang_filter_is_three_valued_and_excludes_null_lang(seeded: Seeded) -> None:
+    # `repo:^acme -lang:go`: every acme file is either lang=go (excluded by `-lang:go`) or
+    # lang=NULL (src/no_lang.txt -> `NOT (NULL = 'go')` is NULL, also excluded). So the set is
+    # empty -- proving the NULL-lang row is in NEITHER `lang:go` NOR `-lang:go`.
+    assert _paths(seeded.conn, "repo:^acme -lang:go") == set()
+
+
+@pytest.mark.integration
+def test_negated_symbol_filter_excludes_files_with_that_symbol(seeded: Seeded) -> None:
+    # `repo:^acme -sym:Handler`: NOT EXISTS(a Handler-named symbol) -> only src/handler.go (which
+    # declares `Handler`) is excluded; every other acme file has no such symbol and remains.
+    assert _paths(seeded.conn, "repo:^acme -sym:Handler") == ACME_PATHS - {"src/handler.go"}
+
+
+@pytest.mark.integration
+def test_nullable_content_row_excluded_from_both_positive_and_negated(seeded: Seeded) -> None:
+    # NOT A MERGE GATE (integration-only, deferred to CI): the three-valued NULL contract.
+    # gamma/null_content.txt has content=NULL and is reachable via a path predicate, but a NULL
+    # content matches NEITHER `foo` (NULL ILIKE) NOR `-foo` (NULL NOT ILIKE) -- both are NULL,
+    # never true -- so it appears in neither candidate set. No set-complement rewrite includes it.
+    assert _paths(seeded.conn, "file:^gamma/") == {"gamma/null_content.txt"}
+    assert _paths(seeded.conn, "file:^gamma/ foo") == set()
+    assert _paths(seeded.conn, "file:^gamma/ -foo") == set()
+
+
+@pytest.mark.integration
+def test_negated_branch_stays_scoped_to_default_and_excludes_that_branch(
+    branch_seeded: BranchSeeded,
+) -> None:
+    # `-branch:feature` is an EXCLUSION, not a scope selection: it does NOT opt out of the
+    # implicit default-branch conjunct. So the query stays scoped to the default branch AND
+    # additionally drops any default-branch row whose membership also includes "feature".
+    # src/shared.go (branches=[main, feature]) is dropped; default_only.go and the "main"
+    # version of divergent.go remain.
+    paths = _paths(branch_seeded.conn, "repo:^branch/main-default -branch:feature")
+    assert paths == {"src/default_only.go", "src/divergent.go"}
+
+
+@pytest.mark.integration
+def test_negated_commit_that_resolves_to_nothing_excludes_nothing(seeded: Seeded) -> None:
+    # No repo_branches rows are seeded here, so `-commit:abc1234` lowers to NOT EXISTS(...) which
+    # is true for every row -- a non-resolving negated commit is inert and excludes nothing, so
+    # `lang:go -commit:abc1234` returns the same set as `lang:go`.
+    assert _paths(seeded.conn, "lang:go -commit:abc1234") == _paths(seeded.conn, "lang:go")
+
+
 # ------------------------------------------------------------------------ limit / ordering
 
 

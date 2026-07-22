@@ -87,6 +87,7 @@ from app.query.parser import (
     CommitFilter,
     LangFilter,
     Node,
+    Not,
     Or,
     PathFilter,
     Regex,
@@ -208,10 +209,18 @@ class GrepResult:
 
 
 def _collect_matchers(node: Node, flags: int, patterns: list[re.Pattern[str]]) -> bool:
-    """Append every Substring/Regex leaf's compiled pattern to ``patterns``.
+    """Append every AFFIRMATIVE Substring/Regex leaf's compiled pattern to ``patterns``.
 
-    Returns True if any Regex leaf failed Python ``re.compile`` (NOT-RE2 degradation).
-    Filters (repo/path/lang/sym) contribute no patterns.
+    Returns True if any (affirmative) Regex leaf failed Python ``re.compile`` (NOT-RE2
+    degradation). Filters (repo/path/lang/sym) contribute no patterns.
+
+    A :class:`Not` subtree contributes NOTHING and is NOT recursed into: grep highlights only
+    POSITIVE matches, and a ``-foo`` exclusion is a SQL-only predicate never rendered as a
+    highlight. This also means a purely-negated broken regex (``-/[/``) does NOT set
+    ``regex_incompatible`` -- the Python-side ``re.compile`` there exists only to build highlight
+    patterns, and a negated atom builds none, so there is nothing whose highlighting capability
+    was lost. (The SQL predicate still compiles the pattern server-side via Postgres POSIX ARE
+    regardless of polarity, so exclusion correctness is unaffected.)
     """
     match node:
         case Substring(value=value):
@@ -222,6 +231,8 @@ def _collect_matchers(node: Node, flags: int, patterns: list[re.Pattern[str]]) -
                 patterns.append(re.compile(pattern, flags))
             except re.error:
                 return True
+            return False
+        case Not():
             return False
         case And(children=children) | Or(children=children):
             incompatible = False

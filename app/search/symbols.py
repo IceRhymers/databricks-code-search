@@ -59,6 +59,7 @@ from app.query.parser import (
     CommitFilter,
     LangFilter,
     Node,
+    Not,
     Or,
     PathFilter,
     Regex,
@@ -106,13 +107,18 @@ class SymbolResult:
 
 
 def _collect_symbol_patterns(node: Node, out: list[str]) -> None:
-    """Append every ``SymbolFilter.name`` in the AST (any And/Or nesting) to ``out``.
+    """Append every AFFIRMATIVE ``SymbolFilter.name`` in the AST (any And/Or nesting) to ``out``.
 
-    All other leaves (substring/regex/repo/path/lang) contribute nothing. Pure -- no DB import.
+    All other leaves (substring/regex/repo/path/lang) contribute nothing. A :class:`Not` subtree
+    is skipped (never recursed into): a ``-sym:foo`` exclusion has no definitions to project, so
+    a `-sym:foo`-only query collects zero patterns -> ``no_symbol_atom=True``. Pure -- no DB
+    import.
     """
     match node:
         case SymbolFilter(name=name):
             out.append(name)
+        case Not():
+            return
         case And(children=children) | Or(children=children):
             for child in children:
                 _collect_symbol_patterns(child, out)

@@ -22,8 +22,17 @@ Contract / divergence notes (load-bearing for #9 and future work):
   not Python ``re``, so compiling would false-reject valid patterns. Only delimiter
   structure (open ``/`` ... closing unescaped ``/``) is validated; body validity is #9's
   job against the real Postgres engine. Thus ``/[/`` PARSES to ``Regex("[")``.
-* ``-foo`` is a literal :class:`Substring` in V1. When negation ships later, stored
-  ``-foo`` queries will silently flip to negation -- an accepted, documented V1 risk.
+* Lexical negation: a TOKEN-INITIAL ``-`` (one whose next char exists, is non-whitespace,
+  and is not ``)``) lexes as a :class:`TokenKind.NOT` token and negates the immediately
+  following primary -- ``-foo``, ``-"x"``, ``-/re/``, ``-repo:x`` (any field), and negated
+  groups ``-(a b)`` all parse to a :class:`Not` wrapper; ``NOT`` binds tighter than the
+  implicit whitespace-AND. Any other ``-`` (``a - b``, trailing ``foo -``, ``(a -)``,
+  interior ``foo-bar``, dashes inside field values) falls through to the bareword scan
+  byte-for-byte, so only a leading ``-`` in operand position triggers negation. This is a
+  deliberate, documented V1 compatibility break: a stored ``-foo`` flips from literal
+  substring to negation. The escape hatch is quoting: ``"-foo"`` still parses as
+  ``Substring("-foo")``. Double negation is NOT simplified (``--foo`` stays
+  ``Not(Not(Substring("foo")))``, exact AST).
 * The OR operator is accepted case-insensitively (``or``/``OR``/``Or``). Issue #8 writes
   ``OR`` while live zoekt uses lowercase ``or``; this is a deliberate divergence. The
   literal word is still reachable via quoting (``"or"`` -> ``Substring("or")``).
@@ -105,6 +114,17 @@ class CommitFilter:
 
 
 @dataclass(frozen=True)
+class Not:
+    """Lexical negation of a single ``child`` primary (``-foo``, ``-repo:x``, ``-(a b)``).
+
+    No double-negation simplification: ``--foo`` is ``Not(Not(Substring("foo")))``, kept
+    exact. Lowered to a three-valued SQL ``NOT (...)`` by #9 (a NULL column matches neither
+    the positive nor the negated form)."""
+
+    child: Node
+
+
+@dataclass(frozen=True)
 class And:
     """N-ary conjunction. Invariant: ``len(children) >= 2``."""
 
@@ -128,6 +148,7 @@ Node: TypeAlias = (
     | SymbolFilter
     | BranchFilter
     | CommitFilter
+    | Not
     | And
     | Or
 )
@@ -153,6 +174,7 @@ class TokenKind(Enum):
     LPAREN = auto()
     RPAREN = auto()
     OR = auto()
+    NOT = auto()  # a token-initial '-' in operand position (see tokenize)
     SUBSTRING = auto()
     REGEX = auto()
     REPO = auto()
@@ -300,6 +322,14 @@ def tokenize(query: str) -> list[Token]:
             body, i = _read_quoted(query, start)
             tokens.append(Token(TokenKind.SUBSTRING, body, start))
             continue
+        # Token-initial '-' negates the following primary, but ONLY when a primary can follow:
+        # the next char must exist, be non-whitespace, and not be ')'. Otherwise (EOF, `a - b`,
+        # `foo -`, `(a -)`) the '-' falls through to the bareword scan and stays a literal, so
+        # every pre-negation query without a leading '-' is preserved byte-for-byte.
+        if c == "-" and i + 1 < n and query[i + 1] not in _WHITESPACE and query[i + 1] != ")":
+            tokens.append(Token(TokenKind.NOT, "-", i))
+            i += 1
+            continue
 
         # Bareword. First test for a recognized field prefix: [a-z]+ ':'.
         start = i
@@ -351,7 +381,16 @@ class _RawOr:
     children: list[_Raw]
 
 
-_Raw: TypeAlias = Node | _RawAnd | _RawOr | _CaseMarker
+@dataclass
+class _RawNot:
+    """A parsed ``NOT primary``. ``position`` is the NOT token's column, kept so ``_finalize``
+    can raise at the right place when the negated operand carries no real term (``-case:yes``)."""
+
+    child: _Raw
+    position: int
+
+
+_Raw: TypeAlias = Node | _RawAnd | _RawOr | _RawNot | _CaseMarker
 
 
 class _Parser:
@@ -359,7 +398,7 @@ class _Parser:
 
     or_expr  := and_expr ( OR and_expr )*
     and_expr := primary ( primary )*
-    primary  := '(' or_expr ')' | FIELD | REGEX | STRING | TERM | CASE
+    primary  := NOT primary | '(' or_expr ')' | FIELD | REGEX | STRING | TERM | CASE
     """
 
     def __init__(self, tokens: list[Token], case_sensitive: bool) -> None:
@@ -407,6 +446,17 @@ class _Parser:
         tok = self._peek()
         if tok is None:
             raise QueryParseError("unexpected end of input", self.eof_pos)
+        if tok.kind == TokenKind.NOT:
+            self._advance()
+            # depth tracks NESTING, not a running count: NOT recurses into parse_primary and
+            # decrements on the way out, so a flat `-a -b -c ...` chain (each sibling parsed and
+            # unwound independently) never accumulates, while `--...--a` / `-(-(...))` does.
+            self.depth += 1
+            if self.depth > _MAX_DEPTH:
+                raise QueryParseError("expression nesting too deep", tok.position)
+            child = self.parse_primary()
+            self.depth -= 1
+            return _RawNot(child, tok.position)
         if tok.kind == TokenKind.LPAREN:
             self._advance()
             self.depth += 1
@@ -479,6 +529,14 @@ def _finalize(raw: _Raw) -> Node | None:
     """
     if isinstance(raw, _CaseMarker):
         return None
+    if isinstance(raw, _RawNot):
+        child = _finalize(raw.child)
+        if child is None:
+            # The negated operand carried no real term (only case markers), e.g. `-case:yes`
+            # or `-(case:yes)`: negating a query-global flag is meaningless, so raise loudly
+            # rather than silently drop the NOT.
+            raise QueryParseError("negation has no term to negate", raw.position)
+        return Not(child)
     if isinstance(raw, _RawAnd):
         kids = [k for k in (_finalize(c) for c in raw.children) if k is not None]
         if not kids:
