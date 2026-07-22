@@ -29,8 +29,10 @@ class _PoisonConnection:
 @pytest.mark.unit
 def test_empty_retired_branches_is_a_noop() -> None:
     counts = reconcile_retired_branches(
-        _PoisonConnection(), name="acme/widgets", retired_branches=[]
-    )  # type: ignore[arg-type]
+        _PoisonConnection(),  # type: ignore[arg-type]
+        name="acme/widgets",
+        retired_branches=[],
+    )
     assert counts == ReconcileCounts(branches_removed=0, files_stripped=0, files_deleted=0)
 
 
