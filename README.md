@@ -120,6 +120,10 @@ scoping — `-branch:x foo` still searches the default branch, just excluding `x
 > bookmarked or stored `-foo` query now means negation. To search for a literal leading
 > dash, quote it: `"-foo"` parses as the substring `-foo`.
 
+Negation is lexical-search only (`search_code` and the web UI's Search page); a leading `-`
+is rejected in semantic search (`semantic_search` and the web UI's Semantic page) — remove it
+or quote the term to search it as text.
+
 Not supported in V1. Most of these raise; the first one is silent, which is the more
 dangerous case:
 

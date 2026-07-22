@@ -48,6 +48,20 @@ export function SyntaxHelp(): JSX.Element {
           </tr>
           <tr>
             <td>
+              <code>-term</code>
+            </td>
+            <td>
+              Exclude (negate) the next atom, e.g. <code>-repo:acme</code> or{" "}
+              <code>-lang:go</code>. Binds tighter than AND; only a leading{" "}
+              <code>-</code> immediately before a non-space, non-<code>)</code> character
+              negates -- a trailing or standalone <code>-</code> (as in{" "}
+              <code>foo -</code>) stays a literal dash. Quote it to search for a literal
+              leading dash, e.g. <code>&quot;-foo&quot;</code>. Not supported in semantic
+              search.
+            </td>
+          </tr>
+          <tr>
+            <td>
               <code>foo bar</code>
             </td>
             <td>Space between atoms is AND.</td>

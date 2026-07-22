@@ -2,8 +2,8 @@
 // language the backend parses (app/query/parser.py). This is NOT a full parser -- it
 // mirrors just enough of app/query/parser.py:tokenize (lines 249-300) to classify a query
 // as either "safe" (a flat conjunction of field:value / bareword atoms the chip UI can
-// edit structurally) or "unsafe" (contains parens, OR, quotes, or regex -- anything whose
-// structure a naive atom-rewrite could silently corrupt). Unsafe queries are still valid
+// edit structurally) or "unsafe" (contains parens, OR, quotes, regex, or negation ('-') --
+// anything whose structure a naive atom-rewrite could silently corrupt). Unsafe queries are still valid
 // zoekt queries; they are just left as opaque free text for the chips to disable rather
 // than edit. See docs/runbooks/webui.md for the user-facing asymmetry this produces.
 import type { RepoInfo } from "../api/client";
@@ -53,8 +53,8 @@ function readBareValue(source: string, start: number): [string, number] {
 
 /**
  * Classify `query` as a flat AND of atoms ("safe") or bail ("unsafe") on the first
- * paren, OR, quote, or regex delimiter -- mirroring app/query/parser.py:tokenize's scan
- * but refusing (rather than parsing) anything with real boolean/grouping structure.
+ * paren, OR, quote, regex, or negation ('-') delimiter -- mirroring app/query/parser.py:tokenize's
+ * scan but refusing (rather than parsing) anything with real boolean/grouping/negation structure.
  */
 export function recognize(query: string): QueryModel {
   const atoms: Atom[] = [];

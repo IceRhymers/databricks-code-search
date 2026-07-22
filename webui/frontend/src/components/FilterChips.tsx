@@ -10,7 +10,7 @@ export interface FilterChipsProps {
   onToggleBranch: (branch: string) => void;
 }
 
-const UNSAFE_TITLE = "This query has OR/parens/quotes/regex -- edit the text directly.";
+const UNSAFE_TITLE = "This query has OR/parens/quotes/regex/negation (-) -- edit the text directly.";
 
 // Chips compose `repo:`/`lang:`/`branch:` atoms into the query string (owned by SearchPage,
 // via utils/queryModel's recognizer); they never call the API directly. `languages` is

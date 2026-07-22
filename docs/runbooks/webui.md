@@ -43,8 +43,11 @@ The Search page's `repo:`/`lang:` chips (`FilterChips.tsx`) compose atoms into t
 string via a small client-side recognizer (`utils/queryModel.ts`) that classifies the typed
 query as either a flat AND of `field:value`/bareword atoms ("safe" -- the chips can add,
 remove, or replace an atom without touching anything else) or "unsafe" (contains `OR`,
-parens, a quoted string, or a `/regex/` -- any construct a naive atom rewrite could silently
-corrupt). The recognizer is a deliberately narrower single-pass port of
+parens, a quoted string, a `/regex/`, or a negated (`-`) atom -- any construct a naive atom
+rewrite could silently corrupt). A negated query (e.g. `-repo:acme`) is always unsafe, even
+when it would otherwise name exactly one known repository -- the chips disable rather than
+risk silently dropping or inverting the exclusion. The recognizer is a deliberately narrower
+single-pass port of
 `app/query/parser.py:tokenize`, not a full parser; `tests/unit/test_query_corpus_parity.py`
 and `webui/frontend/src/utils/queryModel.corpus.test.ts` share one JSON corpus
 (`queryModel.corpus.json`) to keep the TS port's "safe" verdict from drifting out of sync
