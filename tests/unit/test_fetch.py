@@ -319,6 +319,47 @@ def test_list_branches_follows_link_rel_next() -> None:
 
 
 @pytest.mark.unit
+def test_list_branches_mid_pagination_http_failure_raises_no_partial_list() -> None:
+    """AC4/D5: complete-or-raise. Page 2 500s -> the whole call raises; page 1's
+    branches are never returned as a silently-short list."""
+    page1 = [{"name": f"b{i}"} for i in range(100)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["page"] == "1":
+            return httpx.Response(
+                200,
+                json=page1,
+                headers={"Link": f'<{request.url}&page=2>; rel="next"'},
+            )
+        return httpx.Response(500)
+
+    client, seen = _recording_client(handler)
+    with client, pytest.raises(httpx.HTTPStatusError):
+        list_branches(client, ORG, REPO)
+    assert len(seen) == 2  # page 1 succeeded, page 2 is what raised
+
+
+@pytest.mark.unit
+def test_list_branches_mid_pagination_rate_limit_raises_no_partial_list() -> None:
+    """Same complete-or-raise contract, but page 2 hits a genuine rate limit."""
+    page1 = [{"name": f"b{i}"} for i in range(100)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params["page"] == "1":
+            return httpx.Response(
+                200,
+                json=page1,
+                headers={"Link": f'<{request.url}&page=2>; rel="next"'},
+            )
+        return httpx.Response(429)
+
+    client, seen = _recording_client(handler)
+    with client, pytest.raises(RateLimitError, match=f"{ORG}/{REPO} branches"):
+        list_branches(client, ORG, REPO)
+    assert len(seen) == 2
+
+
+@pytest.mark.unit
 def test_list_branches_rate_limit_names_org_repo_selector() -> None:
     client, _ = _recording_client(lambda request: httpx.Response(429))
     with client:

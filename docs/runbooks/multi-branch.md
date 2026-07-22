@@ -61,10 +61,21 @@ time. `branch:` at query time is likewise an exact match, not a glob (see §4).
 **The soft cap is 20 branches per repo** (`indexer/branches.SOFT_BRANCH_CAP`). If globs resolve
 to more than 20 branches for one repo, the result is truncated **default-first, then
 alphabetical** — the default branch is never dropped, and among the rest it's alphabetical
-order that decides what survives. Truncation is a loud `logger.warning` naming the repo and the
-exact dropped branches, not a failure: the run still indexes the kept 20. There is no override
-flag — mirroring `indexer.resolve.MAX_REPOS`' philosophy, the fix for a runaway match (a typo'd
-`*` glob, say) is narrowing the glob in `config.yaml`, not a config knob to raise the ceiling.
+order that decides what survives. Truncation is a loud `logger.warning` naming the repo, the
+cap, and the exact dropped branches, not a failure: the run still indexes the kept 20. There is
+no override flag — mirroring `indexer.resolve.MAX_REPOS`' philosophy, the fix for a runaway
+match (a typo'd `*` glob, say) is narrowing the glob in `config.yaml`, not a config knob to raise
+the ceiling.
+
+**Since #61, truncation also marks that repo's branch discovery incomplete and blocks
+reconciliation for it.** `indexer.branches.resolve_branches` returns a typed `BranchResolution`
+(`branches`, `complete`, `dropped`, `cap`) instead of a bare list, and `indexer.job`'s per-repo
+`RepoOutcome` carries the same `complete` flag through as `discovery_complete`. A capped repo's
+kept branches are still indexed normally — nothing here changes what gets indexed or the run's
+exit code — but the upcoming desired-state reconciliation pass (#56/#59, see §7) must not treat
+a truncated set as proof the repo has no other branches: doing so would let it retire branches
+that were only dropped by the cap, not genuinely removed upstream. Narrow the glob (or raise the
+repo's branch hygiene) to get back to `complete=True` and unblock reconciliation for that repo.
 
 Branches are indexed **sequentially within a repo, not in parallel** (Option A1). This is
 deliberate, not a missing optimization: it's what keeps the single-writer-per-repo invariant the
@@ -204,6 +215,11 @@ rows (and `array_remove`-ing + deleting emptied `files`) for anything no longer 
 tracked in `.omc/plans/open-questions.md` but not implemented. If you narrow a `branches:` glob
 or a repo's default branch changes, expect the old branch's content to remain searchable via
 `branch:<old-name>` until that reconciliation pass ships.
+
+`indexer.branches.BranchResolution.complete` (#61, see §2) is the property that reconciliation
+will gate on once it ships — a repo whose discovery was truncated (`complete=False`) must not
+have its omitted branches treated as evidence of retirement; the full reconciliation design
+(what reads `complete`, how deletion is scoped) is #59's scope, not covered further here.
 
 ---
 

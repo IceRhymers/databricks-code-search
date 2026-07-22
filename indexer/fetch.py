@@ -179,6 +179,15 @@ def list_branches(client: httpx.Client, org: str, repo: str) -> list[str]:
 
     Used only when a connection configures ``branches:`` globs (plan Phase 2):
     resolving glob patterns needs the repo's real branch list to match against.
+
+    Complete-or-raise, via :func:`_paginated_get`: any page's failure (a rate
+    limit, an HTTP error, anything else) raises out of this call rather than
+    returning whatever pages were fetched so far -- there is no partial-list
+    return path. That is load-bearing for corpus reconciliation (#56): a caller
+    that resolved a truncated branch list without knowing it was truncated could
+    treat missing branches as evidence they no longer exist upstream and retire
+    them. A mid-pagination failure here instead fails the whole repo (see
+    ``indexer.job._index_one_inner``), never a silently short branch list.
     """
     items = _paginated_get(
         client, f"{_API_BASE}/repos/{org}/{repo}/branches", selector=f"{org}/{repo} branches"

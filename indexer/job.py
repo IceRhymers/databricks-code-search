@@ -17,6 +17,15 @@ sweep sound without an advisory lock. Each BRANCH is isolated: one branch's
 failure or CAS conflict does not stop its repo's other branches from being
 attempted, and the process exits non-zero if any branch fails.
 
+Each repo's worker returns a :class:`RepoOutcome` (#61): its per-branch
+``outcomes`` plus ``discovery_complete``, mirroring
+:class:`indexer.branches.BranchResolution` -- ``False`` when the soft branch
+cap truncated that repo's concrete branch list, so its resolved set must not be
+trusted as evidence the repo has no OTHER branches to reconcile against. This
+run's drain loop still only reads ``outcomes`` for its ok/skipped/conflict/failed
+counters, unchanged; ``discovery_complete`` is surfaced for a future
+reconciliation gate (#59) to collect across repos, not consumed here.
+
 One logical corpus writer, at the RUN level: ``resources/job.yml`` pins
 ``max_concurrent_runs: 1`` (queueing retained), so at most one run of this job
 is ever fetching, deriving, or applying corpus state at a time -- the
@@ -126,6 +135,34 @@ class BranchOutcome:
     branch: str
     status: Literal["indexed", "skipped", "conflict", "failed"]
     counts: IndexCounts | None = None
+
+
+@dataclass(frozen=True)
+class RepoOutcome:
+    """The result of attempting every branch of one repo (#61).
+
+    ``discovery_complete`` mirrors :class:`indexer.branches.BranchResolution`'s
+    ``complete`` flag for this repo's concrete branch list: ``False`` means the
+    soft cap truncated discovery, so ``outcomes`` covers only the KEPT branches
+    and must never be read as this repo's full branch membership. It is
+    production-WRITE-only here -- ``run()``'s drain loop still unpacks only
+    ``outcomes`` for its ok/skipped/conflict/failed counters, unchanged from
+    before this field existed. Collecting ``discovery_complete`` across repos to
+    gate reconciliation is #59's job, not this one's; this dataclass exists so
+    that collection has something typed to read once it lands.
+
+    A repo that fails BEFORE this object is constructed (a bad default-HEAD
+    resolve, a branch-listing failure) has no ``RepoOutcome`` at all -- it
+    propagates as an exception and is still counted in ``run()``'s ``except``
+    branch, exactly as before. That absence is itself meaningful: it is a
+    stronger signal than ``discovery_complete=False`` and must stay
+    distinguishable from it, which is why this field is never defaulted to
+    ``False`` for a repo that never got this far.
+    """
+
+    name: str
+    discovery_complete: bool
+    outcomes: list[BranchOutcome]
 
 
 # Per-repo log context. Set by _index_one so that records emitted by
@@ -330,12 +367,12 @@ def run(
             for fut in as_completed(futures):
                 entry = futures[fut]
                 try:
-                    outcomes = fut.result()
+                    repo_outcome = fut.result()
                 except Exception:
                     failures += 1
                     logger.exception("failed to index %s", entry.name)
                     continue
-                for outcome in outcomes:
+                for outcome in repo_outcome.outcomes:
                     if outcome.status == "skipped":
                         skipped += 1
                     elif outcome.status == "conflict":
@@ -485,7 +522,7 @@ def _index_one(
     cfg: Settings,
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
-) -> list[BranchOutcome]:
+) -> RepoOutcome:
     """Run the full fetch -> parse -> symbols -> store pipeline for every branch of one repo.
 
     Branches are processed SEQUENTIALLY (plan Option A1) so no concurrent writer
@@ -525,14 +562,15 @@ def _index_one_inner(
     cfg: Settings,
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
-) -> list[BranchOutcome]:
+) -> RepoOutcome:
     """The body of :func:`_index_one`, run with the repo log context already set.
 
     Resolving the default HEAD and the concrete branch list happens ONCE, here,
     outside the per-branch loop; a failure at this stage (a 404 repo, a rate
     limit) fails the whole repo and propagates to ``run()``'s repo-level
-    handler. Everything from that point on is per-branch and never raises out
-    of this function (see :func:`_index_one_branch`).
+    handler -- there is no :class:`RepoOutcome` at all for that case (see its
+    docstring). Everything from that point on is per-branch and never raises
+    out of this function (see :func:`_index_one_branch`).
     """
     name = normalize_repo(entry.name)
     org, repo = name.split("/", 1)
@@ -542,7 +580,7 @@ def _index_one_inner(
     # call at all: resolve_branches ignores all_branches entirely when globs is
     # empty (it always resolves to just [default_branch]).
     all_branches = list_branches(http_client, org, repo) if entry.branch_globs else []
-    concrete_branches = resolve_branches(
+    resolution = resolve_branches(
         default_branch, all_branches, sorted(entry.branch_globs), repo=name
     )
 
@@ -562,7 +600,7 @@ def _index_one_inner(
             stamps=stamps,
             started=started,
         )
-        for branch in concrete_branches
+        for branch in resolution.branches
     ]
 
     # Measured here, where the clock already runs, rather than as an IndexCounts
@@ -571,7 +609,7 @@ def _index_one_inner(
     # This is the instrument the "throughput measured on the first production
     # run" promise depends on -- without it that promise is unfalsifiable.
     logger.info("finished %s in %.2fs", name, time.monotonic() - started)
-    return outcomes
+    return RepoOutcome(name=name, discovery_complete=resolution.complete, outcomes=outcomes)
 
 
 def _index_one_branch(

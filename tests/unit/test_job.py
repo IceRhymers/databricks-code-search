@@ -102,6 +102,7 @@ class _GitHub:
         missing: set[str] | None = None,
         files: dict[str, bytes] | None = None,
         branches: dict[str, list[str]] | None = None,
+        branches_fail: set[str] | None = None,
     ) -> None:
         self.enumerations = enumerations or {}
         self.missing = missing or set()
@@ -109,6 +110,9 @@ class _GitHub:
         # full_name -> branch names, for the /branches endpoint. A repo not
         # listed here answers with an empty branch list.
         self.branches = branches or {}
+        # full_name entries here answer the /branches endpoint with a 500,
+        # exercising the complete-or-raise contract at the job level (#61 AC4).
+        self.branches_fail = branches_fail or set()
         # Appended to from worker threads under fan-out; list.append is atomic,
         # so the contents are safe even though the ORDER is not deterministic.
         self.paths: list[str] = []
@@ -142,6 +146,8 @@ class _GitHub:
                 sha = f"sha_{repo}" if ref == "main" else f"sha_{repo}_{ref}"
                 return httpx.Response(200, json={"sha": sha})
             if parts[3] == "branches":
+                if f"{org}/{repo}" in self.branches_fail:
+                    return httpx.Response(500)
                 names = self.branches.get(f"{org}/{repo}", [])
                 return httpx.Response(200, json=[{"name": n} for n in names])
             if parts[3] == "tarball":
@@ -880,6 +886,125 @@ def test_one_branchs_failure_does_not_stop_the_repos_other_branches() -> None:
 
     assert code == 1  # a genuine failure DOES fail the run
     assert sorted(seen) == ["feature", "main"]
+
+
+# --- #61: reconciliation-safe branch discovery (BranchResolution / RepoOutcome) ---
+
+
+@pytest.mark.unit
+def test_index_one_inner_reports_discovery_complete_for_a_normal_run() -> None:
+    """No branches: configured -> the fast path, always complete."""
+    from indexer.job import _index_one_inner
+    from indexer.resolve import RepoEntry
+
+    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+        outcome = _index_one_inner(
+            RepoEntry(name="acme/widgets", branch_globs=frozenset()),
+            started=time.monotonic(),
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=_RecordingIndex(),
+            cfg=Settings(semantic_enabled=False),
+            embed_fn=None,
+            stamps={},
+        )
+    assert outcome.name == "acme/widgets"
+    assert outcome.discovery_complete is True
+    assert [o.branch for o in outcome.outcomes] == ["main"]
+
+
+@pytest.mark.unit
+def test_index_one_inner_reports_discovery_incomplete_when_capped() -> None:
+    """More matching branches than SOFT_BRANCH_CAP -> discovery_complete is False."""
+    from indexer.branches import SOFT_BRANCH_CAP
+    from indexer.job import _index_one_inner
+    from indexer.resolve import RepoEntry
+
+    extra = [f"b{i:02d}" for i in range(SOFT_BRANCH_CAP + 5)]
+    github = _GitHub(branches={"acme/widgets": ["main", *extra]})
+    idx = _RecordingIndex()
+    with httpx.Client(transport=httpx.MockTransport(github)) as client:
+        outcome = _index_one_inner(
+            RepoEntry(name="acme/widgets", branch_globs=frozenset({"*"})),
+            started=time.monotonic(),
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=idx,
+            cfg=Settings(semantic_enabled=False),
+            embed_fn=None,
+            stamps={},
+        )
+    assert outcome.discovery_complete is False
+    assert len(outcome.outcomes) == SOFT_BRANCH_CAP
+
+
+@pytest.mark.unit
+def test_index_one_inner_default_flip_mirror_is_complete() -> None:
+    """AC3 mirrored at the job level: an unmatched retired branch does not affect completeness.
+
+    Distinct from the cap-overflow case above: here nothing was dropped by the cap
+    -- "master" simply never matched the glob -- so completeness stays True.
+    """
+    from indexer.job import _index_one_inner
+    from indexer.resolve import RepoEntry
+
+    github = _GitHub(branches={"acme/widgets": ["main", "master"]})
+    idx = _RecordingIndex()
+    with httpx.Client(transport=httpx.MockTransport(github)) as client:
+        outcome = _index_one_inner(
+            RepoEntry(name="acme/widgets", branch_globs=frozenset({"main"})),
+            started=time.monotonic(),
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=idx,
+            cfg=Settings(semantic_enabled=False),
+            embed_fn=None,
+            stamps={},
+        )
+    assert [o.branch for o in outcome.outcomes] == ["main"]
+    assert outcome.discovery_complete is True
+
+
+@pytest.mark.unit
+def test_run_indexes_kept_branches_and_logs_reconciliation_blocked_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Truncation is not a failure: the run still exits 0 and indexes the kept branches,
+    while the reconciliation-blocked warning is still visible in the run's own log."""
+    from indexer.branches import SOFT_BRANCH_CAP
+
+    extra = [f"b{i:02d}" for i in range(SOFT_BRANCH_CAP + 5)]
+    idx = _RecordingIndex()
+    github = _GitHub(branches={"acme/widgets": ["main", *extra]})
+    with caplog.at_level(logging.WARNING, logger="indexer.branches"):
+        code = _run(_config(repos=["acme/widgets"], branches=["*"]), idx, github=github)
+    assert code == 0
+    assert len(idx.calls) == SOFT_BRANCH_CAP  # truncated set still gets indexed
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "acme/widgets" in message
+    assert "incomplete" in message.lower()
+    assert "reconciliation" in message.lower()
+    assert "blocked" in message.lower()
+
+
+@pytest.mark.unit
+def test_branch_listing_failure_fails_the_repo_and_never_calls_index_fn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC4: a branch-listing API failure must fail the WHOLE repo, never return a
+    silently short branch list -- a truncated-but-unflagged list would be wrongly
+    trusted as complete reconciliation evidence."""
+    idx = _RecordingIndex()
+    github = _GitHub(branches_fail={"acme/widgets"})
+    with caplog.at_level(logging.ERROR, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"], branches=["*"]), idx, github=github)
+    assert code == 1
+    assert idx.calls == []
+    assert github.tarball_requests == []
+    assert "failed to index acme/widgets" in caplog.text
 
 
 # --- Step 5: bounded fan-out ------------------------------------------------
