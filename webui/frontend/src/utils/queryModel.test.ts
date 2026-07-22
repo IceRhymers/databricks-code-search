@@ -12,8 +12,8 @@ describe("recognize", () => {
   it.each([
     "repo:acme lang:go foo",
     "",
-    "-repo:acme",
     "Repo:acme",
+    "foo -",
     "case:yes repo:acme foo",
     "repo:acme repo:widgets",
     "repo:acme branch:main foo",
@@ -43,6 +43,12 @@ describe("recognize", () => {
     "content:x",
     "r:foo",
     "case:maybe",
+    "-foo",
+    "-repo:acme",
+    "-foo bar",
+    "-(foo bar)",
+    "--foo",
+    "foo -bar",
   ])("classifies %j as unsafe", (query) => {
     expect(recognize(query).safe).toBe(false);
   });
@@ -52,10 +58,28 @@ describe("recognize", () => {
     expect(model).toEqual({ safe: true, source: "", atoms: [] });
   });
 
-  it("treats a leading '-repo:' as a content atom, not a repo filter", () => {
-    const model = recognize("-repo:acme");
-    expect(model.safe).toBe(true);
-    if (model.safe) expect(model.atoms).toEqual([{ field: null, value: "-repo:acme", start: 0, end: 10 }]);
+  it("bails to unsafe on a token-initial '-' (negation) on any operand, not just the first", () => {
+    // A leading '-' parses to a Not(...) node on the Python side; its structure a flat
+    // atom-rewrite cannot represent, so the whole query is unsafe -- and this holds for a '-'
+    // beginning ANY token, not only i === 0.
+    expect(recognize("-repo:acme").safe).toBe(false);
+    expect(recognize("foo -bar").safe).toBe(false);
+    expect(recognize("-(foo bar)").safe).toBe(false);
+    expect(recognize("--foo").safe).toBe(false);
+  });
+
+  it("keeps a non-negating '-' (at EOF, before whitespace or ')') safe as a literal", () => {
+    // The compatibility-preserving fallthrough: a '-' whose next char is missing, whitespace,
+    // or ')' is NOT negation -- it stays a literal bareword, mirroring the Python scanner.
+    const trailing = recognize("foo -");
+    expect(trailing.safe).toBe(true);
+    if (trailing.safe) {
+      expect(trailing.atoms).toEqual([
+        { field: null, value: "foo", start: 0, end: 3 },
+        { field: null, value: "-", start: 4, end: 5 },
+      ]);
+    }
+    expect(recognize("a - b").safe).toBe(true);
   });
 
   it("treats an uppercase 'Repo:' as a content atom, not a repo filter", () => {
@@ -134,6 +158,13 @@ describe("deriveChips", () => {
 
   it("disables everything for an unsafe query", () => {
     const chips = deriveChips(recognize("(foo)"), REPOS);
+    expect(chips).toEqual({ editable: false, repoActive: null, langActive: null, branch: { available: false, options: [], active: null } });
+  });
+
+  it("disables everything for a negated query, even one naming a known repo", () => {
+    // Negation makes the whole query unsafe (see `recognize`'s token-initial '-' check), so
+    // chips must not surface a stale repoActive/branch group from before the '-' was typed.
+    const chips = deriveChips(recognize("-repo:acme foo"), REPOS);
     expect(chips).toEqual({ editable: false, repoActive: null, langActive: null, branch: { available: false, options: [], active: null } });
   });
 

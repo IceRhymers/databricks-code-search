@@ -76,6 +76,9 @@ _UNSUPPORTED_ATOMS: dict[TokenKind, str] = {
     TokenKind.COMMIT: "commit:",
     TokenKind.CASE: "case:",
     TokenKind.REGEX: "regex",
+    # Lexical negation has no meaning in a natural-language semantic query: reject loudly rather
+    # than silently flip the query's meaning or treat the leading '-' as prose.
+    TokenKind.NOT: "-",
 }
 
 
@@ -102,7 +105,7 @@ class SemanticFilters:
 class UnsupportedSemanticAtomError(ValueError):
     """A semantic query contained a filter atom with no semantic-search meaning.
 
-    ``atom`` is one of ``"sym:"``, ``"case:"``, ``"commit:"``, ``"regex"`` (matching
+    ``atom`` is one of ``"sym:"``, ``"case:"``, ``"commit:"``, ``"regex"``, ``"-"`` (matching
     :data:`_UNSUPPORTED_ATOMS`'s values); ``position`` is the 0-based column of the offending
     token in the original query string, mirroring :class:`app.query.parser.QueryParseError`.
     """
@@ -136,9 +139,10 @@ def split_semantic_query(query: str) -> SemanticFilters:
     Reuses :func:`tokenize` (scan errors -- an unterminated quote/regex, an empty field value,
     an invalid ``commit:``/``case:`` value -- propagate as :class:`QueryParseError`, unchanged).
     ``REPO``/``PATH``/``LANG``/``BRANCH`` tokens become filters; ``SYMBOL``/``COMMIT``/``CASE``/
-    ``REGEX`` tokens raise :class:`UnsupportedSemanticAtomError`; everything else (``SUBSTRING``,
-    ``OR``, ``LPAREN``, ``RPAREN``) stays untouched in the residual -- see the module docstring's
-    two worked examples for the ``or``/parens-are-prose and absolute-path/regex cases.
+    ``REGEX``/``NOT`` tokens raise :class:`UnsupportedSemanticAtomError` (``NOT`` -> atom ``"-"``);
+    everything else (``SUBSTRING``, ``OR``, ``LPAREN``, ``RPAREN``) stays untouched in the
+    residual -- see the module docstring's two worked examples for the ``or``/parens-are-prose
+    and absolute-path/regex cases.
     """
     tokens = tokenize(query)
 

@@ -462,6 +462,85 @@ def test_sym_leg_timeout_suppresses_no_content_atom(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.unit
+def test_negative_only_query_sets_no_content_atom_and_echoes_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fully-negated query (`-foo`) is no_content_atom=True exactly like a filter-only query
+    # (issue #70's contract decision -- one flag covers both shapes); the echoed `query` field
+    # is how a caller recovers which one it actually was.
+    monkeypatch.setattr(service, "grep_search", lambda *a, **k: _grep(no_content_atom=True))
+    monkeypatch.setattr(service, "symbol_search", lambda *a, **k: _no_sym())
+
+    payload = main._search_code_payload(_FakeEngine([]), _cfg(), "-foo", 50)
+
+    assert payload["query"] == "-foo"
+    assert payload["no_content_atom"] is True
+    assert payload["zero_width_only_atoms"] is False
+    assert payload["file_count"] == 0
+
+
+@pytest.mark.unit
+def test_sym_wanted_minus_sym_ignored_projects_only_affirmative_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC4 payload-shape traceability: `sym:Wanted -sym:Ignored` merges only the affirmative
+    # symbol's definition into the envelope; the real collector-level proof that a negated
+    # sym: atom contributes nothing lives in test_symbols_search.py's walker tests -- symbol
+    # search is mocked here, so this pins the merge/projection plumbing, not the collector.
+    monkeypatch.setattr(service, "grep_search", lambda *a, **k: _grep(no_content_atom=True))
+    monkeypatch.setattr(
+        service,
+        "symbol_search",
+        lambda *a, **k: _sym_result(
+            SymbolMatch(
+                repo_id=7,
+                path="src/handler.go",
+                lang="go",
+                content_sha="deadbeef",
+                branches=("main",),
+                name="Wanted",
+                kind="function",
+                start_line=2,
+            )
+        ),
+    )
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "sym:Wanted -sym:Ignored", 50)
+
+    assert payload["no_content_atom"] is False
+    (file,) = payload["files"]
+    assert file["matches"] == [
+        {
+            "line": 2,
+            "text": "",
+            "byte_ranges": [],
+            "symbols": [{"name": "Wanted", "kind": "function"}],
+        }
+    ]
+    projected_names = [s["name"] for m in file["matches"] for s in m.get("symbols", [])]
+    assert "Ignored" not in projected_names
+
+
+@pytest.mark.unit
+def test_foo_minus_bar_payload_shape_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Payload-shape / query-echo traceability, NOT the highlight-correctness proof: grep is
+    # mocked in this module, so the fact that a real `-bar` never produces a highlight pattern
+    # is pinned at the pure-helper level by test_grep.py::
+    # test_negated_content_atom_contributes_no_highlight_pattern. This test only pins that the
+    # envelope carries the query through unchanged and shapes the (mocked) grep result normally
+    # for a query that happens to contain an exclusion.
+    monkeypatch.setattr(service, "grep_search", lambda *a, **k: _grep_result())
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "foo -bar", 50)
+
+    assert payload["query"] == "foo -bar"
+    assert payload["no_content_atom"] is False
+    assert payload["file_count"] == 1
+
+
+@pytest.mark.unit
 def test_zero_width_with_sym_answer_is_suppressed(monkeypatch: pytest.MonkeyPatch) -> None:
     # The `sym:Handler /^/` shape: zero-width-only to grep, yet the symbol leg folds real
     # matches into files. Flagging a query that RETURNED RESULTS is the exact failure mode

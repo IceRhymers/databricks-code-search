@@ -2,10 +2,10 @@
 // language the backend parses (app/query/parser.py). This is NOT a full parser -- it
 // mirrors just enough of app/query/parser.py:tokenize (lines 249-300) to classify a query
 // as either "safe" (a flat conjunction of field:value / bareword atoms the chip UI can
-// edit structurally) or "unsafe" (contains parens, OR, quotes, or regex -- anything whose
-// structure a naive atom-rewrite could silently corrupt). Unsafe queries are still valid
-// zoekt queries; they are just left as opaque free text for the chips to disable rather
-// than edit. See docs/runbooks/webui.md for the user-facing asymmetry this produces.
+// edit structurally) or "unsafe" (contains parens, OR, quotes, regex, or negation ('-') --
+// anything whose structure a naive atom-rewrite could silently corrupt). Unsafe queries are
+// still valid zoekt queries; they are just left as opaque free text for the chips to disable
+// rather than edit. See docs/runbooks/webui.md for the user-facing asymmetry this produces.
 import type { RepoInfo } from "../api/client";
 
 export type AtomField = "repo" | "file" | "lang" | "sym" | "branch" | "case" | "commit";
@@ -53,8 +53,9 @@ function readBareValue(source: string, start: number): [string, number] {
 
 /**
  * Classify `query` as a flat AND of atoms ("safe") or bail ("unsafe") on the first
- * paren, OR, quote, or regex delimiter -- mirroring app/query/parser.py:tokenize's scan
- * but refusing (rather than parsing) anything with real boolean/grouping structure.
+ * paren, OR, quote, regex, or negation ('-') delimiter -- mirroring
+ * app/query/parser.py:tokenize's scan but refusing (rather than parsing) anything with real
+ * boolean/grouping/negation structure.
  */
 export function recognize(query: string): QueryModel {
   const atoms: Atom[] = [];
@@ -71,6 +72,14 @@ export function recognize(query: string): QueryModel {
     if (c === "(" || c === ")") return { safe: false };
     // A regex or quoted literal in operand position -- unsafe (chips never edit these).
     if (c === "/" || c === '"') return { safe: false };
+    // A token-initial '-' is lexical negation on the Python side (parses to a Not(...) node),
+    // whose structure a flat atom-rewrite cannot represent -- unsafe. Mirror the Python
+    // scanner's exact trigger: the next char must exist, be non-whitespace, and not be ')'.
+    // Any other '-' (at EOF, or before whitespace/')' ) is a literal and falls through. This
+    // runs at every token start (not just i === 0), so a leading '-' on ANY operand triggers it.
+    if (c === "-" && i + 1 < n && !isWhitespace(query[i + 1]) && query[i + 1] !== ")") {
+      return { safe: false };
+    }
 
     const start = i;
     // Mirror tokenize's field-prefix scan: leading [a-z]+ followed by ':'.

@@ -21,8 +21,12 @@ class QueryTooBroadError(Exception):
 def reraise_or_query_too_broad(error: OperationalError) -> NoReturn:
     """Map a Postgres statement_timeout cancellation to :class:`QueryTooBroadError`.
 
-    Any other :class:`~sqlalchemy.exc.OperationalError` (e.g. an invalid POSIX regex bound
-    into a ``sym:``/content pattern) is re-raised unchanged.
+    Any other :class:`~sqlalchemy.exc.OperationalError` is re-raised unchanged. Note an
+    invalid POSIX regex (e.g. ``/[/``) does NOT reach here at all: Postgres raises
+    ``InvalidRegularExpression``, a Data Exception that SQLAlchemy surfaces as
+    ``sqlalchemy.exc.DataError`` -- a sibling class this function is never even called
+    for, since the ``except OperationalError`` at each call site does not match it (see
+    ``app/search/grep.py``'s NOT-RE2 caveat).
     """
     if isinstance(error.orig, psycopg.errors.QueryCanceled):
         raise QueryTooBroadError(

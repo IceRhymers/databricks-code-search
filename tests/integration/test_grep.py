@@ -20,9 +20,12 @@ from typing import NamedTuple
 
 import pytest
 from sqlalchemy import Connection, insert, text
+from sqlalchemy.exc import DataError
 
 from app.db.client import create_db_engine
 from app.db.models import Base, File, Repo
+from app.query.compiler import compile_query
+from app.query.parser import parse, resolve_case
 from app.search.errors import QueryTooBroadError
 from app.search.grep import FileCursor, GrepResult, grep_search
 from indexer.hashing import content_sha
@@ -251,6 +254,24 @@ def test_healthy_query_does_not_raise_query_too_broad(seeded: Seeded) -> None:
     result = grep_search(seeded.conn, "/f.o/")
     assert result.files
     assert result.truncated is False
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(
+    raises=DataError,
+    strict=False,
+    reason="Follow-up issue #75 (filed while scoping #70's polarity-awareness work). A "
+    "Postgres-invalid POSIX regex (e.g. `[`) reaches the DB raw regardless of polarity -- "
+    "the compiler never validates a Regex atom's pattern, negated or not -- and Postgres's "
+    "InvalidRegularExpression is a Data Exception, which SQLAlchemy surfaces as "
+    "sqlalchemy.exc.DataError: a sibling class reraise_or_query_too_broad's "
+    "`except OperationalError` does not catch, so it propagates uncaught as an unhandled "
+    "fault instead of a recoverable payload field (see app/search/grep.py's NOT-RE2 "
+    "caveat). Asserts the DESIRED future behavior (no uncaught exception) so a fix makes "
+    "this XPASS (non-gating here) rather than silently rotting as a stale pin.",
+)
+def test_negated_broken_regex_reaching_postgres_is_an_unhandled_fault(seeded: Seeded) -> None:
+    grep_search(seeded.conn, "-/[/ foo")
 
 
 # ----------------------------------------------------------------- 7. byte cap -> truncated
@@ -556,3 +577,105 @@ def test_pagination_page_two_stable_under_interleaved_unrelated_repo_write(seede
     assert "src/handler.go" not in _paths(page2)
     assert "src/util.go" not in _paths(page2)
     assert _paths(page2) == ["pkg/note.py", "z.go"]
+
+
+# ------------------------------------------------------------------- 12. negation (issue #70)
+#
+# The seeded corpus has no "bar" anywhere, so `-bar` alone never restricts candidacy in these
+# tests -- it isolates the negation-specific behavior (no highlight pattern, shape flags,
+# cap/timeout interaction) from also having to reason about which files an exclusion drops.
+
+
+@pytest.mark.integration
+def test_negative_content_atom_excludes_matching_file_end_to_end(seeded: Seeded) -> None:
+    both = "foo and bar together\n"
+    _insert_file(seeded.conn, seeded.acme_id, "src/z_both.go", lang="go", content=both)
+    seeded.conn.commit()
+
+    result = grep_search(seeded.conn, "foo -bar")
+    assert "src/z_both.go" not in _paths(result)
+    assert set(_paths(result)) == {"src/handler.go", "src/util.go", "pkg/note.py"}
+
+
+@pytest.mark.integration
+def test_zero_width_only_atoms_true_from_positive_leaf_beside_negation(seeded: Seeded) -> None:
+    result = grep_search(seeded.conn, "/^/ -bar")
+    assert result.zero_width_only_atoms is True
+    assert result.no_content_atom is False
+    assert result.regex_incompatible is False
+    assert result.files == ()
+
+
+@pytest.mark.integration
+def test_negative_only_query_returns_no_files_with_no_content_atom(seeded: Seeded) -> None:
+    result = grep_search(seeded.conn, "-bar", cursor=None)
+    assert result.files == ()
+    assert result.no_content_atom is True
+    assert result.truncated is False
+    assert result.next_cursor is None
+
+
+@pytest.mark.integration
+def test_row_cap_with_exclusion_still_truncates(seeded: Seeded) -> None:
+    # 3 real files match "foo -bar" (handler.go, util.go, note.py); row_limit=1 caps it.
+    result = grep_search(seeded.conn, "foo -bar", row_limit=1)
+    assert result.truncated is True
+    assert result.truncation_reason == "row_cap"
+
+
+@pytest.mark.integration
+def test_byte_cap_with_exclusion_still_truncates(seeded: Seeded) -> None:
+    result = grep_search(seeded.conn, "foo -bar", max_content_bytes=10)
+    assert result.truncated is True
+    assert result.truncation_reason == "byte_cap"
+
+
+@pytest.mark.integration
+def test_multibyte_byte_ranges_accurate_with_a_noop_exclusion(seeded: Seeded) -> None:
+    # Same corpus/assertions as test_grep_multibyte_byte_ranges_are_utf8_accurate, with a
+    # harmless `-bar` tacked on: exclusion plumbing must not perturb UTF-8 byte offsets.
+    result = grep_search(seeded.conn, "foo -bar")
+    (util,) = [f for f in result.files if f.path == "src/util.go"]
+    (m,) = util.line_matches
+    assert m.line_number == 1
+    (span,) = m.byte_ranges
+    start, end = span
+    assert m.line_text.encode("utf-8")[start:end] == b"foo"
+
+
+@pytest.mark.integration
+def test_tiny_statement_timeout_with_exclusion_raises_query_too_broad(seeded: Seeded) -> None:
+    # Mirrors test_tiny_statement_timeout_raises_query_too_broad: the timeout guard must still
+    # fire when the query also carries an exclusion (the SQL predicate is `... AND NOT (...)`,
+    # not a different code path).
+    blob = "a" * (2 * 1024 * 1024)
+    for i in range(8):
+        _insert_file(seeded.conn, seeded.acme_id, f"src/blob{i}.txt", lang=None, content=blob)
+    seeded.conn.commit()
+    with pytest.raises(QueryTooBroadError):
+        grep_search(seeded.conn, "/zq/ -bar", statement_timeout_ms=1)
+
+
+@pytest.mark.integration
+def test_negated_content_predicate_does_not_resurrect_null_content_row(seeded: Seeded) -> None:
+    # Three-valued SQL (README's documented contract): a row with NULL `content` matches
+    # NEITHER `content:foo` NOR `-content:foo`. A NAIVE two-valued reading of "-foo" ("doesn't
+    # contain foo") would wrongly treat a NULL-content row as a match; prove the compiled
+    # predicate excludes it instead -- both at grep's own layer and directly against the
+    # candidate SQL (grep's `content or ""` coercion would hide the row anyway once `patterns`
+    # is empty, so the candidate-SQL check is the one that actually proves this).
+    _insert_file(seeded.conn, seeded.acme_id, "src/nullish.go", lang="go", content=None)
+    seeded.conn.commit()
+
+    result = grep_search(seeded.conn, "lang:go -foo")
+    assert result.files == ()
+    assert result.no_content_atom is True
+
+    query = "lang:go -foo"
+    node = parse(query)
+    stmt = compile_query(node, limit=200, case_sensitive=resolve_case(query))
+    candidate_paths = {row.path for row in seeded.conn.execute(stmt).all()}
+    assert "src/nullish.go" not in candidate_paths
+    # The two real go files both contain "foo" -> excluded by -foo, not by the null check --
+    # so candidate_paths is empty for an entirely different (and also correct) reason.
+    assert candidate_paths == set()

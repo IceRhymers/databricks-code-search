@@ -32,6 +32,7 @@ from app.query.parser import (
     CommitFilter,
     LangFilter,
     Node,
+    Not,
     Or,
     PathFilter,
     QueryParseError,
@@ -151,15 +152,22 @@ def _query_has_symbol_atom(node: Node) -> bool:
 def _collect_branch_filters(node: Node) -> frozenset[str]:
     """Collect every ``branch:`` value in ``node``, under any ``And``/``Or`` nesting.
 
-    An empty ``frozenset`` means the query carries no ``branch:`` filter anywhere. This
-    mirrors :func:`app.query.compiler._has_branch_filter`'s tree walk, but -- unlike this
-    module's own :func:`_query_has_symbol_atom` -- it is deliberately EXHAUSTIVE: the tail is
-    ``assert_never(node)`` rather than a catch-all ``case _: return frozenset()``, so a future
-    :data:`Node` variant is a mypy error here, not a silently-empty result.
+    An empty ``frozenset`` means the query carries no affirmative ``branch:`` filter anywhere
+    (negated subtrees are skipped -- see the ``Not`` case). Deliberately exhaustive -- unlike
+    this module's own :func:`_query_has_symbol_atom` -- with an ``assert_never(node)`` tail
+    rather than a catch-all ``case _: return frozenset()``, so a future :data:`Node` variant is
+    a mypy error here, not a silently-empty result.
     """
     match node:
         case BranchFilter(value=v):
             return frozenset({v})
+        case Not():
+            # Skip negated subtrees entirely (never recurse): this set drives permalink-branch
+            # selection (_select_permalink_branch) and the branch commit-metadata lookup, both of
+            # which mean "branches the author affirmatively scoped to". A `-branch:x` is an
+            # exclusion, not a selection -- folding x in here would wrongly make x an eligible
+            # permalink branch and fire a spurious repo_branches lookup for it.
+            return frozenset()
         case And(children=children) | Or(children=children):
             return frozenset().union(*(_collect_branch_filters(c) for c in children))
         case (
@@ -188,6 +196,11 @@ def _collect_commit_filters(node: Node) -> frozenset[str]:
     match node:
         case CommitFilter(value=v):
             return frozenset({v})
+        case Not():
+            # Skip negated subtrees (same rationale as _collect_branch_filters): a `-commit:x` is
+            # an exclusion predicate, not a reverse-lookup scope -- collecting x here would fire
+            # commit resolution and the scoped-search path for a commit the query means to EXCLUDE.
+            return frozenset()
         case And(children=children) | Or(children=children):
             return frozenset().union(*(_collect_commit_filters(c) for c in children))
         case (
@@ -215,6 +228,10 @@ def _has_content_atom(node: Node) -> bool:
     match node:
         case Substring() | Regex() | SymbolFilter():
             return True
+        case Not(child=child):
+            # A negated content atom is still content-bearing: `commit:abc -foo` is a scoped
+            # search (excluding foo), not a bare reverse-lookup, so recurse into the child.
+            return _has_content_atom(child)
         case And(children=children) | Or(children=children):
             return any(_has_content_atom(child) for child in children)
         case RepoFilter() | PathFilter() | LangFilter() | BranchFilter() | CommitFilter():
@@ -360,8 +377,13 @@ def _search_envelope(
 ) -> dict[str, Any]:
     """Build the pinned ``search_code`` envelope (zoekt fields + additive signal fields).
 
-    ``no_content_atom`` -- the query carried no content atom at all (e.g. ``lang:go``), so
-    there was nothing to highlight and zero files is a shape outcome, not a true negative.
+    ``no_content_atom`` -- the query carried no affirmative content atom to highlight, so zero
+    files is a shape outcome, not a true negative. This covers two structurally different
+    queries identically: a filter-only query (e.g. ``lang:go`` alone -- nothing to highlight)
+    and a fully-negated query (e.g. ``-foo`` alone -- a content atom exists but excludes rather
+    than highlights). Neither has anything to highlight, so one flag suffices for both; the
+    echoed ``query`` field is what a caller uses to recover which one it was, not a second key
+    (see :func:`app.search.grep._no_content_atom`).
     ``zero_width_only_atoms`` -- content atoms were present but every one provably matches
     zero-width (e.g. ``/^/``), so every span was dropped. Mutually exclusive by construction.
 
@@ -438,6 +460,10 @@ def search_code_payload(
     leg answered. ``sym:Handler`` is filter-only to grep but fully answered here, and
     ``sym:Handler /^/`` is zero-width-only to grep yet returns files -- flagging either would
     contradict the results sitting beside it and train agents to ignore the signal.
+    ``no_content_atom`` itself does not distinguish filter-only from fully-negated: ``lang:go``
+    and ``-foo`` both set it, and both are equally suppressed here when the symbol leg answers
+    (e.g. ``sym:Handler -foo``); a caller recovers which shape it was from the echoed ``query``
+    field.
 
     ``sym_answers`` treats an unknown symbol leg (``sym_result is None``, i.e. the leg timed
     out) as answering, which is a proof rather than a precaution: ``None`` arises only from
@@ -726,17 +752,19 @@ def search_code_payload(
     next_cursor_out: str | None | _Unset = _UNSET
     if pagination_mode:
         if run_symbol_leg and result.no_content_atom:
-            # Filter-only query on page 1 (e.g. a `sym:` atom with no content atom alongside
-            # it): grep's `files` is ALWAYS empty here regardless of how many CANDIDATE files
-            # the filter matched (there is no content pattern to highlight), but grep's own
-            # candidate scan can still hit `row_limit` and row-cap when the filter matches many
-            # files -- e.g. a `sym:` name shared by >= row_limit files. Left alone, that still
+            # Page 1, no affirmative content atom to highlight -- either a filter-only query
+            # (e.g. a `sym:` atom with no content atom alongside it) or a fully-negated one
+            # (e.g. `-foo` alone): grep's `files` is ALWAYS empty here regardless of how many
+            # CANDIDATE files the filter/exclusion matched (there is no content pattern to
+            # highlight), but grep's own candidate scan can still hit `row_limit` and row-cap
+            # when the query matches many files -- e.g. a `sym:` name shared by >= row_limit
+            # files, or `-foo` excluding a rare term from a huge corpus. Left alone, that still
             # sets a non-null `next_cursor`; the symbol leg only ever folds in on page 1 too
             # (page-1-only, see above), so every continuation page would re-run the
             # same filter-only grep scan, find nothing to highlight, and hand back ANOTHER
             # non-null cursor -- an unbounded sequence of empty pages. Suppressed here instead:
-            # a filter-only query is always exactly one page, with any real "there's more"
-            # signal (e.g. more matching symbols than fit) already carried by
+            # a query with no affirmative content atom is always exactly one page, with any real
+            # "there's more" signal (e.g. more matching symbols than fit) already carried by
             # `truncated`/`truncation_reason`, not `next_cursor`.
             next_cursor_out = None
         else:

@@ -185,11 +185,32 @@ a b OR c d          ==  (a AND b) OR (c AND d)
 repo:acme lang:go /Foo.*Bar/
 ```
 
-Not supported in V1. Most of these raise; the first two are silent, which is the more
-dangerous case:
+### Negation
 
-- **Negation.** `-foo` parses as a literal substring, with no error. If negation ships
-  later, queries written today will silently flip meaning.
+A `-` prefixing a term or group **negates** it: `-foo` excludes files matching `foo`,
+`-repo:acme` excludes the `acme` repo, `-/Foo/` excludes the regex, and `-(a b)` negates a
+whole group. `-` applies to any field (`-branch:x`, `-lang:go`, …). It binds to the next
+term only (tighter than the implicit AND), so `-a b` is `(NOT a) AND b`; double negation is
+kept as written (`--foo` is `NOT NOT foo`, not simplified). A `-` is negation only when it
+starts a term with something to negate right after it — a `-` at end of input, before a
+space, or before `)` (e.g. `a - b`, `foo -`, `(a -)`) stays a literal, as do interior
+dashes (`foo-bar`) and dashes inside field values.
+
+Negation on nullable columns follows standard three-valued SQL: a row with NULL `content`
+matches **neither** `content:foo` nor `-content:foo`. A negated `branch:`/`commit:` is an
+*exclusion*, not a scope selection, so it does **not** opt the query out of default-branch
+scoping — `-branch:x foo` still searches the default branch, just excluding `x`.
+
+> **Compatibility break.** Before this, a leading `-foo` was a literal substring. A
+> bookmarked or stored `-foo` query now means negation. To search for a literal leading
+> dash, quote it: `"-foo"` parses as the substring `-foo`.
+
+Negation is lexical-search only (`search_code` and the web UI's Search page); a leading `-`
+is rejected in semantic search (`semantic_search` and the web UI's Semantic page) — remove it
+or quote the term to search it as text.
+
+Unsupported syntax. Most of these raise; the first is silent and therefore more dangerous:
+
 - **`AND` as a keyword.** `a and b` silently searches for the literal word `and`.
 - **`content:`**, and the single-letter aliases `r` `f` `l` `b` `c` `s` — reserved, and
   raise a parse error. (`branch:` is no longer reserved — see the field table above.)

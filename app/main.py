@@ -215,9 +215,12 @@ async def search_code(
     """Search the indexed corpus with a zoekt-style query; returns file-grouped line matches.
 
     Supports ``repo:``/``file:``/``lang:``/``sym:``/``branch:``/``commit:`` filters, ``case:yes``,
-    boolean AND (whitespace) / OR, and ``/regex/`` patterns. Without ``branch:``/``commit:`` (or
-    the params below), results are scoped to each repo's default branch. ``branch:<name>``
-    restricts to files whose indexed branches include ``<name>`` (exact match, not a glob/regex).
+    boolean AND (whitespace) / OR, ``/regex/`` patterns, and negation: a ``-`` prefixing any
+    term or field (``-foo``, ``-repo:acme``, ``-/regex/``, ``-(a b)``) EXCLUDES it -- files whose
+    compiled query matches an excluded term are dropped from candidacy. Without ``branch:``/
+    ``commit:`` (or the params below), results are scoped to each repo's default branch.
+    ``branch:<name>`` restricts to files whose indexed branches include ``<name>`` (exact match,
+    not a glob/regex).
 
     ``commit:<hash>`` scopes to whatever (repo, branch) heads are indexed at that git commit --
     a full 40-char SHA or a hex prefix of >= 7 chars (matched git-style against
@@ -232,8 +235,13 @@ async def search_code(
     server maximum). Recoverable conditions surface as fields (``query_parse_error``,
     ``query_too_broad``, ``truncated``, ``regex_incompatible``, ``no_content_atom``,
     ``zero_width_only_atoms``). The last two explain an empty result that is NOT a true negative:
-    the query carried no content atom to highlight (e.g. ``lang:go`` alone) or every atom it
-    carried matches zero-width (e.g. ``/^/``).
+    ``no_content_atom`` means the query carried no affirmative content atom to highlight --
+    either a filter-only query (e.g. ``lang:go`` alone) or one that is entirely negated (e.g.
+    ``-foo`` alone: an exclusion is never a highlight) -- and ``zero_width_only_atoms`` means
+    every atom it carried matches zero-width (e.g. ``/^/``). A query mixing content with an
+    exclusion (e.g. ``foo -bar``) highlights only the affirmative term; excluded terms never
+    appear as matches. ``no_content_atom`` does not distinguish "no atom at all" from "fully
+    negated" -- recover which one it was from the echoed ``query`` field, if it matters.
     """
     lc = ctx.request_context.lifespan_context
     engine, cfg = lc["engine"], lc["config"]
@@ -260,13 +268,16 @@ async def semantic_search(
     filter-then-rank, never post-filtered, so a highly selective filter narrows the candidate
     pool the ranking draws from, not just the results shown.
 
-    ``sym:``, ``case:``, ``commit:``, and bare ``/regex/`` atoms have no meaning here and are
-    REJECTED (``unsupported_filter`` in the payload, naming the atom, with a remedy in
-    ``reason``): ``sym:``/``commit:`` -> symbol/commit-scoped search is lexical-only, use
-    :func:`search_code`; ``case:`` -> case sensitivity does not apply to semantic ranking,
-    remove it; a bare ``/.../`` -> quote the term to search it as literal text (this also
-    catches innocent absolute-path prose like ``/etc/nginx.conf`` -- quote it:
-    ``"/etc/nginx.conf"``). A query that is only filters, or empty/whitespace-only, leaves
+    ``sym:``, ``case:``, ``commit:``, bare ``/regex/``, and lexical negation (a leading ``-``,
+    e.g. ``-foo``) have no meaning here and are REJECTED (``unsupported_filter`` in the payload,
+    naming the atom as ``"-"`` for negation, with a remedy in ``reason``): ``sym:``/``commit:``
+    -> symbol/commit-scoped search is lexical-only, use :func:`search_code`; ``case:`` -> case
+    sensitivity does not apply to semantic ranking, remove it; a bare ``/.../`` -> quote the term
+    to search it as literal text (this also catches innocent absolute-path prose like
+    ``/etc/nginx.conf`` -- quote it: ``"/etc/nginx.conf"``); ``-`` -> exclusion has no meaning
+    for a ranked natural-language query, remove it (this is deterministic and checked BEFORE any
+    embedding or database work -- a negated query is never silently embedded with the ``-``
+    stripped or reinterpreted). A query that is only filters, or empty/whitespace-only, leaves
     nothing to embed and returns ``nothing_to_embed: true`` with no embedding call made.
 
     ``branch`` is sugar for a ``branch:`` atom -- conjunctive with any ``branch:`` atom already

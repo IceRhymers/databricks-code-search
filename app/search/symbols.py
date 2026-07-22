@@ -32,9 +32,12 @@ eligible file's symbols are re-matched with identical semantics.
 
 Semantics (load-bearing, documented, tested):
 
-* A query with NO ``sym:`` atom returns an empty result with ``no_symbol_atom=True`` (there is
-  nothing to project; use ``search_code``/grep for content). This is distinct from a ``sym:``
-  query that simply matched no symbols (``no_symbol_atom=False``, empty ``symbols``).
+* A query with no affirmative ``sym:`` atom to project returns an empty result with
+  ``no_symbol_atom=True``: either no ``sym:`` atom anywhere (there is nothing to project; use
+  ``search_code``/grep for content) or every ``sym:`` atom is negated (``-sym:foo`` alone --
+  an exclusion has no definitions to project either). Both collect zero patterns identically;
+  see :func:`_collect_symbol_patterns`. This is distinct from a ``sym:`` query that simply
+  matched no symbols (``no_symbol_atom=False``, empty ``symbols``).
 * Content atoms narrow which FILES are eligible but never which symbols are returned:
   ``sym:Handler foo`` returns ``Handler`` symbols from files that also contain ``foo`` -- the
   ``foo`` need not be near the definition.
@@ -59,6 +62,7 @@ from app.query.parser import (
     CommitFilter,
     LangFilter,
     Node,
+    Not,
     Or,
     PathFilter,
     Regex,
@@ -94,7 +98,8 @@ class SymbolMatch:
 @dataclass(frozen=True)
 class SymbolResult:
     """Symbol-search result. ``truncated`` flags a row-capped page; ``no_symbol_atom`` marks a
-    query that carried no ``sym:`` atom (empty by construction, not by absence of matches)."""
+    query with no affirmative ``sym:`` atom to project -- none at all, or every one negated
+    (``-sym:foo`` alone) -- empty by construction either way, not by absence of matches."""
 
     symbols: tuple[SymbolMatch, ...]  # in (repo_id, path, content_sha, start_line, name, id) order
     truncated: bool  # candidate-file cap OR symbol-row cap tripped
@@ -106,13 +111,18 @@ class SymbolResult:
 
 
 def _collect_symbol_patterns(node: Node, out: list[str]) -> None:
-    """Append every ``SymbolFilter.name`` in the AST (any And/Or nesting) to ``out``.
+    """Append every affirmative ``SymbolFilter.name`` in the AST (any And/Or nesting) to ``out``.
 
-    All other leaves (substring/regex/repo/path/lang) contribute nothing. Pure -- no DB import.
+    All other leaves (substring/regex/repo/path/lang) contribute nothing. A :class:`Not` subtree
+    is skipped (never recursed into): a ``-sym:foo`` exclusion has no definitions to project, so
+    a `-sym:foo`-only query collects zero patterns -> ``no_symbol_atom=True``. Pure -- no DB
+    import.
     """
     match node:
         case SymbolFilter(name=name):
             out.append(name)
+        case Not():
+            return
         case And(children=children) | Or(children=children):
             for child in children:
                 _collect_symbol_patterns(child, out)

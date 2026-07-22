@@ -331,6 +331,29 @@ def test_continuation_page_without_sym_atom_reports_no_content_atom(
     assert payload["no_content_atom"] is True
 
 
+# ---------------------------------------------------- negative-only cursor suppression (#70)
+
+
+@pytest.mark.unit
+def test_negative_only_page_one_suppresses_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fully-negated query (e.g. `-foo`) is no_content_atom=True at the grep layer exactly like
+    # a filter-only query, and the SAME suppression applies: even if grep's own candidate scan
+    # row-capped (a rare term excluded from a huge corpus can still match >= row_limit files) and
+    # produced a non-null next_cursor, page 1 forces it back to None -- there is nothing to
+    # highlight on any later page either, so continuing would just replay empty pages forever.
+    file_cursor = FileCursor(repo_id=7, path="src/handler.go", content_sha="deadbeef")
+    monkeypatch.setattr(
+        service,
+        "grep_search",
+        lambda *a, **k: _grep(no_content_atom=True, truncated=True, next_cursor=file_cursor),
+    )
+    monkeypatch.setattr(service, "symbol_search", lambda *a, **k: _no_sym())
+
+    payload = service.search_code_payload(_FakeEngine([]), _cfg(), "-foo", 50, cursor=None)
+    assert payload["next_cursor"] is None
+    assert payload["no_content_atom"] is True
+
+
 # ------------------------------------------------------------------------------- misc gating
 
 
@@ -426,3 +449,44 @@ def test_has_content_atom_distinguishes_commit_moods() -> None:
     # ...while a content term (or a sym: atom) flips it to the scoped-search mood.
     assert service._has_content_atom(parse("commit:abc1234 foo")) is True
     assert service._has_content_atom(parse("commit:abc1234 sym:Handler")) is True
+
+
+# ----------------------------------------------------------------- negation (Not) collectors
+
+
+@pytest.mark.unit
+def test_collect_branch_filters_skips_negated_branch() -> None:
+    # A `-branch:x` is an exclusion, not a selection: collecting x here would corrupt
+    # permalink-branch selection and fire a spurious repo_branches lookup. So it is skipped.
+    assert service._collect_branch_filters(parse("-branch:main foo")) == frozenset()
+    # An affirmative branch alongside a negated one still collects only the affirmative value.
+    assert service._collect_branch_filters(parse("branch:main -branch:dev")) == frozenset({"main"})
+
+
+@pytest.mark.unit
+def test_collect_commit_filters_skips_negated_commit() -> None:
+    assert service._collect_commit_filters(parse("-commit:abc1234 foo")) == frozenset()
+    assert service._collect_commit_filters(parse("commit:abc1234 -commit:bbbbbbb")) == frozenset(
+        {"abc1234"}
+    )
+
+
+@pytest.mark.unit
+def test_has_content_atom_recurses_into_negation() -> None:
+    # A negated content atom is still content-bearing: `commit:abc -foo` is a SCOPED search
+    # (excluding foo), not a bare reverse-lookup.
+    assert service._has_content_atom(parse("commit:abc1234 -foo")) is True
+    assert service._has_content_atom(parse("-foo")) is True
+    # A filter alongside a negated content atom is content-bearing too, not just a commit scope.
+    assert service._has_content_atom(parse("lang:go -foo")) is True
+    # A negated pure-filter (no content leaf under the Not) does not manufacture a content atom.
+    assert service._has_content_atom(parse("commit:abc1234 -file:src/")) is False
+
+
+@pytest.mark.unit
+def test_query_has_symbol_atom_excludes_negated_symbol() -> None:
+    # A `-sym:foo`-only query does NOT count as "has a symbol atom" (the symbol leg cannot
+    # answer it), staying consistent with the symbols collector skipping exclusions.
+    assert service._query_has_symbol_atom(parse("-sym:foo")) is False
+    # A positive sym: alongside a negated one still counts.
+    assert service._query_has_symbol_atom(parse("-sym:foo sym:bar")) is True

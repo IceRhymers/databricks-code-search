@@ -165,6 +165,35 @@ def test_uncompilable_regex_flags_incompatible_without_crashing() -> None:
 
 
 @pytest.mark.unit
+def test_negated_content_atom_contributes_no_highlight_pattern() -> None:
+    # grep only highlights POSITIVE matches; a `-foo` exclusion is SQL-only and is never
+    # rendered as a highlight, so it collects no pattern (the positive `bar` survives).
+    patterns, regex_incompatible = _patterns("-foo bar")
+    assert regex_incompatible is False
+    assert [p.pattern for p in patterns] == ["bar"]
+    # A purely-negated query collects nothing at all -> filter-only at the grep layer.
+    only_neg, _ = _patterns("-foo")
+    assert only_neg == []
+
+
+@pytest.mark.unit
+def test_negated_broken_regex_does_not_flag_regex_incompatible() -> None:
+    # JUDGMENT CALL (plan: "reason it through"): a purely-negated broken regex (`-/[/`) builds
+    # NO highlight pattern, so nothing was meant to highlight and there is nothing whose
+    # highlighting capability was lost. We deliberately do NOT recurse into the Not to attempt a
+    # Python re.compile, so regex_incompatible stays False. (The SQL predicate still compiles the
+    # pattern server-side via Postgres POSIX ARE regardless of polarity, so exclusion
+    # correctness is unaffected -- only the Python-side highlight signal is suppressed.)
+    patterns, regex_incompatible = _patterns("-/[/")
+    assert patterns == []
+    assert regex_incompatible is False
+    # Contrast: the SAME broken regex un-negated DOES flag incompatible (it was meant to
+    # highlight and Python could not compile it).
+    _, positive_incompatible = _patterns("/[/")
+    assert positive_incompatible is True
+
+
+@pytest.mark.unit
 def test_matchers_collect_across_and_or_nesting_and_filters_contribute_none() -> None:
     patterns, regex_incompatible = _patterns("(foo OR bar) baz")
     assert regex_incompatible is False
@@ -289,6 +318,44 @@ def test_zero_width_only_atoms_true_for_empty_terms(query: str) -> None:
     assert _zero_width_only_atoms(patterns, regex_incompatible) is True
 
 
+# ------------------------------------------------------ flag interaction with negation (#70)
+
+
+@pytest.mark.unit
+def test_zero_width_only_atoms_true_from_positive_leaf_beside_negation() -> None:
+    # `/^/ -bar`: `-bar` contributes no pattern at all (Not is never recursed into), so the
+    # ONLY pattern collected is the positive zero-width `/^/` -- the flag is driven by that
+    # single affirmative leaf, exactly as if `-bar` were not there.
+    patterns, regex_incompatible = _patterns("/^/ -bar")
+    assert [p.pattern for p in patterns] == ["^"]
+    assert regex_incompatible is False
+    assert _zero_width_only_atoms(patterns, regex_incompatible) is True
+    assert _no_content_atom(patterns, regex_incompatible) is False
+
+
+@pytest.mark.unit
+def test_positive_only_patterns_beside_a_negated_broken_regex() -> None:
+    # `-/[/ foo`: the negated broken regex builds no pattern and cannot flag
+    # regex_incompatible (test_negated_broken_regex_does_not_flag_regex_incompatible already
+    # pins that in isolation); alongside a positive `foo`, the collected patterns are
+    # positive-only and the query is NOT reported as content-free or regex-incompatible.
+    patterns, regex_incompatible = _patterns("-/[/ foo")
+    assert [p.pattern for p in patterns] == [re.escape("foo")]
+    assert regex_incompatible is False
+    assert _no_content_atom(patterns, regex_incompatible) is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("query", ['-""', "-//"])
+def test_negated_empty_term_is_no_content_atom_not_zero_width(query: str) -> None:
+    # A negated empty term (`-""`/`-//`) collects nothing at all -- same as any other
+    # purely-negated query -- so it is no_content_atom, NOT zero_width_only_atoms (that flag
+    # requires `bool(patterns)`, which is false here).
+    no_content, zero_width = _flags(query)
+    assert no_content is True
+    assert zero_width is False
+
+
 @pytest.mark.unit
 def test_getwidth_private_api_canary() -> None:
     # DELIBERATELY UNGUARDED (no try/except). _zero_width_only_atoms depends on the private
@@ -349,7 +416,7 @@ def test_grep_module_does_not_import_private_re_parser_at_module_scope() -> None
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("query", ["lang:go", "/^/", "foo", "sym:X", '""'])
+@pytest.mark.parametrize("query", ["lang:go", "/^/", "foo", "sym:X", '""', "-foo", "-sym:X"])
 def test_flags_are_mutually_exclusive(query: str) -> None:
     # Three states, never four: no_content_atom needs `not patterns`, zero_width_only_atoms
     # needs `bool(patterns)`. The envelope only ever clears flags, so this holds there too.
