@@ -23,7 +23,8 @@ WITHOUT a CAS check (one release's grace period for 0002-era readers).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass
 
 from sqlalchemy import Connection, delete, func, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -46,6 +47,23 @@ class StaleIndexError(RuntimeError):
     ``max_concurrent_runs``). It protects the *stamp* only -- it does not detect
     a refactor that moves the ``repo_branches`` upsert out of statement 2.
     """
+
+
+@dataclass(frozen=True)
+class ReconcileCounts:
+    """Row-count summary returned by ``reconcile_retired_branches`` for one repo's run.
+
+    ``files_stripped`` counts ``files`` rows whose ``branches`` array was
+    modified (a distinct-files rowcount, not a pair count) -- it is deliberately
+    not named ``memberships_stripped``, which would suggest one count per
+    (file, branch) pair rather than per file. ``files_deleted`` is always a
+    subset of ``files_stripped``: a row is only deleted once its subtraction
+    leaves it with zero remaining branches.
+    """
+
+    branches_removed: int
+    files_stripped: int
+    files_deleted: int
 
 
 # Called as chunk_writer(conn, repo_id, file_id, pf) once per file, inside the
@@ -320,3 +338,108 @@ def _stamp_repo_branch(
             f"statement (baseline {baseline_commit!r}/{baseline_version!r}); aborting rather "
             "than regressing the index"
         )
+
+
+def reconcile_retired_branches(
+    conn: Connection,
+    *,
+    name: str,
+    retired_branches: Collection[str],
+) -> ReconcileCounts:
+    """Remove retired branch membership from one repo's ``files`` and ``repo_branches``.
+
+    Phase 1 of the corpus-reconciliation epic (#56): a pure storage primitive
+    for branches that are no longer actively indexed (deleted, default-branch
+    changed, or narrowed out of a ``branches:`` glob) -- the case
+    ``_sweep_membership`` cannot reach, since that sweep only runs during an
+    active ``index_repo`` call for the branch being re-indexed. This helper
+    does not decide which branches are retired; the caller supplies a set
+    already proven retired (see #59), and it does not protect the live default
+    branch from being passed in by mistake.
+
+    **Sanitize first**: ``retired_branches`` is filtered to non-empty strings
+    and de-duplicated before anything else. A ``None`` or blank entry bound
+    into ``<> ALL(...)`` / ``= ANY(...)`` poisons the comparison (SQL's
+    three-valued logic makes any ``= NULL`` comparison unknown, never true),
+    which would make the membership-stripping ``WHERE e <> ALL(...)`` never
+    evaluate true for that element and the rebuilt array come back with the
+    row's *entire* membership intact instead of just the retired branches
+    removed. Sanitizing before any SQL runs means an empty or all-invalid
+    input returns ``(0, 0, 0)`` with no transaction opened at all -- it can
+    never fall through into a wildcard match.
+
+    Runs as a single ``with conn.begin():`` transaction, repo-scoped on every
+    statement:
+
+    1. ``SELECT id FROM repos WHERE name = :name FOR UPDATE`` resolves and
+       locks the repo row in one statement; a missing repo is a no-op
+       (``scalar_one_or_none`` returns ``None``). This lock makes the helper a
+       per-repo mutex with ``index_repo`` (both take the repo row lock first),
+       so the two can never interleave against the same repo. The job role
+       holds ``UPDATE`` on this table (``app/db/grants.py``), so ``FOR UPDATE``
+       is a privilege it already has.
+    2. Strip every retired branch from ``files.branches`` for this repo via
+       ``ARRAY(SELECT e FROM unnest(branches) AS e WHERE e <> ALL(...))``
+       rather than this module's usual ``array_remove`` idiom (a deliberate
+       deviation): it lets one GIN-served (``ix_files_branches_gin``) pass via
+       ``branches && ...`` produce an exact distinct-files rowcount, and
+       ``ARRAY(subquery)`` always yields ``'{}'`` rather than ``NULL`` -- a
+       plain ``array_agg`` over an all-matched unnest returns ``NULL`` on an
+       emptied array, which would leave a zombie row the next step's
+       cardinality check can't see.
+    3. Delete rows left with zero membership (``cardinality(branches) = 0``);
+       a strict subset of step 2's rowcount. ``symbols`` and ``chunks`` are
+       removed by FK cascade, the same invariant ``_sweep_membership`` relies
+       on (see its docstring, indexer/store.py).
+    4. Delete the matching ``repo_branches`` registry rows.
+
+    Invariants: repo-scoped on every statement; membership subtraction only,
+    never delete-by-path (a shared ``(repo_id, path, content_sha)`` row keeps
+    every branch it isn't losing); ``files.commit`` is never read (it is
+    ambiguous under multi-branch dedup, see the module docstring); no engine
+    construction, network I/O, or ``TEMP TABLE``; no Alembic migration; no
+    ``INDEX_SEMANTICS_VERSION`` bump (this is not an indexing run); idempotent
+    (re-running against an already-reconciled repo returns zero counts); and
+    stored ``branches`` arrays are assumed NULL-element-free, guaranteed by
+    ``index_repo``'s own writes.
+    """
+    retired = list(dict.fromkeys(b for b in retired_branches if isinstance(b, str) and b))
+    if not retired:
+        return ReconcileCounts(branches_removed=0, files_stripped=0, files_deleted=0)
+
+    with conn.begin():
+        repo_id = conn.execute(
+            text("SELECT id FROM repos WHERE name = :name FOR UPDATE"),
+            {"name": name},
+        ).scalar_one_or_none()
+        if repo_id is None:
+            return ReconcileCounts(branches_removed=0, files_stripped=0, files_deleted=0)
+
+        files_stripped = conn.execute(
+            text(
+                "UPDATE files SET branches = ARRAY("
+                "SELECT e FROM unnest(branches) AS e WHERE e <> ALL(CAST(:retired AS text[]))"
+                ") "
+                "WHERE repo_id = :repo_id AND branches && CAST(:retired AS text[])"
+            ),
+            {"repo_id": repo_id, "retired": retired},
+        ).rowcount
+
+        files_deleted = conn.execute(
+            text("DELETE FROM files WHERE repo_id = :repo_id AND cardinality(branches) = 0"),
+            {"repo_id": repo_id},
+        ).rowcount
+
+        branches_removed = conn.execute(
+            text(
+                "DELETE FROM repo_branches "
+                "WHERE repo_id = :repo_id AND branch = ANY(CAST(:retired AS text[]))"
+            ),
+            {"repo_id": repo_id, "retired": retired},
+        ).rowcount
+
+    return ReconcileCounts(
+        branches_removed=branches_removed,
+        files_stripped=files_stripped,
+        files_deleted=files_deleted,
+    )
