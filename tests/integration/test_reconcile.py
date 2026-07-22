@@ -185,6 +185,7 @@ def test_shared_content_row_survives_and_remains_searchable(conn: Connection) ->
     conn.rollback()
 
     assert sorted(_branches_of(conn, "main.py")) == ["feature", "main"]
+    conn.rollback()  # clear the read's autobegun txn before reconcile's own conn.begin()
 
     counts = reconcile_retired_branches(conn, name="acme/widgets", retired_branches=["feature"])
 
@@ -235,6 +236,7 @@ def test_divergent_branch_only_file_is_deleted_with_symbols_and_chunks_cascade(
     feature_file_id = _file_id(conn, "only_feature.py")
     assert _count(conn, "symbols", f"file_id = {feature_file_id}") == 1
     assert _count(conn, "chunks", f"file_id = {feature_file_id}") == 1
+    conn.rollback()  # clear the reads' autobegun txn before reconcile's own conn.begin()
 
     counts = reconcile_retired_branches(conn, name="acme/widgets", retired_branches=["feature"])
 
@@ -274,6 +276,7 @@ def test_multiple_retired_branches_removed_in_one_atomic_call(conn: Connection) 
     conn.rollback()
 
     assert sorted(_branches_of(conn, "main.py")) == ["a", "b", "c"]
+    conn.rollback()  # clear the read's autobegun txn before reconcile's own conn.begin()
 
     counts = reconcile_retired_branches(conn, name="acme/widgets", retired_branches=["b", "c"])
 
@@ -336,6 +339,7 @@ def test_missing_repo_and_empty_retired_set_are_safe_noops(conn: Connection) -> 
 
     files_before = _count(conn, "files")
     branches_before = _repo_branch_names(conn, "acme/widgets")
+    conn.rollback()  # clear the reads' autobegun txn before either reconcile call below
 
     # Empty retired set against a real, existing repo.
     counts = reconcile_retired_branches(conn, name="acme/widgets", retired_branches=[])
@@ -373,6 +377,7 @@ def test_injected_failure_rolls_back_every_prior_mutation(conn: Connection) -> N
     branches_before = _branches_of(conn, "main.py")
     repo_branches_before = _repo_branch_names(conn, "acme/widgets")
     files_before = _count(conn, "files")
+    conn.rollback()  # clear the reads' autobegun txn before reconcile's own conn.begin()
 
     poisoned = _FailOnStatementConnection(conn, poison="DELETE FROM repo_branches")
     with pytest.raises(RuntimeError, match="injected failure"):
