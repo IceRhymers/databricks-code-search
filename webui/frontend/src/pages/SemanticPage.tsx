@@ -5,6 +5,70 @@ import { replaceRoute } from "../router";
 
 type Status = "idle" | "loading" | "error";
 
+// Pure render-decision function, extracted from the component so the banner/results branching
+// is testable via renderToStaticMarkup without jsdom or hook-driven state (this repo's vitest
+// runs in a plain "node" environment). Render order mirrors the plan: loading, request error,
+// disabled state, not-migrated banner, then the three filter-grammar error states, then
+// results -- all mutually exclusive by construction (status/envelope shape), so returning early
+// from each branch keeps an error envelope from ever falling through to "0 chunks".
+export function semanticBody(
+  status: Status,
+  error: string | null,
+  envelope: SemanticEnvelope | null,
+  enabled: boolean | null
+): JSX.Element | null {
+  if (status === "loading") return <div className="result-summary">Searching…</div>;
+  if (status === "error") return <div className="banner error">{error}</div>;
+  if (!envelope) {
+    if (enabled === false) {
+      return <div className="banner warn">Semantic search is not enabled for this deployment.</div>;
+    }
+    return null;
+  }
+  if (envelope.semantic_enabled === false) {
+    return (
+      <div className="banner warn">
+        Semantic search is not enabled for this deployment.
+        {envelope.reason ? ` ${envelope.reason}` : ""}
+      </div>
+    );
+  }
+  if (envelope.semantic_schema_missing) {
+    return <div className="banner warn">{envelope.reason}</div>;
+  }
+  // Filter-grammar atoms (repo:/file:/lang:/branch:) are parsed in-query; these three error
+  // states are mutually exclusive with each other and with a results payload, so they must
+  // be checked (and returned) before falling through to the "0 chunks" results branch below.
+  if (envelope.query_parse_error) {
+    return <div className="banner error">{envelope.query_parse_error}</div>;
+  }
+  if (envelope.unsupported_filter) {
+    return (
+      <div className="banner error">
+        {envelope.unsupported_filter}
+        {envelope.reason ? ` ${envelope.reason}` : ""}
+      </div>
+    );
+  }
+  if (envelope.nothing_to_embed) {
+    return (
+      <div className="banner warn">
+        {envelope.reason ?? "Nothing to search -- the query has no text left to embed."}
+      </div>
+    );
+  }
+  return (
+    <>
+      <div className="result-summary">
+        {envelope.count} chunk{envelope.count === 1 ? "" : "s"}, ranked by hybrid relevance
+      </div>
+      {envelope.results.map((result, i) => (
+        <ChunkCard key={i} result={result} />
+      ))}
+    </>
+  );
+}
+
 export function SemanticPage({ initialQuery }: { initialQuery: string }): JSX.Element {
   const [input, setInput] = useState(initialQuery);
   const [status, setStatus] = useState<Status>("idle");
@@ -56,41 +120,6 @@ export function SemanticPage({ initialQuery }: { initialQuery: string }): JSX.El
     void runSearch(input);
   }
 
-  // Render order mirrors the plan: disabled state, then not-migrated banner, then error,
-  // then results -- but these are mutually exclusive by construction (status/envelope shape),
-  // so a single derived body keeps the branches from overlapping.
-  function renderBody(): JSX.Element | null {
-    if (status === "loading") return <div className="result-summary">Searching…</div>;
-    if (status === "error") return <div className="banner error">{error}</div>;
-    if (!envelope) {
-      if (enabled === false) {
-        return <div className="banner warn">Semantic search is not enabled for this deployment.</div>;
-      }
-      return null;
-    }
-    if (envelope.semantic_enabled === false) {
-      return (
-        <div className="banner warn">
-          Semantic search is not enabled for this deployment.
-          {envelope.reason ? ` ${envelope.reason}` : ""}
-        </div>
-      );
-    }
-    if (envelope.semantic_schema_missing) {
-      return <div className="banner warn">{envelope.reason}</div>;
-    }
-    return (
-      <>
-        <div className="result-summary">
-          {envelope.count} chunk{envelope.count === 1 ? "" : "s"}, ranked by hybrid relevance
-        </div>
-        {envelope.results.map((result, i) => (
-          <ChunkCard key={i} result={result} />
-        ))}
-      </>
-    );
-  }
-
   return (
     <div>
       <form className="search-box" onSubmit={handleSubmit}>
@@ -98,14 +127,18 @@ export function SemanticPage({ initialQuery }: { initialQuery: string }): JSX.El
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder='e.g. "how are branch filters compiled to SQL"'
+          placeholder='e.g. "how are branch filters compiled to SQL" repo:acme/widgets'
           aria-label="Semantic search query"
           autoFocus
         />
         <button type="submit">Search</button>
       </form>
+      <p className="result-summary">
+        Scope with in-query <code>repo:</code>, <code>file:</code>, or <code>lang:</code> atoms
+        -- the rest of the query is embedded for similarity ranking.
+      </p>
 
-      {renderBody()}
+      {semanticBody(status, error, envelope, enabled)}
     </div>
   );
 }

@@ -27,6 +27,7 @@ export function ChunkCard({ result }: { result: SemanticResult }): JSX.Element {
         </a>
         <span className="lang">chunk {result.chunk_index}</span>
         <span className="lang">score {result.rrf_score.toFixed(4)}</span>
+        <span className="lang">sim {result.similarity === null ? "—" : result.similarity.toFixed(3)}</span>
       </div>
       <pre className="chunk-card-body">{result.content}</pre>
     </div>

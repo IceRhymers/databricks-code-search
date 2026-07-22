@@ -238,18 +238,31 @@ async def api_semantic(
 ) -> dict[str, Any]:
     """Hybrid semantic + BM25 search over indexed chunks (issue #36).
 
+    ``q`` accepts the same in-query filter grammar as ``/api/search`` -- ``repo:``, ``file:``,
+    ``lang:``, ``branch:`` atoms -- passed through verbatim to ``app.service`` (see
+    ``app/query/semantic_filters.py``); the atoms are excised before the residual text is
+    embedded, so a query like ``repo:acme/widgets how are branch filters compiled`` scopes the
+    candidate set to ``acme/widgets`` and embeds only the trailing prose. Boolean ``or`` and
+    mid-word slashes stay prose (there is no compiled lexical AST on this path), while
+    ``sym:``, ``case:``, ``commit:``, and token-initial ``/regex/`` are rejected with an
+    ``unsupported_filter`` payload naming the atom and its remedy.
+
     ``limit`` defaults to 50 -- parity with the MCP ``semantic_search`` tool's own default
     (``app/main.py``), NOT ``/api/search``'s ``0 -> row_limit`` convention: the two surfaces
     should return the same result set for the same defaulted call.
 
-    Disabled (``semantic_enabled: false``) and not-migrated (``semantic_schema_missing: true``)
-    payloads pass through unchanged as 200 bodies -- recoverable conditions are payload fields,
-    never HTTP errors (mirrors ``app/main.py``'s dispatch contract). Only malformed input and
-    backend faults become HTTP errors: a NUL byte in ``q``/``branch`` reaching a bound SQL
-    parameter raises ``DataError`` -> 400 (same rationale as the existing routes); anything else
-    (e.g. the embedding endpoint's SDK/auth/network failures, which are arbitrary exception
-    types) is logged with a full traceback server-side and mapped to a generic 502 so a raw
-    error body never echoes endpoint/host detail (mirrors ``ready()``'s no-leak policy).
+    Disabled (``semantic_enabled: false``), not-migrated (``semantic_schema_missing: true``),
+    and the filter-grammar's own recoverable states -- a malformed atom (``query_parse_error``),
+    an atom this surface doesn't support such as ``commit:`` (``unsupported_filter`` + a
+    ``reason`` naming the remedy), or a query with nothing left to embed after filters are
+    excised (``nothing_to_embed`` + ``reason``) -- all pass through unchanged as 200 bodies with
+    ``results: []``/``count: 0``: recoverable conditions are payload fields, never HTTP errors
+    (mirrors ``app/main.py``'s dispatch contract). Only malformed input and backend faults
+    become HTTP errors: a NUL byte in ``q``/``branch`` reaching a bound SQL parameter raises
+    ``DataError`` -> 400 (same rationale as the existing routes); anything else (e.g. the
+    embedding endpoint's SDK/auth/network failures, which are arbitrary exception types) is
+    logged with a full traceback server-side and mapped to a generic 502 so a raw error body
+    never echoes endpoint/host detail (mirrors ``ready()``'s no-leak policy).
     """
     clamped = service.clamp_limit(limit, cfg)
     try:

@@ -22,7 +22,8 @@ from sqlalchemy import Connection, insert, select, text
 from app.config import SEMANTIC_EMBEDDING_DIM
 from app.db.client import create_db_engine
 from app.db.models import Base, File, Repo
-from app.search.semantic import build_hybrid_rrf_sql, format_vector_literal
+from app.query.semantic_filters import SemanticFilters
+from app.search.semantic import build_hybrid_rrf_sql, filter_params, format_vector_literal
 from indexer.chunk_store import write_chunks
 from indexer.hashing import content_sha
 
@@ -118,6 +119,30 @@ def seeded() -> Iterator[Connection]:
                 (1, "database connection pooling and retries", 2, 2, _vec({0: 0.7, 1: 0.7})),
                 (2, "authentication authentication token authentication", 3, 3, _vec({1: 1.0})),
             ],
+        )
+
+        # A second repo/file/lang (filter-semantics): out-of-scope for every "acme/widgets" /
+        # "src/auth.py" / "python" scoped query below, and using its own embedding dimension
+        # (index 4) + query terms ("kubernetes") so it never leaks into the unscoped tests above.
+        beta_repo_id = conn.execute(
+            insert(Repo).values(name="beta/gizmos", default_branch="main").returning(Repo.id)
+        ).scalar_one()
+        beta_file_id = conn.execute(
+            insert(File)
+            .values(
+                repo_id=beta_repo_id,
+                path="src/other.js",
+                lang="javascript",
+                content="stub",
+                content_sha=content_sha("beta-stub"),
+                branches=["main"],
+            )
+            .returning(File.id)
+        ).scalar_one()
+        write_chunks(
+            conn,
+            file_id=beta_file_id,
+            chunks=[(0, "kubernetes orchestration and deployment", 1, 1, _vec({4: 1.0}))],
         )
         conn.commit()
 
@@ -275,7 +300,9 @@ def test_rrf_explicit_branch_head_reaches_null_default_repo_chunk(seeded: Connec
     _seed_null_default_head_chunk(seeded)
 
     params = _null_default_params()
-    params["branch"] = "HEAD"
+    # Decision C1 (filter-semantics): the `branch` kwarg is unified with in-query `branch:`
+    # atoms into the single sem_branch_{i} bind mechanism -- params["branch"] no longer exists.
+    params.update(filter_params(branch="HEAD"))
     branch_rows = seeded.execute(build_hybrid_rrf_sql(branch="HEAD"), params).all()
     contents = [r.content for r in branch_rows]
     assert "widget gizmo only reachable on head" in contents
@@ -306,7 +333,9 @@ def test_rrf_branch_filter_reaches_feature_only_chunk(seeded: Connection) -> Non
     params = _params(topk=5, limit=10)
     params["qvec"] = format_vector_literal(_vec({2: 1.0}))
     params["qtext"] = "gizmo"
-    params["branch"] = "feature"
+    # Decision C1 (filter-semantics): merges filter_params(...)'s sem_branch_0 bind instead of
+    # setting params["branch"] directly (the unified branch bind mechanism).
+    params.update(filter_params(branch="feature"))
 
     branch_rows = seeded.execute(build_hybrid_rrf_sql(branch="feature"), params).all()
     contents = [r.content for r in branch_rows]
@@ -314,3 +343,155 @@ def test_rrf_branch_filter_reaches_feature_only_chunk(seeded: Connection) -> Non
     # The pre-existing "main"-only chunks (A/B/C) never carry "feature" membership, so an
     # exact branch: match excludes them even though they exist in the corpus.
     assert "user authentication and login" not in contents
+
+
+# ------------------------------------------------------------- filter-semantics: repo/file/lang
+
+
+def _filters(
+    *,
+    repo: tuple[str, ...] = (),
+    file: tuple[str, ...] = (),
+    lang: tuple[str, ...] = (),
+    branch: tuple[str, ...] = (),
+    residual: str = "",
+) -> SemanticFilters:
+    return SemanticFilters(
+        repo_patterns=repo, path_patterns=file, langs=lang, branches=branch, residual=residual
+    )
+
+
+@pytest.mark.integration
+def test_repo_filter_scopes_ranking_to_named_repo(seeded: Connection) -> None:
+    filters = _filters(repo=("acme/widgets",), residual="authentication")
+    params = _params(topk=10, limit=10)
+    params.update(filter_params(filters))
+    rows = seeded.execute(build_hybrid_rrf_sql(filters), params).all()
+
+    assert rows, "expected in-scope results"
+    assert all(r.repo == "acme/widgets" for r in rows)
+    assert "kubernetes orchestration and deployment" not in [r.content for r in rows]
+
+
+@pytest.mark.integration
+def test_file_filter_scopes_ranking_to_named_path(seeded: Connection) -> None:
+    filters = _filters(file=(r"src/auth\.py",), residual="authentication")
+    params = _params(topk=10, limit=10)
+    params.update(filter_params(filters))
+    rows = seeded.execute(build_hybrid_rrf_sql(filters), params).all()
+
+    assert rows, "expected in-scope results"
+    assert all(r.path == "src/auth.py" for r in rows)
+
+
+@pytest.mark.integration
+def test_lang_filter_scopes_ranking_to_named_language(seeded: Connection) -> None:
+    filters = _filters(lang=("python",), residual="authentication")
+    params = _params(topk=10, limit=10)
+    params.update(filter_params(filters))
+    rows = seeded.execute(build_hybrid_rrf_sql(filters), params).all()
+
+    assert rows, "expected in-scope results"
+    assert "kubernetes orchestration and deployment" not in [r.content for r in rows]
+    assert all(r.path.endswith(".py") for r in rows)
+
+
+@pytest.mark.integration
+def test_filters_scope_before_ranking_not_after(seeded: Connection) -> None:
+    """Filter-then-rank proof (AC8): with topk small enough that the out-of-scope chunk would
+    monopolize an unscoped leg's candidate pool, a repo:-scoped query still surfaces the
+    in-scope chunk -- proving candidates are drawn from the FILTERED subset, never ranked over
+    the whole corpus first and filtered after (which would leave the ANN leg with zero rows
+    once the sole top-1 candidate is excluded).
+    """
+    repo_id = seeded.execute(select(Repo.id).where(Repo.name == "acme/widgets")).scalar_one()
+    file_id = seeded.execute(
+        insert(File)
+        .values(
+            repo_id=repo_id,
+            path="src/orchestration.py",
+            lang="python",
+            content="stub",
+            content_sha=content_sha("orchestration-stub"),
+            branches=["main"],
+        )
+        .returning(File.id)
+    ).scalar_one()
+    write_chunks(
+        seeded,
+        file_id=file_id,
+        # Close to, but not exactly aligned with, the query vector -- ranks #2 globally, behind
+        # the out-of-scope "beta/gizmos" chunk (seeded fixture), which is EXACTLY aligned.
+        chunks=[(0, "kubernetes orchestration helper", 1, 1, _vec({4: 0.9, 5: 0.1}))],
+    )
+    seeded.commit()
+
+    filters = _filters(repo=("acme/widgets",), residual="kubernetes")
+    params = _params(topk=1, limit=10)  # tiny: room for exactly ONE candidate per leg
+    params["qvec"] = format_vector_literal(_vec({4: 1.0}))
+    params["qtext"] = "kubernetes"
+    params.update(filter_params(filters))
+
+    rows = seeded.execute(build_hybrid_rrf_sql(filters), params).all()
+    contents = [r.content for r in rows]
+
+    assert "kubernetes orchestration helper" in contents
+    assert "kubernetes orchestration and deployment" not in contents
+
+
+@pytest.mark.integration
+def test_ann_leg_with_filter_still_uses_ann_index(seeded: Connection) -> None:
+    """EXPLAIN pin WITH a filter (clones ``test_ann_leg_uses_ann_index_not_seqscan_sort``): the
+    extra inner WHERE predicate a repo: filter adds must not collapse the ANN/BM25 index path
+    to a seq scan -- i.e. it leaves the ordered-index path AVAILABLE (the ``_leg_cte``
+    invariant this whole suite guards).
+
+    This pins AVAILABILITY, not the optimizer's CHOICE: for a sufficiently selective filter the
+    planner may legitimately prefer a filter-driven plan (walk repos -> files -> chunks via the
+    unique indexes, then an exact-distance Sort + Limit) over the approximate ANN index --
+    that's a valid, cost-based alternative for a filtered subset, not the structural collapse
+    the invariant guards against, and `enable_seqscan=off` alone does not rule it out (a Sort
+    is not a Seq Scan). Setting `enable_sort=off` too closes that loophole: the ordered ANN
+    path is the ONLY sort-free way to satisfy the inner `ORDER BY <=> LIMIT`, so with both
+    seq scans AND sorts penalized, the index is chosen iff it is structurally available --
+    isolating availability from cost-based plan choice.
+    """
+    filters = _filters(repo=("acme/widgets",), residual="authentication")
+    params = _params(topk=2, limit=10)
+    params.update(filter_params(filters))
+    with seeded.begin():
+        seeded.exec_driver_sql("SET LOCAL enable_seqscan = off")
+        seeded.exec_driver_sql("SET LOCAL enable_sort = off")
+        plan_rows = seeded.execute(
+            text("EXPLAIN " + str(build_hybrid_rrf_sql(filters))), params
+        ).all()
+    plan = "\n".join(str(r[0]) for r in plan_rows)
+
+    assert "ix_chunks_embedding_ann" in plan, (
+        f"ANN leg with a repo: filter did not use the lakebase_ann index:\n{plan}"
+    )
+
+
+@pytest.mark.integration
+def test_cosine_distance_reflects_alignment_and_bm25_only_rows_are_non_null(
+    seeded: Connection,
+) -> None:
+    """Similarity plausibility (AC8, Decision B1): the perfectly-aligned chunk's cosine
+    distance is smaller (higher similarity) than the partially-aligned one's, and the
+    BM25-only chunk -- never in the ANN leg's topk=2 candidate pool -- still gets a non-null
+    cosine_distance from the outer-select recompute.
+    """
+    rows = seeded.execute(build_hybrid_rrf_sql(), _params(topk=2, limit=10)).all()
+    by_content = {r.content: r for r in rows}
+
+    aligned = by_content["user authentication and login"]  # A: embedding == query vector exactly
+    partial = by_content["database connection pooling and retries"]  # B: ANN-only, partial
+    bm25_only = by_content["authentication authentication token authentication"]  # C: BM25-only
+
+    assert aligned.cosine_distance is not None
+    assert partial.cosine_distance is not None
+    assert bm25_only.cosine_distance is not None
+    assert aligned.cosine_distance < partial.cosine_distance
+
+    similarity = 1.0 - aligned.cosine_distance
+    assert similarity > 0.99

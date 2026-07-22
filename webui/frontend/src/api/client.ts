@@ -44,6 +44,9 @@ export interface SemanticResult {
   start_line: number | null;
   end_line: number | null;
   rrf_score: number;
+  // 1 - cosine_distance, recomputed in the outer select; null for chunks indexed before
+  // embedding (pre-embedding rows still rank via the BM25 leg alone).
+  similarity: number | null;
 }
 
 export interface SemanticEnvelope {
@@ -53,6 +56,13 @@ export interface SemanticEnvelope {
   count: number;
   reason?: string;
   semantic_schema_missing?: boolean;
+  // Mutually exclusive with each other and with a normal results payload: filter-grammar
+  // atoms (repo:/file:/lang:/branch:) are parsed in-query, so a malformed atom, an atom this
+  // surface doesn't support, or a query that reduces to filters-only/empty all short-circuit
+  // to results: [], count: 0 plus one of these fields (see webui/main.py::api_semantic).
+  query_parse_error?: string;
+  unsupported_filter?: string;
+  nothing_to_embed?: boolean;
 }
 
 export function semanticSearch(query: string, opts: { limit?: number; branch?: string } = {}): Promise<SemanticEnvelope> {
