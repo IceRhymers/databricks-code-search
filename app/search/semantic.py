@@ -351,6 +351,8 @@ _UNSUPPORTED_FILTER_REMEDIES: dict[str, str] = {
     "case:": "case sensitivity does not apply to semantic ranking; remove case:",
     "regex": "regex atoms are not supported in semantic queries; quote the term to search it "
     "as text",
+    "-": "negation is not supported in semantic queries; remove the leading '-' or quote the "
+    "term to search it as text",
 }
 
 
@@ -368,7 +370,7 @@ def _semantic_query_parse_error_payload(query: str, error: QueryParseError) -> d
 def _semantic_unsupported_filter_payload(
     query: str, error: UnsupportedSemanticAtomError
 ) -> dict[str, Any]:
-    """`sym:`/`case:`/`commit:`/regex atom: a loud, remedy-bearing rejection, never silent prose."""
+    """`sym:`/`case:`/`commit:`/regex/negation atom: a loud, remedy-bearing rejection, not prose."""
     return {
         "query": query,
         "semantic_enabled": True,

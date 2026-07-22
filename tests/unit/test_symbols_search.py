@@ -46,6 +46,20 @@ def test_collect_multiple_sym_atoms_union() -> None:
     assert _patterns("sym:Handler sym:Parse") == ["Handler", "Parse"]
 
 
+@pytest.mark.unit
+def test_collect_skips_negated_symbol_atom() -> None:
+    # The collector does NOT recurse into a Not: a `-sym:foo` exclusion has no definitions to
+    # project, so a `-sym:foo`-only query yields zero patterns -> the caller reports
+    # no_symbol_atom=True (there is no positive symbol leg to answer).
+    assert _patterns("-sym:foo") == []
+
+
+@pytest.mark.unit
+def test_collect_returns_only_positive_symbol_beside_a_negated_one() -> None:
+    # `-sym:foo sym:bar` finds only `bar` definitions; the negated leg contributes nothing.
+    assert _patterns("-sym:foo sym:bar") == ["bar"]
+
+
 # ------------------------------------------------------------------ projection SQL
 
 

@@ -342,11 +342,109 @@ def test_projection_and_ordering() -> None:
     assert "ORDER BY files.repo_id, files.path, files.content_sha" in sql
 
 
-# ------------------------------------------------------------------------- edge atoms
+# --------------------------------------------------------------------------- negation
 
 
 @pytest.mark.unit
-def test_leading_dash_is_plain_substring() -> None:
-    # `-foo` is a literal Substring in V1 (no negation node).
-    _, params = _render("-foo")
-    assert "%-foo%" in _param_values(params)
+def test_leading_dash_lowers_to_negation() -> None:
+    # Replaces the retired test_leading_dash_is_plain_substring: `-foo` is now negation. SQLAlchemy
+    # renders not_() of an ILIKE by pushing the NOT into the operator (`NOT ILIKE`), still binding
+    # the %foo% literal -- a plain negation, not a literal `%-foo%` substring.
+    sql, params = _render("-foo")
+    assert "files.content NOT ILIKE" in sql
+    assert "%foo%" in _param_values(params)
+    assert "%-foo%" not in _param_values(params)  # NOT the retired literal-substring behavior
+
+
+@pytest.mark.unit
+def test_negated_regex_wraps_the_regex_operator_in_not() -> None:
+    sql, _ = _render("-/foo/")
+    assert "NOT (files.content ~*" in sql
+
+
+@pytest.mark.unit
+def test_negation_null_semantics_is_plain_not_no_is_null_rewrite() -> None:
+    # Three-valued boolean NOT only: the predicate is a plain negation with NO set-complement
+    # `IS NULL OR NOT ...` clause. A NULL content row matches neither the positive nor the
+    # negated form -- standard SQL semantics.
+    sql, _ = _render("-foo")
+    assert "files.content NOT ILIKE" in sql
+    assert "IS NULL" not in sql
+
+
+@pytest.mark.unit
+def test_repeated_negations_bind_distinct_params() -> None:
+    # `-foo -foo` must bind TWO distinct params (never interpolate, never collide on one name).
+    sql, params = _render("-foo -foo")
+    assert sql.count("files.content NOT ILIKE") == 2
+    like_params = [v for v in params.values() if v == "%foo%"]
+    assert len(like_params) == 2  # two separate binds, both %foo%
+
+
+@pytest.mark.unit
+def test_nested_negated_groups_bind_distinct_params() -> None:
+    sql, params = _render("-(foo) -(foo)")
+    assert sql.count("files.content NOT ILIKE") == 2
+    assert len([v for v in params.values() if v == "%foo%"]) == 2
+
+
+@pytest.mark.unit
+def test_negated_content_still_gets_default_branch_conjunct() -> None:
+    # A negated content atom carries no branch scope, so the implicit default-branch conjunct is
+    # still ANDed in (a `-foo` search runs the default-branch-scoped candidate scan).
+    sql, _ = _render("-foo")
+    assert "EXISTS (SELECT repos.id" in sql
+
+
+# ------------------------------------------------- negation: default-branch polarity matrix
+
+
+@pytest.mark.unit
+def test_negated_branch_does_not_opt_out_of_default_conjunct() -> None:
+    # `-branch:x foo`: the `-branch:x` is an EXCLUSION, not a selection, so it does NOT opt out
+    # of the implicit default-branch conjunct -- both the negated @> AND the default EXISTS emit.
+    sql, _ = _render("-branch:main foo")
+    assert "NOT (files.branches @>" in sql
+    assert "EXISTS (SELECT repos.id" in sql
+
+
+@pytest.mark.unit
+def test_affirmative_branch_beside_negated_branch_opts_out() -> None:
+    # `branch:main -branch:x`: the affirmative branch:main opts out (existing behavior), so the
+    # default-branch EXISTS is absent even though a negated branch is also present.
+    sql, _ = _render("branch:main -branch:dev foo")
+    assert "files.branches @>" in sql
+    assert "NOT (files.branches @>" in sql
+    assert "EXISTS (SELECT repos.id" not in sql
+
+
+@pytest.mark.unit
+def test_double_negated_branch_opts_out_again() -> None:
+    # `-(-branch:x)`: double negation -> affirmative again -> opts out of the default conjunct.
+    sql, _ = _render("-(-branch:main) foo")
+    assert "NOT (NOT (files.branches @>" in sql
+    assert "EXISTS (SELECT repos.id" not in sql
+
+
+@pytest.mark.unit
+def test_plain_branch_filter_still_opts_out_unchanged() -> None:
+    # Regression: a plain affirmative branch: is unchanged by the polarity rewrite.
+    sql, _ = _render("branch:main foo")
+    assert "files.branches @>" in sql
+    assert "EXISTS (SELECT repos.id" not in sql
+
+
+@pytest.mark.unit
+def test_negated_commit_does_not_opt_out_of_default_conjunct() -> None:
+    # A negated commit scope is likewise an exclusion, not a selection -> default conjunct kept.
+    sql, _ = _render("-commit:abc1234 foo")
+    assert "NOT (EXISTS (SELECT repo_branches.id" in sql
+    assert "EXISTS (SELECT repos.id" in sql
+
+
+@pytest.mark.unit
+def test_negated_filters_thread_global_case_through_the_wrapper() -> None:
+    # `case:yes -sym:y`: the derived global case flag reaches the negated symbol filter (`~`).
+    sql, _ = _render("case:yes foo -sym:y")
+    assert "symbols.name ~ " in sql
+    assert "symbols.name ~*" not in sql
