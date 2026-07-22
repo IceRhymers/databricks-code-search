@@ -27,7 +27,7 @@ import re
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 _GITHUB_HOSTS = {"github.com", "www.github.com"}
@@ -119,6 +119,128 @@ class GitHubConnection(BaseModel):
 Connection = Annotated[GitHubConnection, Field(discriminator="type")]
 
 
+class SemanticOverrides(BaseModel):
+    """config.yaml's overlay onto the semantic knobs in ``app.config.Settings``.
+
+    The serverless job has **no reachable env surface**: nothing in
+    ``resources/job.yml`` sets ``CODE_SEARCH_*``, so every ``Settings`` semantic
+    default is effectively hard-coded for the job. This block is how an operator
+    moves those knobs from config.yaml -- the one file the job already reads --
+    without editing bundle resources and redeploying. Precedence for the job is
+    **config.yaml > ``CODE_SEARCH_*`` env > code default**: a field set here wins,
+    an unset field (``None``) falls through to whatever the env/``Settings``
+    default already resolved to. An absent ``semantic:`` block is a pure no-op, so
+    every config predating this schema keeps exactly today's behavior.
+
+    Every field is ``None`` by default -- "not set", NOT "set to false/zero". That
+    is load-bearing: ``settings_overrides`` emits a key only for a field the
+    operator actually wrote, so ``model_copy(update=...)`` in ``indexer.job``
+    touches only those, and an omitted field is never silently forced to a
+    default that would clobber the env value it was meant to inherit.
+
+    The env surface (``app.config.get_settings``) is deliberately left as the MCP
+    server / webui surface -- those processes have their own environment and this
+    block does not reach them. See ``docs/runbooks/semantic-enablement.md``.
+
+    **``max_chunks_per_repo`` here is the GLOBAL ceiling** (one int, the job-wide
+    default), distinct from ``RepoConfig.semantic_max_chunks_per_repo`` -- a
+    *map* of per-repo overrides. The two are intentionally similarly named because
+    they tune the same dimension at different scopes; the per-repo map still beats
+    this global from ANY source, because ``indexer.job`` resolves the effective cap
+    as ``entry.semantic_max_chunks or cfg.semantic_max_chunks_per_repo`` and this
+    block only moves the second operand. Setting both is coherent: raise the floor
+    for the whole corpus here, spot-override the outliers in the map.
+
+    Two ``Settings`` semantic knobs are deliberately absent, because exposing them
+    would be a lie or a footgun: ``semantic_embedding_dim`` is pinned to
+    ``SEMANTIC_EMBEDDING_DIM`` (the ``chunks.embedding`` column type and the 0004
+    migration DDL both derive from it, tripwire-tested) -- it is a schema
+    invariant, not an operator knob; and ``semantic_chunk_max_tokens`` is not
+    consumed by the chunker at all (chunking is bounded by the
+    ``SEMANTIC_CHUNK_MAX_CHARS`` constant), so a config key for it would silently
+    do nothing.
+
+    Validation mirrors the existing ``index_concurrency`` / per-repo-cap pattern:
+    the bound lives on the field (``ge`` / ``gt`` / ``min_length``), so a bad value
+    fails at parse time with pydantic's own message and reaches the job as a
+    :class:`ConfigError` naming the source path -- never a mid-run surprise.
+
+    ``extra="forbid"`` (unlike the extra-ignore default the rest of this schema
+    keeps) is a FAIL-CLOSED guard, not tidiness: this block is the job's only
+    semantic kill switch, and pydantic's default would turn a typo'd key
+    (``enable: false`` for ``enabled: false``) into a silently ignored no-op that
+    leaves semantic indexing ON -- fail-OPEN on exactly the surface that must fail
+    loud. An unknown key here raises at parse time instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    max_chunks_per_repo: int | None = Field(default=None, ge=1)
+    embedding_endpoint: str | None = Field(default=None, min_length=1)
+    embedding_model: str | None = Field(default=None, min_length=1)
+    embedding_batch_size: int | None = Field(default=None, ge=1)
+    embedding_timeout_s: float | None = Field(default=None, gt=0)
+
+    @field_validator("embedding_endpoint")
+    @classmethod
+    def _require_workspace_relative_path(cls, value: str | None) -> str | None:
+        """Reject anything but a workspace-relative path (an SSRF / token-exfil guard).
+
+        ``app.embed`` builds the request URL by bare string concatenation
+        (``f"{host}{path}"`` on the SDK raw client), so a value like
+        ``@evil.com/x`` would parse as ``userinfo@evil.com`` and ship the
+        workspace bearer token to an attacker-controlled host, and an absolute
+        ``https://evil/x`` or protocol-relative ``//evil/x`` would leave the
+        workspace entirely. This is a config-surface guard only -- ``app.embed``
+        and ``Settings`` are unchanged; the check lives here because config.yaml is
+        operator-editable and this is where a bad value is cheapest to catch.
+        """
+        if value is None:
+            return value
+        if not value.startswith("/") or value.startswith("//"):
+            raise ValueError(
+                "embedding_endpoint must be a workspace-relative path starting with a single '/' "
+                f"(got {value!r})"
+            )
+        if "@" in value or "://" in value:
+            raise ValueError(
+                "embedding_endpoint must not contain '@' or '://' -- a workspace-relative path "
+                f"only, or the workspace token could be sent off-host (got {value!r})"
+            )
+        return value
+
+    def settings_overrides(self) -> dict[str, Any]:
+        """Return the ``{Settings_field_name: value}`` overlay for the SET fields.
+
+        The keys are ``app.config.Settings`` field names, spelled as string
+        literals ON PURPOSE: importing ``app.config`` here would break this
+        module's import-light contract (see the module docstring) and drag
+        pydantic-settings into the fast schema tests. The literals are pinned to
+        the real ``Settings`` fields by a type-aware tripwire in
+        ``tests/unit/test_repo_config.py`` (it round-trips this dict through
+        ``Settings.model_copy`` + ``model_validate``), so a rename on either side
+        fails loudly rather than silently dropping an override.
+
+        Only fields the operator actually set (non-``None``) are emitted, so the
+        job's ``model_copy(update=...)`` overlays exactly those and leaves every
+        other ``Settings`` value -- env-sourced or default -- untouched.
+        """
+        mapping = {
+            "enabled": "semantic_enabled",
+            "max_chunks_per_repo": "semantic_max_chunks_per_repo",
+            "embedding_endpoint": "semantic_embedding_endpoint",
+            "embedding_model": "semantic_embedding_model",
+            "embedding_batch_size": "semantic_embedding_batch_size",
+            "embedding_timeout_s": "semantic_embedding_timeout_s",
+        }
+        return {
+            settings_field: value
+            for local_field, settings_field in mapping.items()
+            if (value := getattr(self, local_field)) is not None
+        }
+
+
 class RepoConfig(BaseModel):
     """The parsed ``config.yaml`` document.
 
@@ -139,12 +261,19 @@ class RepoConfig(BaseModel):
     embedding materialises a whole repo's chunks in memory (~0.5-0.8 GB per
     worker; 260 MB of vectors alone at the 8000-chunk ceiling).
 
-    ``semantic_max_chunks_per_repo`` overrides that global 8000-chunk ceiling
-    (``app.config.Settings.semantic_max_chunks_per_repo``) for individual repos
-    named here, without moving the global default. It does NOT relax the
-    2-worker semantic clamp above -- a large override still multiplies the
-    per-worker memory cost of whichever of the (at most 2) concurrent semantic
-    workers happens to be indexing that repo.
+    ``semantic_max_chunks_per_repo`` (the per-repo MAP) overrides that global
+    8000-chunk ceiling for individual repos named here, without moving the global
+    default. It does NOT relax the 2-worker semantic clamp above -- a large
+    override still multiplies the per-worker memory cost of whichever of the (at
+    most 2) concurrent semantic workers happens to be indexing that repo.
+
+    The similarly-named ``semantic.max_chunks_per_repo`` (inside the ``semantic:``
+    block, a single INT) moves that GLOBAL ceiling itself for the whole job. The
+    two coexist by design: this map spot-overrides outliers, ``semantic:`` raises
+    the floor everyone inherits. The map still wins for a repo it names, because
+    the job resolves ``entry.semantic_max_chunks or cfg.semantic_max_chunks_per_repo``
+    and the ``semantic:`` block only supplies the second operand -- see
+    :class:`SemanticOverrides`.
     """
 
     version: Literal[1]
@@ -158,6 +287,14 @@ class RepoConfig(BaseModel):
     # `ge=1` on the value type (not a separate validator) rejects 0/negative/non-int with
     # pydantic's own message, matching index_concurrency's pattern above.
     semantic_max_chunks_per_repo: dict[str, Annotated[int, Field(ge=1)]] = {}
+
+    # The `semantic:` overlay onto the job's semantic Settings (config.yaml > env >
+    # default). Absent (the default `SemanticOverrides()`) is a no-op: every field is
+    # None, so `settings_overrides()` is empty and indexer/job.py never model_copies
+    # the injected cfg. This is the JOB's config surface; env vars remain the MCP /
+    # webui surface. See SemanticOverrides for the precedence and the deliberate
+    # exclusions (embedding_dim, chunk_max_tokens).
+    semantic: SemanticOverrides = SemanticOverrides()
 
     @model_validator(mode="after")
     def _normalize_semantic_overrides(self) -> RepoConfig:

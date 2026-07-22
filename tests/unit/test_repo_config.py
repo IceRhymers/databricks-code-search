@@ -22,6 +22,7 @@ from indexer.repo_config import (
     ExcludeRules,
     GitHubConnection,
     RepoConfig,
+    SemanticOverrides,
     effective_workers,
     load_config,
     normalize_repo,
@@ -310,6 +311,186 @@ def test_semantic_max_chunks_per_repo_rejects_duplicate_keys_post_casefold() -> 
     with pytest.raises(ConfigError) as excinfo:
         parse_config(raw, source="cfg")
     assert "duplicate" in str(excinfo.value)
+
+
+# --- semantic: block (config.yaml as the job's semantic-config surface) -----
+
+
+@pytest.mark.unit
+def test_semantic_block_absent_is_a_noop() -> None:
+    """An unmodified config gets the default empty overlay: every field None, and
+    ``settings_overrides()`` empty -- so ``indexer.job`` never model_copies cfg."""
+    cfg = parse_config(_MINIMAL, source="cfg")
+    assert cfg.semantic == SemanticOverrides()
+    assert cfg.semantic.settings_overrides() == {}
+
+
+@pytest.mark.unit
+def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
+    """A fully-populated block emits all six Settings-named keys, values intact."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"semantic:\n"
+        b"  enabled: false\n"
+        b"  max_chunks_per_repo: 12000\n"
+        b"  embedding_endpoint: /custom/embeddings\n"
+        b"  embedding_model: acme.embed-v2\n"
+        b"  embedding_batch_size: 32\n"
+        b"  embedding_timeout_s: 15.0\n"
+    )
+    cfg = parse_config(raw, source="cfg")
+    assert cfg.semantic.settings_overrides() == {
+        "semantic_enabled": False,
+        "semantic_max_chunks_per_repo": 12000,
+        "semantic_embedding_endpoint": "/custom/embeddings",
+        "semantic_embedding_model": "acme.embed-v2",
+        "semantic_embedding_batch_size": 32,
+        "semantic_embedding_timeout_s": 15.0,
+    }
+
+
+@pytest.mark.unit
+def test_semantic_block_partial_emits_only_set_fields() -> None:
+    """Unset fields stay out of the overlay so they fall through to env/default --
+    emitting them as None would clobber the value the operator meant to inherit."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"semantic:\n  max_chunks_per_repo: 20000\n"
+    )
+    cfg = parse_config(raw, source="cfg")
+    assert cfg.semantic.settings_overrides() == {"semantic_max_chunks_per_repo": 20000}
+    # enabled:false is a real override; enabled unset must NOT surface as False.
+    assert cfg.semantic.enabled is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_chunks_per_repo", b"0"),
+        ("max_chunks_per_repo", b"-1"),
+        ("embedding_batch_size", b"0"),
+        ("embedding_batch_size", b"-5"),
+        ("embedding_timeout_s", b"0"),
+        ("embedding_timeout_s", b"-2.5"),
+        ("embedding_endpoint", b'""'),
+        ("embedding_model", b'""'),
+    ],
+)
+def test_semantic_block_rejects_out_of_bound_values(field: str, value: bytes) -> None:
+    """Bounds live on the fields (ge/gt/min_length), so a bad value fails at parse
+    time and reaches the job as ConfigError naming both the block and the field."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"semantic:\n  " + field.encode() + b": " + value + b"\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+    message = str(excinfo.value)
+    assert "semantic" in message
+    assert field in message
+
+
+@pytest.mark.unit
+def test_bad_semantic_block_surfaces_as_config_error_through_parse_config() -> None:
+    """AC 4: a misvalidated ``semantic:`` block fails the run at parse time with the
+    ConfigError contract (path in the message), exactly like index_concurrency."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"semantic:\n  max_chunks_per_repo: 0\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="/Workspace/x/config.yaml")
+    message = str(excinfo.value)
+    assert "/Workspace/x/config.yaml" in message
+    assert "max_chunks_per_repo" in message
+
+
+@pytest.mark.unit
+def test_semantic_block_rejects_unknown_key() -> None:
+    """A typo'd key must fail loud, not silently leave semantic ON.
+
+    ``extra="forbid"`` on SemanticOverrides makes ``enable: false`` (a typo for
+    ``enabled: false``) a parse error rather than an ignored no-op -- fail-closed
+    on the job's only semantic kill switch."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\nsemantic:\n  enable: false\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+    message = str(excinfo.value)
+    assert "semantic" in message
+    assert "enable" in message
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["@evil.com/x", "https://evil/x", "//evil/x"])
+def test_semantic_embedding_endpoint_rejects_non_workspace_relative_paths(value: str) -> None:
+    """A non-workspace-relative endpoint could exfiltrate the workspace token.
+
+    ``app.embed`` concatenates ``f"{host}{path}"``, so ``@evil.com/x`` parses as
+    userinfo@host and an absolute/protocol-relative URL leaves the workspace. The
+    config surface rejects all three at parse time (through ConfigError)."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"semantic:\n  embedding_endpoint: '" + value.encode() + b"'\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+    assert "embedding_endpoint" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_semantic_embedding_endpoint_accepts_the_workspace_relative_default() -> None:
+    """The shipped default route path is a valid workspace-relative endpoint."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"semantic:\n  embedding_endpoint: /ai-gateway/mlflow/v1/embeddings\n"
+    )
+    cfg = parse_config(raw, source="cfg")
+    assert cfg.semantic.settings_overrides() == {
+        "semantic_embedding_endpoint": "/ai-gateway/mlflow/v1/embeddings"
+    }
+
+
+@pytest.mark.unit
+def test_settings_overrides_keys_are_real_settings_fields_and_types_survive() -> None:
+    """Type-aware tripwire: the string-literal keys in ``settings_overrides`` must
+    stay pinned to real ``app.config.Settings`` fields, and their VALUES must still
+    satisfy those fields' types/constraints.
+
+    ``repo_config`` cannot import ``app.config`` (import-light contract), so the
+    literals could silently drift from the real field names or from their types.
+    This test -- the only place in this module that touches ``Settings`` -- catches
+    both: a name-drift check against ``Settings.model_fields``, then a re-validation
+    of the overlaid model, because ``model_copy(update=...)`` skips validation and
+    would otherwise let a wrong-typed value through unnoticed.
+    """
+    from app.config import Settings
+
+    ov = SemanticOverrides(
+        enabled=False,
+        max_chunks_per_repo=1234,
+        embedding_endpoint="/custom/embeddings",
+        embedding_model="custom.model",
+        embedding_batch_size=8,
+        embedding_timeout_s=5.5,
+    )
+    overrides = ov.settings_overrides()
+    # All six set -> all six emitted, and every key is a real Settings field.
+    assert len(overrides) == 6
+    assert set(overrides) <= set(Settings.model_fields)
+
+    # model_copy(update=) does NOT validate; re-validating the dumped model is what
+    # turns a future type/constraint drift into a loud failure here.
+    overlaid = Settings().model_copy(update=overrides)
+    revalidated = Settings.model_validate(overlaid.model_dump())
+    assert revalidated.semantic_enabled is False
+    assert revalidated.semantic_max_chunks_per_repo == 1234
+    assert revalidated.semantic_embedding_endpoint == "/custom/embeddings"
+    assert revalidated.semantic_embedding_model == "custom.model"
+    assert revalidated.semantic_embedding_batch_size == 8
+    assert revalidated.semantic_embedding_timeout_s == 5.5
 
 
 # --- parse failures (AC 7-8) ------------------------------------------------

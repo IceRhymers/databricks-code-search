@@ -67,13 +67,27 @@ ranges); semantic results appear after that run completes.
 
 ## 3. Opt-out
 
-To disable the feature, set `CODE_SEARCH_SEMANTIC_ENABLED=0` explicitly —
-`semantic_search` short-circuits before any DB/embedder access and the indexer skips
-chunk writes entirely.
+**Two config surfaces, split by process (issue #36).** The MCP app (`code_search`) and
+the webui app (`webui`) read semantic config from their **environment** —
+`CODE_SEARCH_SEMANTIC_ENABLED=0` disables the feature there, short-circuiting before
+any DB/embedder access. The **indexer job** has no reachable env surface (nothing in
+`resources/job.yml` sets `CODE_SEARCH_*`), so it reads its semantic config from
+`config.yaml`'s `semantic:` block instead (see section 6). Disable the job's semantic
+indexing with:
 
-**All three surfaces, not just one (issue #36):** the flag must be set on the MCP app
-(`code_search`), the webui app (`webui`), **and** the indexer job — each has its own
-environment. The webui SPA's Semantic tab is driven entirely by
+```yaml
+semantic:
+  enabled: false
+```
+
+which makes the job a true semantic no-op (no embedder built, no chunking, the
+2-worker clamp not applied) — no bundle/env change and no redeploy of the job's
+environment. Precedence for the job is `config.yaml > CODE_SEARCH_* env > default`, so
+`semantic.enabled: false` wins even if the env says enabled.
+
+**All three surfaces, not just one:** the flag must be off on the MCP app, the webui
+app (both via env), **and** the indexer job (via `config.yaml`) — each has its own
+config source. The webui SPA's Semantic tab is driven entirely by
 `GET /api/semantic/status`, which reads the **webui app's own** `cfg.semantic_enabled`
 (see `docs/runbooks/webui.md`). Disabling only the MCP app leaves the webui tab
 visible (and vice versa) — easy to mistake for a bug.
@@ -83,10 +97,17 @@ visible (and vice versa) — easy to mistake for a bug.
 Embeddings go through the workspace AI Gateway MLflow embeddings route
 (`POST /ai-gateway/mlflow/v1/embeddings`, default model `system.ai.gte-large-en`,
 1024-dim), via the SDK's workspace-authenticated raw API client (`app/embed.py`).
-No model-serving endpoint needs to be provisioned. Overrides:
-`CODE_SEARCH_SEMANTIC_EMBEDDING_ENDPOINT` (route path) and
-`CODE_SEARCH_SEMANTIC_EMBEDDING_MODEL` — a model with a different dimension trips the
-dim tripwire test / `EmbeddingDimMismatchError` rather than writing bad vectors.
+No model-serving endpoint needs to be provisioned. Overrides differ by surface: the
+MCP / webui apps use env vars (`CODE_SEARCH_SEMANTIC_EMBEDDING_ENDPOINT` route path,
+`CODE_SEARCH_SEMANTIC_EMBEDDING_MODEL`); the **indexer job** uses `config.yaml`'s
+`semantic:` block (`embedding_endpoint`, `embedding_model` — see section 6). Swapping
+`embedding_model` to a model of a different dimension is caught at **runtime** by
+`EmbeddingDimMismatchError` (`app/embed.py`), which checks each returned vector against
+the un-overridden `semantic_embedding_dim` and refuses to write bad vectors — that is
+the guard that fires for the config surface, since the config block cannot (and does
+not) move `semantic_embedding_dim`. (The unit dim tripwire is a separate, narrower
+check: it only pins the *default* model's dimension to the column type, not a
+config-supplied override.)
 
 On a workspace where the route or model is unavailable, the indexer degrades
 gracefully (indexes the core corpus without chunks, logging loudly —
@@ -119,7 +140,9 @@ for that repo only (an active override is logged at INFO). It does not relax the
 2-worker semantic clamp above, so a large override still multiplies whichever of the
 (at most 2) concurrent workers happens to be indexing that repo — do the same ~32
 KB/chunk math against the override value, not just the global default, before setting
-one.
+one. To move the **global** cap for the whole job instead of one repo, set
+`semantic.max_chunks_per_repo` (a single int, section 6) — the map still wins for a
+repo it names.
 
 **Parallelism:** with semantic on by default, the `effective_workers` clamp to 2 in
 `indexer/job.py` now applies to every index run by default (each worker materialises a
@@ -133,3 +156,36 @@ they are database-wide objects, and dropping/recreating them buys nothing since 
 managed-preload change (section 1) is itself irreversible per project. Downgrading
 only removes the schema objects this feature owns; it does not "un-preload" the
 project. For a behavioral rollback, prefer the opt-out flag (section 3).
+
+## 6. Indexer job config: the `semantic:` block
+
+The serverless indexing job has no reachable env surface — nothing in
+`resources/job.yml` sets `CODE_SEARCH_*`, so `Settings`' semantic defaults are
+effectively hard-coded for the job. `config.yaml` is therefore the job's config
+surface for semantic behavior; `indexer/job.py` overlays this block onto the process
+`Settings` immediately after loading the config, before it sizes the worker pool or
+builds the embedder. **Precedence is `config.yaml > CODE_SEARCH_* env > default`**; the
+env vars remain the MCP-server / webui surface (separate processes, separate
+environments) and this block does not reach them.
+
+```yaml
+semantic:
+  enabled: true                    # -> Settings.semantic_enabled
+  max_chunks_per_repo: 8000        # -> Settings.semantic_max_chunks_per_repo (GLOBAL ceiling)
+  embedding_endpoint: /ai-gateway/mlflow/v1/embeddings
+  embedding_model: system.ai.gte-large-en
+  embedding_batch_size: 64
+  embedding_timeout_s: 20.0
+```
+
+Every field is optional; an omitted field falls through to the env value / default, and
+an absent `semantic:` block is a pure no-op (unmodified configs behave exactly as
+before). Two `Settings` knobs are deliberately **not** exposed here:
+`semantic_embedding_dim` (pinned to `SEMANTIC_EMBEDDING_DIM`, a schema invariant — the
+`chunks.embedding` column type and the `0004` DDL derive from it) and
+`semantic_chunk_max_tokens` (not consumed by the chunker, which is bounded by the
+`SEMANTIC_CHUNK_MAX_CHARS` constant — a key for it would silently do nothing). A bad
+value fails the run at parse time with the existing `ConfigError` contract (exit 1, path
+in the message). `max_chunks_per_repo` here is the **global** ceiling; the top-level
+`semantic_max_chunks_per_repo` **map** (section 4) spot-overrides individual repos and
+still wins over this global.

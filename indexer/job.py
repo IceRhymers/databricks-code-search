@@ -65,6 +65,14 @@ NOT bound the transient case, where an aggregate ENOSPC still surfaces as the
 opaque ``tarfile`` failure. Sizing ``index_concurrency`` to the disk is the real
 control -- see ``docs/runbooks/indexing-parallelism.md``.
 
+The semantic knobs in ``cfg`` are not read straight from the environment: the
+serverless job has no reachable ``CODE_SEARCH_*`` env surface, so ``run()``
+overlays config.yaml's ``semantic:`` block onto ``cfg`` right after the config
+loads (config.yaml > env > default; see
+:class:`indexer.repo_config.SemanticOverrides`). Everything below -- the
+``effective_workers`` clamp, the embedder build, the per-repo chunk cap -- reads
+the overlaid ``cfg``.
+
 When ``cfg.semantic_enabled`` (issue #14), each repo's files are also chunked and
 embedded -- but OUTSIDE ``index_repo``'s transaction (A4): the embedder is called
 here, up front, and only a ``chunk_writer`` closure over the precomputed vectors
@@ -269,7 +277,10 @@ def run(
     ``reconcile_removed_fn`` (the #57/#58 storage primitives the post-fan-out
     checkpoint below invokes -- mirroring ``index_fn``'s injection so
     reconciliation tests need no real Postgres either). ``cfg`` defaults to the
-    process-cached :func:`app.config.get_settings`.
+    process-cached :func:`app.config.get_settings`, then any ``semantic:`` fields
+    in config.yaml are overlaid onto it before the worker clamp and embedder build
+    (config.yaml > env > default -- config.yaml is the job's semantic-config
+    surface; see :class:`indexer.repo_config.SemanticOverrides`).
 
     ``resolve_repos`` is deliberately **not** injectable: the existing
     ``httpx.MockTransport`` seam already lets tests drive enumeration outcomes
@@ -306,6 +317,21 @@ def run(
         # resolution failure below remain distinguishable in the log.
         logger.error("could not load config from %s", config_path, exc_info=True)
         return 1
+
+    # config.yaml is the job's semantic-config surface (env has no reachable
+    # surface for the serverless job -- resources/job.yml sets no CODE_SEARCH_*).
+    # Overlay any `semantic:` fields the operator set onto cfg HERE, before the
+    # worker clamp and the embedder build below, so effective_workers() and
+    # get_embedder() both see config.yaml's values -- config.yaml > env > default.
+    # An absent/empty block yields {} and leaves the injected cfg untouched (the
+    # test seam keeps working: overlay applies to whatever cfg is in hand). Only
+    # the SET field NAMES are logged, never values -- same redaction posture as
+    # the rest of this module (endpoints/models are not secrets, but logging only
+    # names keeps the "this module logs no config values" invariant simple).
+    overrides = config.semantic.settings_overrides()
+    if overrides:
+        cfg = cfg.model_copy(update=overrides)
+        logger.info("config.yaml semantic overrides applied: %s", sorted(overrides))
 
     token = read_github_token(workspace_client, scope, key)
 

@@ -182,14 +182,23 @@ def _config(
     *,
     index_concurrency: int | None = None,
     semantic_max_chunks_per_repo: dict[str, int] | None = None,
+    semantic: dict[str, Any] | None = None,
     **connection: Any,
 ) -> RepoConfig:
-    """A single-github-connection RepoConfig from selector kwargs."""
+    """A single-github-connection RepoConfig from selector kwargs.
+
+    ``semantic=`` sets the top-level ``semantic:`` overlay block (config.yaml's
+    job-side semantic-config surface), mirroring the ``semantic_max_chunks_per_repo``
+    per-repo-map kwarg above -- the two are distinct config surfaces (global INT vs
+    per-repo MAP) and either can be set independently.
+    """
     doc: dict[str, Any] = {"version": 1, "connections": [{"type": "github", **connection}]}
     if index_concurrency is not None:
         doc["index_concurrency"] = index_concurrency
     if semantic_max_chunks_per_repo is not None:
         doc["semantic_max_chunks_per_repo"] = semantic_max_chunks_per_repo
+    if semantic is not None:
+        doc["semantic"] = semantic
     return RepoConfig.model_validate(doc)
 
 
@@ -743,6 +752,152 @@ def test_unbuildable_embedder_does_not_abort_the_whole_run() -> None:
     assert code == 0
     assert idx.calls == ["acme/widgets"]
     assert idx.chunk_writer is None
+
+
+# --- config.yaml `semantic:` overlay onto cfg (config.yaml > env > default) --
+
+
+@pytest.mark.unit
+def test_config_yaml_semantic_disabled_beats_env_enabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC 2: ``semantic.enabled: false`` in config.yaml wins over an env-enabled cfg.
+
+    The job has no reachable env surface, so config.yaml is authoritative. With the
+    overlay applied before the embedder build, an injected embed_fn is never called
+    and no chunk_writer is wired -- a true semantic no-op even though ``cfg`` says
+    enabled. The applied-overrides line names the field (not its value).
+    """
+
+    def _poison(_texts: list[str]) -> list[list[float]]:
+        raise AssertionError("embedder must not run when config.yaml disabled semantic")
+
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True)
+    config = _config(repos=["acme/widgets"], semantic={"enabled": False})
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(config, idx, cfg=cfg, embed_fn=_poison)
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+    assert idx.chunk_writer is None  # embedder path is dead -> no chunks
+    messages = [r.getMessage() for r in caplog.records if r.name == "indexer.job"]
+    assert "config.yaml semantic overrides applied: ['semantic_enabled']" in messages
+
+
+@pytest.mark.unit
+def test_config_yaml_semantic_enabled_beats_env_disabled() -> None:
+    """The mirror of the disable case: ``semantic.enabled: true`` overlays an
+    env-disabled cfg, so the embedder path goes LIVE.
+
+    With cfg saying disabled, the un-overlaid run would pass no chunk_writer; the
+    overlay flips ``cfg.semantic_enabled`` to True before the embedder wiring, so
+    the injected embed_fn is used and a chunk_writer reaches index_repo.
+    """
+    idx = _RecordingIndex()
+    embed_calls: list[list[str]] = []
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        embed_calls.append(list(texts))
+        return [[0.5] for _ in texts]
+
+    cfg = Settings(semantic_enabled=False)
+    config = _config(repos=["acme/widgets"], semantic={"enabled": True})
+    code = _run(config, idx, cfg=cfg, embed_fn=_embed)
+    assert code == 0
+    assert idx.chunk_writer is not None  # semantic went live despite the env-disabled cfg
+    assert len(embed_calls) == 1  # the injected embedder actually ran
+
+
+@pytest.mark.unit
+def test_config_yaml_semantic_enabled_applies_the_worker_clamp(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The enable overlay also re-arms the 2-worker memory clamp.
+
+    cfg says disabled (which would leave the pool at index_concurrency=6), but
+    config.yaml's ``semantic.enabled: true`` overlays before effective_workers, so
+    the clamp fires: pool 6 -> 2, with the clamp log line -- the pool-side mirror
+    of the disable test.
+    """
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        kwargs = _engine_kwargs(
+            _config(repos=["acme/widgets"], index_concurrency=6, semantic={"enabled": True}),
+            monkeypatch,
+            cfg=Settings(semantic_enabled=False),
+        )
+    assert kwargs["pool_size"] == 2  # clamped
+    assert "clamping index_concurrency 6 -> 2" in caplog.text
+
+
+@pytest.mark.unit
+def test_config_yaml_semantic_global_cap_is_used_when_no_per_repo_override_matches() -> None:
+    """The global cap from config.yaml's ``semantic:`` block feeds the effective cap.
+
+    Same 2-chunk fixture (main.py + README.md). The injected cfg's cap of 1 would
+    degrade the repo to a chunkless core index; the config.yaml global of 5 does not
+    -- so chunk_writer being wired proves the OVERLAID global reached the precompute,
+    not the env-backed cfg value.
+    """
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=1)
+    config = _config(repos=["acme/widgets"], semantic={"max_chunks_per_repo": 5})
+    code = _run(config, idx, cfg=cfg, embed_fn=lambda texts: [[0.0] for _ in texts])
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+    assert idx.chunk_writer is not None  # the config.yaml global (5), not cfg's 1, applied
+
+
+@pytest.mark.unit
+def test_per_repo_override_still_beats_the_config_yaml_global_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The per-repo MAP wins over the ``semantic:`` global, from whatever source.
+
+    The job resolves ``entry.semantic_max_chunks or cfg.semantic_max_chunks_per_repo``;
+    the ``semantic:`` block only moves the second operand. Here the config.yaml global
+    (5) would pass the 2-chunk fixture, but the per-repo override (1) fails it -> the
+    repo degrades to a chunkless core index, and the override log reports the global as
+    5 (the overlaid value), proving both surfaces landed.
+    """
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=1)
+    config = _config(
+        repos=["acme/widgets"],
+        semantic={"max_chunks_per_repo": 5},
+        semantic_max_chunks_per_repo={"acme/widgets": 1},
+    )
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(config, idx, cfg=cfg, embed_fn=lambda texts: [[0.0] for _ in texts])
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+    assert idx.chunk_writer is None  # the per-repo override (1) fired, not the global (5)
+    messages = [r.getMessage() for r in caplog.records if r.name == "indexer.job"]
+    assert "semantic chunk cap override for acme/widgets: 1 (global 5)" in messages
+
+
+@pytest.mark.unit
+def test_absent_semantic_block_leaves_injected_cfg_untouched(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No ``semantic:`` block -> no model_copy, no overlay log, cfg used verbatim.
+
+    The injected cfg's cap of 1 stays in force (2-chunk fixture degrades to a
+    chunkless core index), and the applied-overrides line is never emitted -- the
+    regression guard that an empty overlay does not silently rebuild cfg.
+    """
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=1)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            idx,
+            cfg=cfg,
+            embed_fn=lambda texts: [[0.0] for _ in texts],
+        )
+    assert code == 0
+    assert idx.chunk_writer is None  # cfg's cap of 1 still enforced -> chunks skipped
+    messages = [r.getMessage() for r in caplog.records if r.name == "indexer.job"]
+    assert not any(m.startswith("config.yaml semantic overrides applied") for m in messages)
 
 
 # --- main() exit semantics --------------------------------------------------
@@ -1570,6 +1725,28 @@ def test_pool_size_follows_the_semantic_clamp_not_the_raw_config(
     assert kwargs["pool_size"] == 2
     assert kwargs["max_overflow"] == 0
     assert "clamping index_concurrency 6 -> 2" in caplog.text
+
+
+@pytest.mark.unit
+def test_config_yaml_semantic_disabled_removes_the_worker_clamp(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The overlay runs BEFORE effective_workers, so config.yaml can lift the clamp.
+
+    cfg says semantic enabled (which would clamp 6 -> 2), but config.yaml's
+    ``semantic.enabled: false`` overlays first -- effective_workers then sees a
+    disabled flag and leaves the pool at the full index_concurrency, with no clamp
+    log line. This is the pool-side proof that the overlay precedes both the clamp
+    and the embedder build.
+    """
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        kwargs = _engine_kwargs(
+            _config(repos=["acme/widgets"], index_concurrency=6, semantic={"enabled": False}),
+            monkeypatch,
+            cfg=Settings(semantic_enabled=True),
+        )
+    assert kwargs["pool_size"] == 6  # not clamped to 2
+    assert "clamping index_concurrency" not in caplog.text
 
 
 @pytest.mark.unit

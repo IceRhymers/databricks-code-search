@@ -49,14 +49,19 @@ connections:
     #     - "acme/test-*"
     #   size_mb: 500      # GitHub reports size in KB; this is MB. Default: no cap.
 
-# Per-repo override of the semantic chunk-embedding ceiling (default 8000, env
-# CODE_SEARCH_SEMANTIC_MAX_CHUNKS_PER_REPO — see app/config.py). A repo whose
-# real chunk count exceeds the GLOBAL cap degrades to indexing its core corpus
-# WITHOUT chunks (semantic is additive, never fails the branch); list it here to
-# raise (or lower) its own cap instead of moving the default for every repo.
+# Per-repo override of the semantic chunk-embedding ceiling — a MAP, keyed by
+# repo. This is the SPOT knob: it moves the cap for the repos named here only,
+# leaving the GLOBAL default alone. To move the global default for the whole job,
+# use `semantic.max_chunks_per_repo` in the `semantic:` block below — NOT this map
+# (the two are similarly named on purpose: same dimension, different scope). A repo
+# whose real chunk count exceeds its effective cap degrades to indexing its core
+# corpus WITHOUT chunks (semantic is additive, never fails the branch); list it
+# here to raise (or lower) its own cap without touching everyone else's.
 # Keys are canonicalised the same way as `repos:` above (URL/SSH/bare all work,
 # matched case-insensitively); an override naming a repo the corpus never
-# resolves logs a WARNING (typo guard) and is otherwise a no-op.
+# resolves logs a WARNING (typo guard) and is otherwise a no-op. A repo named here
+# beats the global from any source (config.yaml or env): the job resolves the
+# effective cap as `per-repo override OR global`.
 #
 # Mind the memory math before raising one: buffered vectors are ~32 KB/chunk
 # (dim=1024, Python float-list storage), so 8000 ≈ 260 MB resident for the
@@ -68,3 +73,30 @@ connections:
 # needs the temp-table staging path (follow-up), not a bigger override.
 # semantic_max_chunks_per_repo:
 #   "acme/huge-monorepo": 20000
+
+# Semantic-indexing behavior for THIS JOB. config.yaml is the job's only reachable
+# config surface: the serverless job sets no CODE_SEARCH_* env vars (nothing in
+# resources/job.yml does), so every semantic Settings default in app/config.py is
+# effectively hard-coded for the job unless overridden here. Precedence is
+# config.yaml > CODE_SEARCH_* env > code default — a field set here wins; a field
+# left out falls through to the env value / the app/config.py default. The env vars
+# remain the MCP-server / webui surface (separate deploy, separate environment);
+# this block does not reach them. An absent `semantic:` block is a pure no-op.
+#
+# `max_chunks_per_repo` here is a single INT: the GLOBAL ceiling for every repo
+# (the default is 8000). It is NOT the per-repo `semantic_max_chunks_per_repo` MAP
+# above — that spot-overrides individual repos and still wins over this global. Use
+# this to raise the floor everyone inherits; use the map for the outliers. The same
+# ~32 KB/chunk memory math and 2-worker clamp above apply here, magnified: raising
+# the global lifts the buffer cost for EVERY concurrently-indexing repo at once.
+#
+# `enabled: false` makes the job a true semantic no-op (no embedder built, no
+# chunking, the 2-worker memory clamp not applied) even if the env says enabled —
+# the fastest way to turn semantic off for the job alone.
+# semantic:
+#   enabled: true
+#   max_chunks_per_repo: 8000
+#   embedding_endpoint: /ai-gateway/mlflow/v1/embeddings
+#   embedding_model: system.ai.gte-large-en
+#   embedding_batch_size: 64
+#   embedding_timeout_s: 20.0
