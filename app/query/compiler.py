@@ -3,7 +3,8 @@
 Lowers the immutable AST produced by :mod:`app.query.parser` into a single, pure
 :class:`sqlalchemy.Select`. The compiler needs no DB connection, so unit tests render
 SQL via ``stmt.compile(dialect=postgresql.dialect())``. Each node type lowers to a
-``ColumnElement[bool]`` so ``And``/``Or`` compose with ``and_()``/``or_()``.
+``ColumnElement[bool]`` so ``And``/``Or`` compose with ``and_()``/``or_()`` and ``Not``
+with ``not_()``.
 
 Trigram acceleration is the point: content/path/symbol-name predicates lower to
 operators the GIN ``gin_trgm_ops`` indexes can serve (``ILIKE``/``LIKE``/``~*``/``~``),
@@ -33,6 +34,13 @@ Contract / divergence notes (load-bearing):
   content_sha)`` -> a deterministic, stable ``LIMIT`` page with no ``id`` tiebreak.
   Predicate emission order does NOT drive execution -- Postgres reorders ANDed predicates
   by its own statistics.
+* Negation (:class:`Not`). Lowers to a plain three-valued ``not_(<child>)`` wrap: a NULL
+  content/lang row matches neither ``content:foo`` nor ``-content:foo`` (no set-complement
+  ``IS NULL OR NOT`` rewrite). Each negated leaf keeps its own auto-named bind, so ``-foo -foo``
+  and ``-(foo) -(foo)`` never collide on one param. Branch/commit polarity is deliberate: an
+  affirmative ``branch:``/``commit:`` opts the query out of the implicit default-branch conjunct
+  below, but a negated one (``-branch:x``) is an exclusion that does not opt out -- the default
+  conjunct still runs and merely excludes x within it (see :func:`_has_branch_filter`).
 * Branch scoping. ``branch:<value>`` (:class:`BranchFilter`) lowers to the
   GIN-served exact-membership operator ``files.branches @> ARRAY[:v]``. When the AST carries
   NO ``BranchFilter`` anywhere, :func:`compile_query` ANDs in an IMPLICIT default-branch
@@ -48,7 +56,7 @@ from __future__ import annotations
 
 from typing import assert_never
 
-from sqlalchemy import Select, Text, and_, any_, exists, func, literal, or_, select
+from sqlalchemy import Select, Text, and_, any_, exists, func, literal, not_, or_, select
 from sqlalchemy.dialects.postgresql import ARRAY, array
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -59,6 +67,7 @@ from app.query.parser import (
     CommitFilter,
     LangFilter,
     Node,
+    Not,
     Or,
     PathFilter,
     Regex,
@@ -74,21 +83,30 @@ DEFAULT_ROW_LIMIT = 200
 _RESULT_COLUMNS = (File.id, File.repo_id, File.path, File.lang)
 
 
-def _has_branch_filter(node: Node) -> bool:
-    """True iff ``node`` (any And/Or nesting) contains a :class:`BranchFilter` leaf.
+def _has_branch_filter(node: Node, affirmative: bool = True) -> bool:
+    """True iff ``node`` contains an affirmative ``branch:``/``commit:`` scope -- one under an
+    even number of enclosing :class:`Not`s.
 
-    Mirrors :func:`_global_case`'s tree walk. An explicit ``branch:`` anywhere in the query
-    opts the whole query OUT of the implicit default-branch conjunct -- the query author has
-    already stated which branch(es) they want.
+    Polarity is load-bearing. Only an affirmative branch/commit scope means the author has
+    stated which branch(es) they want and so opts the query out of the implicit default-branch
+    conjunct. A negated scope (``-branch:x``) is an exclusion, not a selection: it must not opt
+    out, so the default-branch conjunct still runs and the ``-branch:x`` merely carves x out of
+    it. ``affirmative`` starts True at the top-level call and each :class:`Not` flips it, so
+    ``-branch:x foo`` resolves to non-affirmative (default conjunct kept), ``branch:main
+    -branch:x`` keeps the affirmative ``branch:main`` opting out, and ``-(-branch:x)`` (double
+    negation) is affirmative again and opts out.
     """
     match node:
         case BranchFilter() | CommitFilter():
-            # A commit scope IS a branch scope (it resolves to specific repo/branch heads), so it
-            # opts the query out of the implicit default-branch conjunct too -- without this a
-            # commit resolving to a non-default branch would silently intersect to zero rows.
-            return True
+            # A commit scope IS a branch scope (it resolves to specific repo/branch heads), so an
+            # affirmative one opts the query out of the implicit default-branch conjunct too --
+            # without this a commit resolving to a non-default branch would silently intersect to
+            # zero rows.
+            return affirmative
+        case Not(child=child):
+            return _has_branch_filter(child, not affirmative)
         case And(children=children) | Or(children=children):
-            return any(_has_branch_filter(child) for child in children)
+            return any(_has_branch_filter(child, affirmative) for child in children)
         case Substring() | Regex() | RepoFilter() | PathFilter() | LangFilter() | SymbolFilter():
             return False
         case _:
@@ -125,9 +143,11 @@ def compile_query(
     the raw query string may pass ``resolve_case(query)`` to make the filter-only
     ``case:yes`` case exact. Raises ``ValueError`` when ``limit`` is negative.
 
-    Branch scoping: an explicit ``branch:`` atom anywhere in ``node`` lowers to
-    ``files.branches @> ARRAY[:v]`` (GIN-served); when absent, the implicit correlated
-    default-branch conjunct (see :func:`_default_branch_conjunct`) is ANDed in instead.
+    Branch scoping: an affirmative ``branch:``/``commit:`` atom anywhere in ``node`` lowers to
+    ``files.branches @> ARRAY[:v]`` (GIN-served) and opts out of the implicit default-branch
+    conjunct; when none is present (or the only branch/commit scope is negated, e.g.
+    ``-branch:x``), the implicit correlated default-branch conjunct (see
+    :func:`_default_branch_conjunct`) is ANDed in instead -- see :func:`_has_branch_filter`.
     """
     if limit < 0:
         raise ValueError(f"limit must be non-negative, got {limit}")
@@ -153,6 +173,10 @@ def _global_case(node: Node) -> bool:
     match node:
         case Substring(case_sensitive=cs) | Regex(case_sensitive=cs):
             return cs
+        case Not(child=child):
+            # Case is inherited by the operand being negated (stamped on the leaf at parse time),
+            # so recurse: `-/Foo/` under `case:yes` still derives a case-sensitive global flag.
+            return _global_case(child)
         case And(children=children) | Or(children=children):
             return any(_global_case(child) for child in children)
         case (
@@ -218,6 +242,11 @@ def _lower(node: Node, cs: bool) -> ColumnElement[bool]:
                     ),
                 )
             )
+        case Not(child=child):
+            # Uniform three-valued boolean NOT: on a nullable column (NULL content/lang) the row
+            # matches neither the positive nor the negated predicate -- standard SQL semantics, no
+            # `IS NULL OR NOT ...` set-complement rewrite.
+            return not_(_lower(child, cs))
         case And(children=children):
             return and_(*[_lower(child, cs) for child in children])
         case Or(children=children):

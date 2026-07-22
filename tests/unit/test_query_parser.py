@@ -12,6 +12,7 @@ from app.query.parser import (
     BranchFilter,
     CommitFilter,
     LangFilter,
+    Not,
     Or,
     PathFilter,
     QueryParseError,
@@ -343,6 +344,237 @@ def test_mixed_filters_and_regex() -> None:
     assert parse("repo:x lang:go /Foo.*Bar/") == And(
         (RepoFilter("x"), LangFilter("go"), Regex("Foo.*Bar", False))
     )
+
+
+# --------------------------------------------------------------------------- negation
+
+
+@pytest.mark.unit
+def test_negation_of_bare_substring() -> None:
+    assert parse("-foo") == Not(Substring("foo", False))
+
+
+@pytest.mark.unit
+def test_negation_of_quoted_substring() -> None:
+    assert parse('-"a b"') == Not(Substring("a b", False))
+
+
+@pytest.mark.unit
+def test_negation_of_regex() -> None:
+    assert parse("-/Foo/") == Not(Regex("Foo", False))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("-repo:acme", Not(RepoFilter("acme"))),
+        ("-file:src/", Not(PathFilter("src/"))),
+        ("-lang:go", Not(LangFilter("go"))),
+        ("-sym:Name", Not(SymbolFilter("Name"))),
+        ("-branch:main", Not(BranchFilter("main"))),
+        ("-commit:abc1234", Not(CommitFilter("abc1234"))),
+    ],
+)
+def test_negation_of_each_filter_type(query: str, expected: Not) -> None:
+    assert parse(query) == expected
+
+
+@pytest.mark.unit
+def test_negation_binds_tighter_than_and() -> None:
+    # `-a b` is `(NOT a) AND b`, not `NOT (a AND b)`.
+    assert parse("-a b") == And((Not(Substring("a")), Substring("b")))
+
+
+@pytest.mark.unit
+def test_whitespace_and_of_two_negations() -> None:
+    assert parse("-a -b") == And((Not(Substring("a")), Not(Substring("b"))))
+
+
+@pytest.mark.unit
+def test_or_with_negation_on_one_arm() -> None:
+    assert parse("-a OR b") == Or((Not(Substring("a")), Substring("b")))
+
+
+@pytest.mark.unit
+def test_or_with_negation_on_both_arms() -> None:
+    assert parse("-a OR -b") == Or((Not(Substring("a")), Not(Substring("b"))))
+
+
+@pytest.mark.unit
+def test_negation_of_parenthesized_group() -> None:
+    assert parse("-(a b)") == Not(And((Substring("a"), Substring("b"))))
+
+
+@pytest.mark.unit
+def test_negation_of_parenthesized_or_group() -> None:
+    assert parse("-(a OR b)") == Not(Or((Substring("a"), Substring("b"))))
+
+
+@pytest.mark.unit
+def test_double_negation_is_not_collapsed() -> None:
+    # `--foo` stays the exact nested AST Not(Not(...)), never simplified to Substring.
+    assert parse("--foo") == Not(Not(Substring("foo")))
+
+
+@pytest.mark.unit
+def test_triple_negation_is_not_collapsed() -> None:
+    assert parse("---foo") == Not(Not(Not(Substring("foo"))))
+
+
+@pytest.mark.unit
+def test_negation_case_flag_propagates_to_negated_leaf() -> None:
+    # Case is query-global and stamped on the leaf; the Not wrapper is transparent to it.
+    assert parse("case:yes -/Foo/") == Not(Regex("Foo", True))
+    assert parse("case:yes -foo") == Not(Substring("foo", True))
+
+
+@pytest.mark.unit
+def test_quoted_leading_dash_is_a_literal_substring_not_negation() -> None:
+    # The escape hatch: quoting keeps a leading dash as a literal, never a NOT.
+    assert parse('"-foo"') == Substring("-foo", False)
+
+
+# ------------------------------------------------------- negation: compat fallthrough (no NOT)
+
+
+@pytest.mark.unit
+def test_bare_dash_at_eof_is_literal_substring() -> None:
+    # `-` with no following char is NOT negation -- it falls through to the bareword scan.
+    assert parse("-") == Substring("-")
+
+
+@pytest.mark.unit
+def test_trailing_dash_is_literal_substring() -> None:
+    assert parse("foo -") == And((Substring("foo"), Substring("-")))
+
+
+@pytest.mark.unit
+def test_dash_before_whitespace_is_literal_substring() -> None:
+    assert parse("a - b") == And((Substring("a"), Substring("-"), Substring("b")))
+
+
+@pytest.mark.unit
+def test_dash_before_rparen_is_literal_substring() -> None:
+    assert parse("(a -)") == And((Substring("a"), Substring("-")))
+
+
+@pytest.mark.unit
+def test_interior_dash_is_preserved_in_bareword() -> None:
+    assert parse("foo-bar") == Substring("foo-bar")
+
+
+@pytest.mark.unit
+def test_dash_inside_field_value_is_preserved() -> None:
+    assert parse("repo:foo-bar") == RepoFilter("foo-bar")
+
+
+# ------------------------------------------------------------------- negation: depth guard
+
+
+@pytest.mark.unit
+def test_long_flat_chain_of_negations_does_not_trip_depth_guard() -> None:
+    # 250 sibling `-a` terms ANDed: each negation is parsed and unwound independently, so depth
+    # tracks NESTING (always 1 here), never a running count of NOT tokens across the AND chain.
+    query = " ".join(["-a"] * 250)
+    result = parse(query)
+    assert isinstance(result, And)
+    assert len(result.children) == 250
+    assert all(child == Not(Substring("a")) for child in result.children)
+
+
+@pytest.mark.unit
+def test_deeply_nested_negation_trips_depth_guard() -> None:
+    # `-` * 201 before one operand nests 201 deep (> _MAX_DEPTH == 200) and must raise.
+    with pytest.raises(QueryParseError) as exc:
+        parse("-" * 201 + "a")
+    assert "too deep" in str(exc.value)
+
+
+@pytest.mark.unit
+def test_nesting_just_under_the_guard_is_accepted() -> None:
+    # `-` * 200 nests exactly to the limit and parses (200 is not > 200).
+    result = parse("-" * 200 + "a")
+    node: object = result
+    for _ in range(200):
+        assert isinstance(node, Not)
+        node = node.child
+    assert node == Substring("a")
+
+
+# ---------------------------------------------------------------- negation: error cases
+
+
+@pytest.mark.unit
+def test_negated_or_keyword_raises() -> None:
+    # `-or`: NOT applied to a dangling operand -- `or` lexes as the OR keyword, which is not a
+    # valid primary, so this raises (matching parse_or's dangling-OR rejection).
+    with pytest.raises(QueryParseError):
+        parse("-or")
+
+
+@pytest.mark.unit
+def test_negated_uppercase_or_keyword_raises() -> None:
+    with pytest.raises(QueryParseError):
+        parse("-OR")
+
+
+@pytest.mark.unit
+def test_negated_case_flag_raises() -> None:
+    # `case:` is a termless query-global flag; negating it is meaningless -> a loud error at the
+    # NOT token's position.
+    with pytest.raises(QueryParseError) as exc:
+        parse("-case:yes")
+    assert exc.value.position == 0
+
+
+@pytest.mark.unit
+def test_double_negated_case_flag_raises() -> None:
+    with pytest.raises(QueryParseError):
+        parse("--case:yes")
+
+
+@pytest.mark.unit
+def test_negated_case_only_group_raises() -> None:
+    with pytest.raises(QueryParseError):
+        parse("-(case:yes)")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("query", ["-content:x", "-r:x", "-b:x"])
+def test_negated_reserved_field_raises(query: str) -> None:
+    # The reserved-field rejection fires while scanning the field itself, so wrapping it in NOT
+    # changes nothing -- it still raises.
+    with pytest.raises(QueryParseError):
+        parse(query)
+
+
+@pytest.mark.unit
+def test_negated_empty_group_raises() -> None:
+    with pytest.raises(QueryParseError):
+        parse("-()")
+
+
+@pytest.mark.unit
+def test_negation_before_rparen_raises_on_the_paren() -> None:
+    # `-)`: the '-' is a literal Substring (fallthrough), then a stray ')' -> unexpected ')'.
+    with pytest.raises(QueryParseError) as exc:
+        parse("-)")
+    assert exc.value.position == 1
+
+
+@pytest.mark.unit
+def test_negation_then_unterminated_group_raises() -> None:
+    with pytest.raises(QueryParseError):
+        parse("-(")
+
+
+@pytest.mark.unit
+def test_negated_query_is_hashable_and_equal() -> None:
+    a = parse("-foo -(bar OR baz)")
+    b = parse("-foo -(bar OR baz)")
+    assert a == b
+    assert hash(a) == hash(b)
 
 
 # ---------------------------------------------------------------- dangling / malformed

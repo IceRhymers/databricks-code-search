@@ -5,8 +5,14 @@
     { "field": null, "value": "foo", "start": 18, "end": 21 }
   ] },
   { "query": "", "verdict": "safe", "python_parses": false, "atoms": [] },
-  { "query": "-repo:acme", "verdict": "safe", "python_parses": true, "atoms": [
-    { "field": null, "value": "-repo:acme", "start": 0, "end": 10 }
+  { "query": "-repo:acme", "verdict": "unsafe", "python_parses": true },
+  { "query": "-foo", "verdict": "unsafe", "python_parses": true },
+  { "query": "-foo bar", "verdict": "unsafe", "python_parses": true },
+  { "query": "-(foo bar)", "verdict": "unsafe", "python_parses": true },
+  { "query": "--foo", "verdict": "unsafe", "python_parses": true },
+  { "query": "foo -", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": null, "value": "foo", "start": 0, "end": 3 },
+    { "field": null, "value": "-", "start": 4, "end": 5 }
   ] },
   { "query": "Repo:acme", "verdict": "safe", "python_parses": true, "atoms": [
     { "field": null, "value": "Repo:acme", "start": 0, "end": 9 }

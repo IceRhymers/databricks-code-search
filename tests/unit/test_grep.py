@@ -165,6 +165,35 @@ def test_uncompilable_regex_flags_incompatible_without_crashing() -> None:
 
 
 @pytest.mark.unit
+def test_negated_content_atom_contributes_no_highlight_pattern() -> None:
+    # grep only highlights POSITIVE matches; a `-foo` exclusion is SQL-only and is never
+    # rendered as a highlight, so it collects no pattern (the positive `bar` survives).
+    patterns, regex_incompatible = _patterns("-foo bar")
+    assert regex_incompatible is False
+    assert [p.pattern for p in patterns] == ["bar"]
+    # A purely-negated query collects nothing at all -> filter-only at the grep layer.
+    only_neg, _ = _patterns("-foo")
+    assert only_neg == []
+
+
+@pytest.mark.unit
+def test_negated_broken_regex_does_not_flag_regex_incompatible() -> None:
+    # JUDGMENT CALL (plan: "reason it through"): a purely-negated broken regex (`-/[/`) builds
+    # NO highlight pattern, so nothing was meant to highlight and there is nothing whose
+    # highlighting capability was lost. We deliberately do NOT recurse into the Not to attempt a
+    # Python re.compile, so regex_incompatible stays False. (The SQL predicate still compiles the
+    # pattern server-side via Postgres POSIX ARE regardless of polarity, so exclusion
+    # correctness is unaffected -- only the Python-side highlight signal is suppressed.)
+    patterns, regex_incompatible = _patterns("-/[/")
+    assert patterns == []
+    assert regex_incompatible is False
+    # Contrast: the SAME broken regex un-negated DOES flag incompatible (it was meant to
+    # highlight and Python could not compile it).
+    _, positive_incompatible = _patterns("/[/")
+    assert positive_incompatible is True
+
+
+@pytest.mark.unit
 def test_matchers_collect_across_and_or_nesting_and_filters_contribute_none() -> None:
     patterns, regex_incompatible = _patterns("(foo OR bar) baz")
     assert regex_incompatible is False

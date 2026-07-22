@@ -32,6 +32,7 @@ from app.query.parser import (
     CommitFilter,
     LangFilter,
     Node,
+    Not,
     Or,
     PathFilter,
     QueryParseError,
@@ -151,15 +152,22 @@ def _query_has_symbol_atom(node: Node) -> bool:
 def _collect_branch_filters(node: Node) -> frozenset[str]:
     """Collect every ``branch:`` value in ``node``, under any ``And``/``Or`` nesting.
 
-    An empty ``frozenset`` means the query carries no ``branch:`` filter anywhere. This
-    mirrors :func:`app.query.compiler._has_branch_filter`'s tree walk, but -- unlike this
-    module's own :func:`_query_has_symbol_atom` -- it is deliberately EXHAUSTIVE: the tail is
-    ``assert_never(node)`` rather than a catch-all ``case _: return frozenset()``, so a future
-    :data:`Node` variant is a mypy error here, not a silently-empty result.
+    An empty ``frozenset`` means the query carries no AFFIRMATIVE ``branch:`` filter anywhere
+    (negated subtrees are skipped -- see the ``Not`` case). Deliberately EXHAUSTIVE -- unlike
+    this module's own :func:`_query_has_symbol_atom` -- with an ``assert_never(node)`` tail
+    rather than a catch-all ``case _: return frozenset()``, so a future :data:`Node` variant is
+    a mypy error here, not a silently-empty result.
     """
     match node:
         case BranchFilter(value=v):
             return frozenset({v})
+        case Not():
+            # Skip negated subtrees entirely (never recurse): this set drives permalink-branch
+            # selection (_select_permalink_branch) and the branch commit-metadata lookup, both of
+            # which mean "branches the author affirmatively scoped TO". A `-branch:x` is an
+            # EXCLUSION, not a selection -- folding x in here would wrongly make x an eligible
+            # permalink branch and fire a spurious repo_branches lookup for it.
+            return frozenset()
         case And(children=children) | Or(children=children):
             return frozenset().union(*(_collect_branch_filters(c) for c in children))
         case (
@@ -188,6 +196,11 @@ def _collect_commit_filters(node: Node) -> frozenset[str]:
     match node:
         case CommitFilter(value=v):
             return frozenset({v})
+        case Not():
+            # Skip negated subtrees (same rationale as _collect_branch_filters): a `-commit:x` is
+            # an exclusion predicate, not a reverse-lookup scope -- collecting x here would fire
+            # commit resolution and the scoped-search path for a commit the query means to EXCLUDE.
+            return frozenset()
         case And(children=children) | Or(children=children):
             return frozenset().union(*(_collect_commit_filters(c) for c in children))
         case (
@@ -215,6 +228,10 @@ def _has_content_atom(node: Node) -> bool:
     match node:
         case Substring() | Regex() | SymbolFilter():
             return True
+        case Not(child=child):
+            # A negated content atom is still content-bearing: `commit:abc -foo` is a scoped
+            # search (excluding foo), not a bare reverse-lookup, so recurse into the child.
+            return _has_content_atom(child)
         case And(children=children) | Or(children=children):
             return any(_has_content_atom(child) for child in children)
         case RepoFilter() | PathFilter() | LangFilter() | BranchFilter() | CommitFilter():
