@@ -13,12 +13,13 @@ read by these assertions instead of silently escaping them.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 _VERSIONS_DIR = Path(__file__).resolve().parents[2] / "app" / "alembic" / "versions"
-_EXPECTED_REVISIONS = {"0001", "0002", "0003", "0004"}
+_EXPECTED_REVISIONS = {"0001", "0002", "0003", "0004", "0005"}
 
 
 @pytest.fixture
@@ -46,6 +47,11 @@ def source_0002(sources: dict[str, str]) -> str:
 @pytest.fixture
 def source_0003(sources: dict[str, str]) -> str:
     return sources["0003"]
+
+
+@pytest.fixture
+def source_0005(sources: dict[str, str]) -> str:
+    return sources["0005"]
 
 
 @pytest.mark.unit
@@ -145,3 +151,77 @@ def test_0003_does_not_import_app_constant(source_0003: str) -> None:
             assert not line.startswith(("import app", "from app")), (
                 f"0003 must not import from the app package: {line!r}"
             )
+
+
+@pytest.mark.unit
+def test_0005_revision_identifiers(source_0005: str) -> None:
+    assert 'revision: str = "0005"' in source_0005
+    assert 'down_revision: str | None = "0004"' in source_0005
+
+
+@pytest.mark.unit
+def test_0005_does_not_import_app_constant(source_0005: str) -> None:
+    """A migration is a historical fact; it must not depend on a mutable app constant."""
+    code_lines = [
+        line
+        for line in source_0005.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    for line in code_lines:
+        if line.startswith(("import ", "from ")):
+            assert not line.startswith(("import app", "from app")), (
+                f"0005 must not import from the app package: {line!r}"
+            )
+
+
+@pytest.mark.unit
+def test_0005_downgrade_drops_indexes_then_table(source_0005: str) -> None:
+    downgrade_pos = source_0005.find("def downgrade()")
+    assert downgrade_pos != -1
+    downgrade_body = source_0005[downgrade_pos:]
+    for index_name in (
+        "ix_reference_edges_target_name",
+        "ix_reference_edges_target_trgm",
+        "ix_reference_edges_file_id",
+        "ix_reference_edges_repo_kind",
+    ):
+        assert f'op.drop_index("{index_name}"' in downgrade_body, (
+            f"0005 downgrade must drop {index_name!r}"
+        )
+    table_pos = downgrade_body.find('op.drop_table("reference_edges")')
+    assert table_pos != -1, "0005 downgrade must drop the reference_edges table"
+    last_index_pos = max(
+        downgrade_body.find(f'op.drop_index("{index_name}"')
+        for index_name in (
+            "ix_reference_edges_target_name",
+            "ix_reference_edges_target_trgm",
+            "ix_reference_edges_file_id",
+            "ix_reference_edges_repo_kind",
+        )
+    )
+    assert last_index_pos < table_pos, "all indexes must drop before the table"
+
+
+@pytest.mark.unit
+def test_0005_no_symbol_fk(source_0005: str) -> None:
+    """Epic #82 rule: reference_edges must never gain a symbols FK at the source level.
+
+    Quote-agnostic (matches ``symbols.id`` under either quoting style) so this
+    tripwire survives formatter drift, unlike a literal-substring check.
+    """
+    assert re.search(r"symbols\.id", source_0005) is None, (
+        "0005 migration must not reference a symbols.id FK target"
+    )
+    assert "REFERENCES symbols" not in source_0005, (
+        "0005 migration must not reference symbols via raw SQL REFERENCES"
+    )
+
+
+@pytest.mark.unit
+def test_0005_does_not_create_extension(source_0005: str) -> None:
+    """pg_trgm already exists since 0001 (database-wide); 0005 must not re-create it."""
+    upgrade_pos = source_0005.find("def upgrade()")
+    downgrade_pos = source_0005.find("def downgrade()")
+    assert upgrade_pos != -1 and downgrade_pos != -1
+    body = source_0005[upgrade_pos:downgrade_pos]
+    assert "CREATE EXTENSION" not in body

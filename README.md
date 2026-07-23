@@ -596,6 +596,9 @@ Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
   semantic search (default-on): the preload assumption, opt-out, embeddings, memory notes
 - [`docs/runbooks/indexing-parallelism.md`](docs/runbooks/indexing-parallelism.md) —
   parallel indexing: worker sizing, skip-if-unchanged, compare-and-set stamping
+- [`docs/runbooks/reference-edges.md`](docs/runbooks/reference-edges.md) — the raw
+  call/import edge schema (`reference_edges`, migration `0005`): what it stores, the
+  no-symbol-FK design, and the grant-coupling this migration introduces
 - [`docs/runbooks/ci-lakebase.md`](docs/runbooks/ci-lakebase.md) — the integration CI
   gate: ephemeral Lakebase branches, prerequisites
 - [`docs/runbooks/webui.md`](docs/runbooks/webui.md) — the web UI app: auth, grants,

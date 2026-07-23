@@ -4,7 +4,9 @@ Each test runs the migration in its own throwaway schema via an *injected*
 connection (the same path ``scripts/migrate.py`` uses), with the Alembic version
 table pinned to that schema. Requires a Lakebase branch whose project preloads
 ``lakebase_vector,lakebase_text`` (``upgrade head`` includes the 0004 semantic
-revision; see docs/runbooks/ci-lakebase.md).
+revision; see docs/runbooks/ci-lakebase.md). Exception: the ``reference_edges``
+(0005) tests use the ``migrated_edges_capable`` fixture, which reaches ``head``
+on a stock dev Postgres too -- see ``_upgrade_edges_capable``'s docstring.
 
 The enforcement test exercises the least-privilege grants on the *same* superuser
 connection via ``SET ROLE`` to a NOLOGIN role; opening a second engine would
@@ -27,7 +29,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from sqlalchemy import Connection, text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from app.db.client import create_db_engine
 from app.db.grants import build_app_grants, build_job_grants
@@ -85,6 +87,74 @@ def migrated() -> Iterator[Migrated]:
         engine.dispose()
 
 
+def _lakebase_extensions_available(conn: Connection) -> bool:
+    return bool(
+        conn.execute(
+            text("SELECT 1 FROM pg_available_extensions WHERE name = 'lakebase_tokenizer'")
+        ).scalar()
+    )
+
+
+_STUB_CHUNKS_DDL = (
+    "CREATE TABLE chunks ("
+    "id bigserial PRIMARY KEY, "
+    "file_id integer NOT NULL REFERENCES files(id) ON DELETE CASCADE, "
+    "chunk_index integer NOT NULL, "
+    "content text NOT NULL)"
+)
+
+
+def _upgrade_edges_capable(config: Config, conn: Connection, target: str) -> None:
+    """Upgrade to ``target`` ("0004" or "head"), working on both a real Lakebase
+    branch and a stock dev Postgres.
+
+    On real Lakebase, 0004 runs natively (the ``lakebase_*`` extensions exist).
+    On stock Postgres those extensions are absent, so this pre-seeds a stub
+    ``chunks`` table before reaching 0004 -- the exact idempotency guard
+    ``test_0004_guard_preserves_preexisting_chunks`` exercises -- which makes
+    0004 skip its extension/index DDL and land cleanly. 0005's ``reference_edges``
+    DDL is pure ``pg_trgm`` (no Lakebase dependency), so it then applies on
+    either environment.
+    """
+    if _lakebase_extensions_available(conn):
+        command.upgrade(config, target)
+        return
+    command.upgrade(config, "0003")
+    conn.execute(text(_STUB_CHUNKS_DDL))
+    command.upgrade(config, target)
+
+
+@pytest.fixture
+def migrated_edges_capable() -> Iterator[Migrated]:
+    """Like ``migrated``, but reaches ``head`` on stock Postgres too (see
+    ``_upgrade_edges_capable``) so the ``reference_edges`` tests run locally
+    without a live Lakebase branch."""
+    schema = _unique("test_edges")
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.commit()
+
+        config = Config("alembic.ini")
+        config.attributes["connection"] = conn
+        config.attributes["version_table_schema"] = schema
+
+        _upgrade_edges_capable(config, conn, "head")
+        conn.commit()
+
+        yield Migrated(conn=conn, schema=schema, config=config)
+    finally:
+        conn.rollback()
+        conn.execute(text("RESET ROLE"))
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
 @pytest.mark.integration
 def test_schema_fidelity(migrated: Migrated) -> None:
     conn, schema = migrated.conn, migrated.schema
@@ -97,7 +167,9 @@ def test_schema_fidelity(migrated: Migrated) -> None:
         .scalars()
         .all()
     )
-    assert {"repos", "files", "symbols", "repo_branches", "chunks"} <= set(tables)
+    assert {"repos", "files", "symbols", "repo_branches", "chunks", "reference_edges"} <= set(
+        tables
+    )
 
     rows = conn.execute(
         text("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = :s"),
@@ -110,6 +182,17 @@ def test_schema_fidelity(migrated: Migrated) -> None:
         assert "gin_trgm_ops" in by_name[idx]
     assert "ix_files_branches_gin" in by_name
     assert "USING gin" in by_name["ix_files_branches_gin"]
+
+    for idx in (
+        "ix_reference_edges_target_name",
+        "ix_reference_edges_file_id",
+        "ix_reference_edges_repo_kind",
+    ):
+        assert idx in by_name, f"missing index {idx}"
+        assert "USING gin" not in by_name[idx], f"{idx} must be a plain btree index"
+    assert "ix_reference_edges_target_trgm" in by_name
+    assert "USING gin" in by_name["ix_reference_edges_target_trgm"]
+    assert "gin_trgm_ops" in by_name["ix_reference_edges_target_trgm"]
 
     fk_count = conn.execute(
         text(
@@ -214,7 +297,8 @@ def test_downgrade_drops_tables_but_keeps_extension(migrated: Migrated) -> None:
         conn.execute(
             text(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = :s AND table_name IN ('repos', 'files', 'symbols')"
+                "WHERE table_schema = :s AND table_name IN "
+                "('repos', 'files', 'symbols', 'reference_edges')"
             ),
             {"s": schema},
         )
@@ -730,3 +814,325 @@ def test_0003_downgrade_blocked_by_multi_branch_data(migrated: Migrated) -> None
     with pytest.raises(RuntimeError, match="multi-branch data present"):
         command.downgrade(migrated.config, "0002")
     conn.rollback()
+
+
+def _seed_repo_and_file(
+    conn: Connection, *, repo_name: str, path: str, sha: str
+) -> tuple[int, int]:
+    conn.execute(text("INSERT INTO repos (name) VALUES (:n)"), {"n": repo_name})
+    repo_id = conn.execute(text("SELECT id FROM repos WHERE name = :n"), {"n": repo_name}).scalar()
+    conn.execute(
+        text(
+            "INSERT INTO files (repo_id, path, content_sha, branches) "
+            "VALUES (:r, :p, :sha, ARRAY['main'])"
+        ),
+        {"r": repo_id, "p": path, "sha": sha},
+    )
+    file_id = conn.execute(
+        text("SELECT id FROM files WHERE repo_id = :r AND path = :p"),
+        {"r": repo_id, "p": path},
+    ).scalar()
+    return repo_id, file_id
+
+
+@pytest.mark.integration
+def test_reference_edges_shape_and_constraints(migrated_edges_capable: Migrated) -> None:
+    conn = migrated_edges_capable.conn
+    repo_id, file_id = _seed_repo_and_file(conn, repo_name="shape_repo", path="a.py", sha="sha1")
+
+    conn.execute(
+        text(
+            "INSERT INTO reference_edges "
+            "(repo_id, file_id, edge_kind, target_name, line, enclosing_name, enclosing_kind, "
+            "enclosing_start_line, enclosing_end_line) "
+            "VALUES (:r, :f, 'call', 'target_fn', 5, 'caller_fn', 'function', 1, 20)"
+        ),
+        {"r": repo_id, "f": file_id},
+    )
+    conn.commit()
+    assert conn.execute(text("SELECT count(*) FROM reference_edges")).scalar() == 1
+
+    with pytest.raises(IntegrityError) as excinfo:
+        conn.execute(
+            text(
+                "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+                "VALUES (:r, :f, 'definition', 'x', 1)"
+            ),
+            {"r": repo_id, "f": file_id},
+        )
+    assert isinstance(excinfo.value.orig, psycopg.errors.CheckViolation)
+    conn.rollback()
+
+    with pytest.raises(IntegrityError) as excinfo:
+        conn.execute(
+            text(
+                "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+                "VALUES (:r, :f, 'call', NULL, 1)"
+            ),
+            {"r": repo_id, "f": file_id},
+        )
+    assert isinstance(excinfo.value.orig, psycopg.errors.NotNullViolation)
+    conn.rollback()
+
+
+@pytest.mark.integration
+def test_reference_edges_cascade_on_file_and_repo_delete(migrated_edges_capable: Migrated) -> None:
+    conn = migrated_edges_capable.conn
+    repo_id, file_id = _seed_repo_and_file(conn, repo_name="cascade_repo", path="a.py", sha="sha1")
+    conn.execute(
+        text(
+            "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+            "VALUES (:r, :f, 'call', 'target_fn', 5)"
+        ),
+        {"r": repo_id, "f": file_id},
+    )
+    conn.commit()
+    assert conn.execute(text("SELECT count(*) FROM reference_edges")).scalar() == 1
+
+    conn.execute(text("DELETE FROM files WHERE id = :f"), {"f": file_id})
+    conn.commit()
+    assert conn.execute(text("SELECT count(*) FROM reference_edges")).scalar() == 0
+
+    _, file_id2 = _seed_repo_and_file(conn, repo_name="cascade_repo2", path="b.py", sha="sha2")
+    repo_id2 = conn.execute(
+        text("SELECT repo_id FROM files WHERE id = :f"), {"f": file_id2}
+    ).scalar()
+    conn.execute(
+        text(
+            "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+            "VALUES (:r, :f, 'import', 'os', 1)"
+        ),
+        {"r": repo_id2, "f": file_id2},
+    )
+    conn.commit()
+    assert conn.execute(text("SELECT count(*) FROM reference_edges")).scalar() == 1
+
+    conn.execute(text("DELETE FROM repos WHERE id = :r"), {"r": repo_id2})
+    conn.commit()
+    assert conn.execute(text("SELECT count(*) FROM reference_edges")).scalar() == 0
+
+
+@pytest.mark.integration
+def test_reference_edges_adp_same_role_covers_new_table() -> None:
+    """Positive proof of the runbook's lifecycle-safe-grants claim: when the SAME
+    role runs ``ALTER DEFAULT PRIVILEGES`` and later creates ``reference_edges``
+    via a schema-only migrate, the app/job grants apply automatically -- no
+    re-grant between ``upgrade head`` and the privilege assertions below."""
+    schema = _unique("test_adp_same")
+    app_ro = _unique("app_ro")
+    job_rw = _unique("job_rw")
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text(f"CREATE ROLE {app_ro} NOLOGIN"))
+        conn.execute(text(f"CREATE ROLE {job_rw} NOLOGIN"))
+        conn.commit()
+
+        config = Config("alembic.ini")
+        config.attributes["connection"] = conn
+        config.attributes["version_table_schema"] = schema
+
+        _upgrade_edges_capable(config, conn, "0004")
+        conn.commit()
+
+        for stmt in build_app_grants(schema, app_ro):
+            conn.execute(text(stmt))
+        for stmt in build_job_grants(schema, job_rw):
+            conn.execute(text(stmt))
+        conn.commit()
+
+        # Same identity (this connection) now creates reference_edges via 0005 --
+        # no re-grant runs between this upgrade and the assertions below.
+        command.upgrade(config, "head")
+        conn.commit()
+
+        conn.execute(text(f"SET ROLE {app_ro}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("SELECT * FROM reference_edges")).all()
+        with pytest.raises(ProgrammingError) as excinfo:
+            conn.execute(
+                text(
+                    "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+                    "VALUES (1, 1, 'call', 'x', 1)"
+                )
+            )
+        assert isinstance(excinfo.value.orig, psycopg.errors.InsufficientPrivilege)
+        conn.rollback()
+
+        conn.execute(text(f"SET ROLE {job_rw}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        repo_id, file_id = _seed_repo_and_file(conn, repo_name="adp_repo", path="a.py", sha="sha1")
+        conn.execute(
+            text(
+                "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+                "VALUES (:r, :f, 'call', 'target_fn', 10)"
+            ),
+            {"r": repo_id, "f": file_id},
+        )
+        conn.execute(text("DELETE FROM reference_edges"))
+
+        # Negative proof: the job role's grants are DML-only (SELECT/INSERT/
+        # UPDATE/DELETE) -- no DDL, matching build_job_grants' least-privilege
+        # intent. A future accidental widening of that builder should fail here.
+        # (The failed TRUNCATE aborts the tx; rollback below also undoes SET ROLE,
+        # same as test_grant_enforcement_via_set_role.)
+        with pytest.raises(ProgrammingError) as excinfo:
+            conn.execute(text("TRUNCATE reference_edges"))
+        assert isinstance(excinfo.value.orig, psycopg.errors.InsufficientPrivilege)
+        conn.rollback()
+    finally:
+        conn.rollback()
+        conn.execute(text("RESET ROLE"))
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        for role in (app_ro, job_rw):
+            conn.execute(text(f"DROP OWNED BY {role} CASCADE"))
+            conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_reference_edges_adp_different_role_does_not_cover_new_table() -> None:
+    """Negative proof, motivating the runbook's re-grant command: Postgres ADP
+    binds to the EXECUTING role, not the schema -- a table created by a
+    different identity than the one that ran ``ALTER DEFAULT PRIVILEGES`` gets
+    no automatic grant."""
+    schema = _unique("test_adp_diff")
+    app_ro = _unique("app_ro")
+    other_creator = _unique("other_creator")
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"CREATE ROLE {app_ro} NOLOGIN"))
+        conn.execute(text(f"CREATE ROLE {other_creator} NOLOGIN"))
+        conn.execute(text(f"GRANT CREATE, USAGE ON SCHEMA {schema} TO {other_creator}"))
+        conn.commit()
+
+        for stmt in build_app_grants(schema, app_ro):
+            conn.execute(text(stmt))
+        conn.commit()
+
+        conn.execute(text(f"SET ROLE {other_creator}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("CREATE TABLE shadow_table (id serial PRIMARY KEY)"))
+        conn.execute(text("RESET ROLE"))
+        conn.commit()
+
+        has_select = conn.execute(
+            text(f"SELECT has_table_privilege('{app_ro}', '{schema}.shadow_table', 'SELECT')")
+        ).scalar()
+        assert has_select is False, (
+            "a table created by a different identity than the one that ran ADP "
+            "must NOT automatically receive the app role's SELECT grant"
+        )
+    finally:
+        conn.rollback()
+        conn.execute(text("RESET ROLE"))
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        for role in (app_ro, other_creator):
+            conn.execute(text(f"DROP OWNED BY {role} CASCADE"))
+            conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+def _seed_explain_fixture(conn: Connection) -> None:
+    repo_id, file_id = _seed_repo_and_file(conn, repo_name="explain_repo", path="a.py", sha="sha1")
+    conn.execute(
+        text(
+            "INSERT INTO symbols (file_id, repo_id, name, kind) "
+            "VALUES (:f, :r, 'handle_request', 'function')"
+        ),
+        {"f": file_id, "r": repo_id},
+    )
+    names = ["handle_request", "handle_response", "parse_args", "other_fn"] * 5
+    conn.execute(
+        text(
+            "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+            "VALUES (:r, :f, 'call', :name, :line)"
+        ),
+        [{"r": repo_id, "f": file_id, "name": name, "line": i + 1} for i, name in enumerate(names)],
+    )
+    conn.commit()
+
+
+@pytest.mark.integration
+def test_reference_edges_explain_resolver_join_uses_target_name_index(
+    migrated_edges_capable: Migrated,
+) -> None:
+    """EXPLAIN on the resolver's join shape (equality + name-join against
+    symbols) must reference the btree ``ix_reference_edges_target_name``."""
+    conn = migrated_edges_capable.conn
+    _seed_explain_fixture(conn)
+
+    with conn.begin():
+        conn.execute(text("SET LOCAL enable_seqscan = off"))
+        plan = (
+            conn.execute(
+                text(
+                    "EXPLAIN SELECT re.id FROM reference_edges re "
+                    "JOIN symbols s ON s.name = re.target_name "
+                    "WHERE re.target_name = 'handle_request'"
+                )
+            )
+            .scalars()
+            .all()
+        )
+    plan_text = "\n".join(plan)
+    assert "ix_reference_edges_target_name" in plan_text, plan_text
+
+
+@pytest.mark.integration
+def test_reference_edges_explain_ilike_uses_trgm_gin_index(
+    migrated_edges_capable: Migrated,
+) -> None:
+    conn = migrated_edges_capable.conn
+    _seed_explain_fixture(conn)
+
+    with conn.begin():
+        conn.execute(text("SET LOCAL enable_seqscan = off"))
+        plan = (
+            conn.execute(
+                text("EXPLAIN SELECT * FROM reference_edges WHERE target_name ILIKE '%handle%'")
+            )
+            .scalars()
+            .all()
+        )
+    plan_text = "\n".join(plan)
+    assert "ix_reference_edges_target_trgm" in plan_text, plan_text
+
+
+@pytest.mark.integration
+def test_reference_edges_downgrade_to_0004_removes_table_and_indexes(
+    migrated_edges_capable: Migrated,
+) -> None:
+    conn, schema, config = migrated_edges_capable
+
+    command.downgrade(config, "0004")
+    conn.commit()
+
+    assert conn.execute(text("SELECT to_regclass('reference_edges')")).scalar() is None
+    remaining_indexes = (
+        conn.execute(
+            text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = :s AND indexname LIKE 'ix_reference_edges%'"
+            ),
+            {"s": schema},
+        )
+        .scalars()
+        .all()
+    )
+    assert remaining_indexes == []
+
+    # The chain re-upgrades cleanly.
+    command.upgrade(config, "head")
+    conn.commit()
+    assert conn.execute(text("SELECT to_regclass('reference_edges')")).scalar() is not None
