@@ -142,6 +142,123 @@ def test_validate_search_payload_rejects_match_non_list_byte_ranges() -> None:
     assert smoke.validate_search_payload(payload).ok is False
 
 
+# --- validate_references_payload (shape-only + negatives) -------------------
+
+
+# find_references-shaped golden: one ambiguous site with two ranked candidates.
+REFERENCES_GOLDEN = {
+    "query": "process",
+    "kind": "references",
+    "symbol": "process",
+    "branch": None,
+    "query_too_broad": False,
+    "site_count": 1,
+    "sites": [
+        {
+            "repo": "acme/widgets",
+            "file": "src/caller.py",
+            "line": 5,
+            "edge_kind": "call",
+            "target_name": "process",
+            "enclosing_symbol": {"name": "run", "kind": "function"},
+            "resolution": "ambiguous",
+            "candidate_count": 2,
+            "candidates_truncated": False,
+            "candidates": [
+                {"repo": "acme/widgets", "file": "src/service.py", "line": 10, "name": "process"},
+                {"repo": "acme/widgets", "file": "src/worker.py", "line": 4, "name": "process"},
+            ],
+        }
+    ],
+    "resolution_summary": {"unique": 0, "ambiguous": 1, "unresolved": 0},
+    "truncated": False,
+    "truncation_reason": None,
+}
+
+# list_imports-shaped golden: carries `direction`, zero sites (accepted by design).
+IMPORTS_GOLDEN = {
+    "query": "acme/widgets",
+    "kind": "imports",
+    "direction": "imports",
+    "repo": "acme/widgets",
+    "repo_known": True,
+    "target": None,
+    "branch": None,
+    "query_too_broad": False,
+    "site_count": 0,
+    "sites": [],
+    "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+    "truncated": False,
+    "truncation_reason": None,
+}
+
+
+@pytest.mark.unit
+def test_validate_references_payload_accepts_references_golden() -> None:
+    assert smoke.validate_references_payload(REFERENCES_GOLDEN).ok is True
+
+
+@pytest.mark.unit
+def test_validate_references_payload_accepts_imports_golden_with_direction() -> None:
+    assert smoke.validate_references_payload(IMPORTS_GOLDEN).ok is True
+
+
+@pytest.mark.unit
+def test_validate_references_payload_accepts_zero_sites() -> None:
+    # A live corpus's symbols are unpredictable, so an empty-but-well-formed envelope is a PASS.
+    payload = {**REFERENCES_GOLDEN, "site_count": 0, "sites": []}
+    assert smoke.validate_references_payload(payload).ok is True
+
+
+@pytest.mark.unit
+def test_validate_references_payload_rejects_site_count_mismatch() -> None:
+    payload = {**REFERENCES_GOLDEN, "site_count": 5}
+    assert smoke.validate_references_payload(payload).ok is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flag", ["truncated", "query_too_broad"])
+def test_validate_references_payload_rejects_non_bool_flags(flag: str) -> None:
+    payload = {**REFERENCES_GOLDEN, flag: "nope"}
+    assert smoke.validate_references_payload(payload).ok is False
+
+
+@pytest.mark.unit
+def test_validate_references_payload_rejects_wrong_resolution_summary_keys() -> None:
+    payload = {**REFERENCES_GOLDEN, "resolution_summary": {"unique": 0, "ambiguous": 1}}
+    assert smoke.validate_references_payload(payload).ok is False
+
+
+@pytest.mark.unit
+def test_validate_references_payload_rejects_non_int_resolution_summary_values() -> None:
+    payload = {
+        **REFERENCES_GOLDEN,
+        "resolution_summary": {"unique": "0", "ambiguous": 1, "unresolved": 0},
+    }
+    assert smoke.validate_references_payload(payload).ok is False
+
+
+@pytest.mark.unit
+def test_validate_references_payload_rejects_non_list_sites() -> None:
+    payload = {**REFERENCES_GOLDEN, "sites": "nope", "site_count": 0}
+    assert smoke.validate_references_payload(payload).ok is False
+
+
+@pytest.mark.unit
+def test_validate_references_payload_rejects_site_missing_file() -> None:
+    bad_site = {**REFERENCES_GOLDEN["sites"][0]}
+    del bad_site["file"]
+    payload = {**REFERENCES_GOLDEN, "sites": [bad_site]}
+    assert smoke.validate_references_payload(payload).ok is False
+
+
+@pytest.mark.unit
+def test_validate_references_payload_rejects_site_non_int_line() -> None:
+    bad_site = {**REFERENCES_GOLDEN["sites"][0], "line": "5"}
+    payload = {**REFERENCES_GOLDEN, "sites": [bad_site]}
+    assert smoke.validate_references_payload(payload).ok is False
+
+
 # --- MCP leg TLS guard (returns before any I/O) -----------------------------
 
 

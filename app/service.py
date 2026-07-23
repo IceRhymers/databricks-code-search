@@ -26,6 +26,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import Settings
 from app.db.models import File, Repo, RepoBranch
+from app.query.compiler import DEFAULT_ROW_LIMIT
 from app.query.parser import (
     And,
     BranchFilter,
@@ -1031,23 +1032,137 @@ def find_references_payload(
     }
 
 
-def list_imports_payload(
-    engine: Engine, cfg: Settings, repo: str, limit: int, branch: str | None = None
+_LIST_IMPORTS_DIRECTIONS = ("imports", "imported_by")
+
+# Deterministic ``query`` echo for the three PRE-DB validation-error payloads (Critic note 3):
+# the dedicated ``direction``/``repo``/``target`` fields already carry the caller's actual
+# inputs, so ``query`` is pinned to the empty string for EVERY validation error -- one
+# deterministic value across all three, independent of which argument was missing/invalid.
+_LIST_IMPORTS_VALIDATION_QUERY = ""
+
+
+def _list_imports_error_payload(
+    *,
+    direction: str,
+    repo: str | None,
+    target: str | None,
+    branch: str | None,
+    error_key: str,
+    error_value: Any,
+    reason: str,
 ) -> dict[str, Any]:
-    """Enumerate a repo's ``import`` edge sites (``repo`` is REQUIRED -- see D8: a corpus-wide
-    listing would filter on ``edge_kind`` alone, the trailing column of
-    ``ix_reference_edges_repo_kind (repo_id, edge_kind)``, which is not index-served).
+    """One deterministic PRE-DB validation-error shape for :func:`list_imports_payload`.
+
+    Mirrors ``app.search.semantic``'s ``unsupported_filter`` precedent: the full empty envelope
+    (``sites``/``site_count``/``resolution_summary``/``truncated``/``truncation_reason``/
+    ``query_too_broad``) plus the uniform ``kind``/``direction``/``repo``/``repo_known``/
+    ``target``/``branch`` keys, plus the single structured error flag (``unsupported_direction``
+    / ``missing_repo`` / ``missing_target``) and its remedy ``reason``. ``repo_known`` is
+    ``True``: a validation error is never a repo-existence miss (no DB lookup happened).
+    """
+    return {
+        "query": _LIST_IMPORTS_VALIDATION_QUERY,
+        "kind": "imports",
+        "direction": direction,
+        "repo": repo,
+        "repo_known": True,
+        "target": target,
+        "branch": branch,
+        "query_too_broad": False,
+        "sites": [],
+        "site_count": 0,
+        "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+        "truncated": False,
+        "truncation_reason": None,
+        error_key: error_value,
+        "reason": reason,
+    }
+
+
+def list_imports_payload(
+    engine: Engine,
+    cfg: Settings,
+    repo: str | None = None,
+    limit: int = DEFAULT_ROW_LIMIT,
+    branch: str | None = None,
+    *,
+    target: str | None = None,
+    direction: str = "imports",
+) -> dict[str, Any]:
+    """Enumerate ``import`` edge sites in one of two directions over ``edge_kind="import"``.
+
+    Both directions collapse to the SAME resolver call
+    (``resolve_references(edge_kind="import", repo=?, target_name=?)``); ``direction`` only
+    decides which argument is REQUIRED:
+
+    * ``direction="imports"`` (default): **``repo`` is REQUIRED** -- a corpus-wide listing
+      would filter on ``edge_kind`` alone, the trailing column of
+      ``ix_reference_edges_repo_kind (repo_id, edge_kind)``, which is not index-served. Lists
+      the repo's import sites; an optional ``target`` narrows to sites importing that exact
+      dotted path (index-served by ``ix_reference_edges_target_name`` either way).
+    * ``direction="imported_by"``: **``target`` is REQUIRED** -- "who imports X", corpus-wide
+      over ``ix_reference_edges_target_name`` (index-served, NOT the seq-scan case #86 D8
+      rejects). An optional ``repo`` narrows to importers within that one repo.
+
+    Deterministic PRE-DB validation returns a structured payload, NEVER an exception (mirroring
+    ``app.search.semantic``'s ``unsupported_filter``): an unknown ``direction`` sets
+    ``unsupported_direction`` (echoing the value); ``imports`` with no ``repo`` sets
+    ``missing_repo``; ``imported_by`` with no ``target`` sets ``missing_target``. Each carries
+    a remedy ``reason`` and the full empty envelope, and is proven to touch no DB.
 
     ``repo_known=False`` is a structured "no such repo" miss (mirrors ``get_file_payload``'s
-    ``found: False``) -- distinct from a known repo with zero import sites, which returns
-    ``repo_known=True`` and an empty ``sites`` list. Import edges are largely EXTERNAL by
-    design (D3: exact dotted-path match only, no last-segment split), so most sites are
-    expected to resolve ``"unresolved"`` -- that is not itself an error.
+    ``found: False``) -- distinct from a known repo with zero import sites (``repo_known=True``,
+    empty ``sites``); it is always ``True`` when no ``repo`` scope was requested. Import edges
+    are largely EXTERNAL by design (#86 D3: exact dotted-path match only, no last-segment
+    split), so most sites are expected to resolve ``"unresolved"`` -- not itself an error.
+
+    Uniform key set across both directions: ``query`` (the ``repo`` for ``imports``, the
+    ``target`` for ``imported_by``), ``kind:"imports"``, ``direction``, ``repo``, ``repo_known``,
+    ``target``, ``branch``, ``query_too_broad``, plus the shared reference envelope. All keys
+    are additive and permanent. Validation lives HERE (the service layer) so the #88 web UI
+    inherits it; the MCP tool is a pure wrapper. ``limit`` is the caller's already-clamped row
+    limit (mirrors :func:`find_references_payload`).
     """
+    if direction not in _LIST_IMPORTS_DIRECTIONS:
+        return _list_imports_error_payload(
+            direction=direction,
+            repo=repo,
+            target=target,
+            branch=branch,
+            error_key="unsupported_direction",
+            error_value=direction,
+            reason="direction must be one of 'imports' or 'imported_by'",
+        )
+    if direction == "imports" and repo is None:
+        return _list_imports_error_payload(
+            direction=direction,
+            repo=repo,
+            target=target,
+            branch=branch,
+            error_key="missing_repo",
+            error_value=True,
+            reason="direction='imports' requires a repo to enumerate; pass repo=",
+        )
+    if direction == "imported_by" and target is None:
+        return _list_imports_error_payload(
+            direction=direction,
+            repo=repo,
+            target=target,
+            branch=branch,
+            error_key="missing_target",
+            error_value=True,
+            reason="direction='imported_by' requires a target dotted path; pass target=",
+        )
+
+    # `query` echoes the direction-primary argument: the repo enumerated (imports) or the
+    # target searched for (imported_by).
+    query = repo if direction == "imports" else target
+
     with engine.connect() as conn:
         try:
             result = resolve_references(
                 conn,
+                target_name=target,
                 edge_kind="import",
                 repo=repo,
                 branch=branch,
@@ -1056,11 +1171,13 @@ def list_imports_payload(
             )
         except QueryTooBroadError:
             return {
-                "query": repo,
+                "query": query,
                 "kind": "imports",
+                "direction": direction,
                 "repo": repo,
-                "branch": branch,
                 "repo_known": True,
+                "target": target,
+                "branch": branch,
                 "sites": [],
                 "site_count": 0,
                 "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
@@ -1071,11 +1188,13 @@ def list_imports_payload(
         name_map = _reference_repo_name_map(conn, result, cfg)
 
     return {
-        "query": repo,
+        "query": query,
         "kind": "imports",
+        "direction": direction,
         "repo": repo,
-        "branch": branch,
         "repo_known": result.repo_known,
+        "target": target,
+        "branch": branch,
         "query_too_broad": False,
         **_reference_result_to_payload(result, name_map),
     }

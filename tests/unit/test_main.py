@@ -1025,6 +1025,100 @@ async def test_get_file_tool_threads_branch(monkeypatch: pytest.MonkeyPatch) -> 
     assert captured["branch"] == "feature/x"
 
 
+# ------------------------------------------------------ reference tools: wiring / clamp
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_references_tool_threads_symbol_branch_and_clamps_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_payload(
+        engine: Any, cfg: Settings, name: str, limit: int, branch: str | None = None
+    ) -> dict[str, Any]:
+        captured["name"] = name
+        captured["limit"] = limit
+        captured["branch"] = branch
+        return {"kind": "references"}
+
+    monkeypatch.setattr(main, "_find_references_payload", _fake_payload)
+    ctx = _FakeLifespanContext(_FakeEngine([]), _cfg())
+
+    # 0 clamps to the default row_limit (200); the symbol/branch thread straight through.
+    await main.find_references("Handler", ctx, limit=0, branch="feature/x")  # type: ignore[arg-type]
+
+    assert captured["name"] == "Handler"
+    assert captured["branch"] == "feature/x"
+    assert captured["limit"] == 200
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_imports_tool_threads_all_params_imports_direction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_payload(
+        engine: Any,
+        cfg: Settings,
+        repo: str | None = None,
+        limit: int = 0,
+        branch: str | None = None,
+        *,
+        target: str | None = None,
+        direction: str = "imports",
+    ) -> dict[str, Any]:
+        captured.update(repo=repo, limit=limit, branch=branch, target=target, direction=direction)
+        return {"kind": "imports"}
+
+    monkeypatch.setattr(main, "_list_imports_payload", _fake_payload)
+    ctx = _FakeLifespanContext(_FakeEngine([]), _cfg())
+
+    # 10_000 clamps to max_row_limit (1000).
+    await main.list_imports(  # type: ignore[arg-type]
+        ctx, repo="acme/widgets", target="os.path", branch="feature/x", limit=10_000
+    )
+
+    assert captured["repo"] == "acme/widgets"
+    assert captured["target"] == "os.path"
+    assert captured["direction"] == "imports"
+    assert captured["branch"] == "feature/x"
+    assert captured["limit"] == 1000
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_list_imports_tool_threads_imported_by_direction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_payload(
+        engine: Any,
+        cfg: Settings,
+        repo: str | None = None,
+        limit: int = 0,
+        branch: str | None = None,
+        *,
+        target: str | None = None,
+        direction: str = "imports",
+    ) -> dict[str, Any]:
+        captured.update(repo=repo, target=target, direction=direction)
+        return {"kind": "imports"}
+
+    monkeypatch.setattr(main, "_list_imports_payload", _fake_payload)
+    ctx = _FakeLifespanContext(_FakeEngine([]), _cfg())
+
+    await main.list_imports(ctx, target="os.path", direction="imported_by")  # type: ignore[arg-type]
+
+    assert captured["direction"] == "imported_by"
+    assert captured["target"] == "os.path"
+    assert captured["repo"] is None
+
+
 # ------------------------------------------------- search_code: divergent content_sha merge
 
 
@@ -1141,3 +1235,30 @@ def test_signals_log_includes_both_flags() -> None:
     signals = main._signals({"no_content_atom": True, "zero_width_only_atoms": False})
     assert signals["no_content_atom"] is True
     assert signals["zero_width_only_atoms"] is False
+
+
+@pytest.mark.observability
+def test_signals_log_includes_reference_tool_keys() -> None:
+    # A list_imports validation miss / repo typo must be diagnosable from the log line alone --
+    # otherwise it reads identically to a genuine empty result.
+    signals = main._signals(
+        {
+            "repo_known": False,
+            "unsupported_direction": "sideways",
+            "missing_repo": True,
+            "missing_target": None,
+        }
+    )
+    assert signals["repo_known"] is False
+    assert signals["unsupported_direction"] == "sideways"
+    assert signals["missing_repo"] is True
+    assert signals["missing_target"] is None
+
+
+@pytest.mark.observability
+def test_signals_are_none_safe_on_payloads_without_reference_keys() -> None:
+    # The four additive keys are None-safe .get() extractions: a search_code payload that never
+    # carries them still produces the keys (as None), never a KeyError.
+    signals = main._signals({"truncated": False})
+    for key in ("repo_known", "unsupported_direction", "missing_repo", "missing_target"):
+        assert signals[key] is None
