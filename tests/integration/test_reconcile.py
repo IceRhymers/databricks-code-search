@@ -145,6 +145,23 @@ def _cfg() -> Settings:
     )
 
 
+def _seed_reference_edge(
+    conn: Connection, *, repo_id: int, file_id: int, target_name: str = "target_fn"
+) -> None:
+    """Seed one raw reference edge row (indexer.store has no writer yet -- #84)."""
+    conn.execute(
+        text(
+            "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+            "VALUES (:r, :f, 'call', :name, 1)"
+        ),
+        {"r": repo_id, "f": file_id, "name": target_name},
+    )
+
+
+def _repo_id(conn: Connection, name: str) -> int:
+    return int(conn.execute(text("SELECT id FROM repos WHERE name = :n"), {"n": name}).scalar_one())
+
+
 def _repo_branch_names(conn: Connection, name: str) -> set[str]:
     rows = (
         conn.execute(
@@ -278,9 +295,15 @@ def test_divergent_branch_only_file_is_deleted_with_symbols_and_chunks_cascade(
     )
     conn.rollback()
 
+    repo_id = _repo_id(conn, "acme/widgets")
     feature_file_id = _file_id(conn, "only_feature.py")
+    main_file_id = _file_id(conn, "main.py")
+    _seed_reference_edge(conn, repo_id=repo_id, file_id=feature_file_id, target_name="retired_fn")
+    _seed_reference_edge(conn, repo_id=repo_id, file_id=main_file_id, target_name="surviving_fn")
+    conn.commit()
     assert _count(conn, "symbols", f"file_id = {feature_file_id}") == 1
     assert _count(conn, "chunks", f"file_id = {feature_file_id}") == 1
+    assert _count(conn, "reference_edges", f"file_id = {feature_file_id}") == 1
     conn.rollback()  # clear the reads' autobegun txn before reconcile's own conn.begin()
 
     counts = reconcile_retired_branches(conn, name="acme/widgets", retired_branches=["feature"])
@@ -289,10 +312,12 @@ def test_divergent_branch_only_file_is_deleted_with_symbols_and_chunks_cascade(
     assert _count(conn, "files", "path = 'only_feature.py'") == 0
     assert _count(conn, "symbols", f"file_id = {feature_file_id}") == 0  # cascade
     assert _count(conn, "chunks", f"file_id = {feature_file_id}") == 0  # cascade
+    assert _count(conn, "reference_edges", f"file_id = {feature_file_id}") == 0  # cascade
 
-    # main.py's branch ('main') was never retired -> untouched.
+    # main.py's branch ('main') was never retired -> untouched, including its edge row.
     assert _count(conn, "files", "path = 'main.py'") == 1
     assert _branches_of(conn, "main.py") == ["main"]
+    assert _count(conn, "reference_edges", f"file_id = {main_file_id}") == 1
 
 
 @pytest.mark.integration
@@ -482,7 +507,7 @@ def test_reconcile_runs_under_the_actual_job_role(conn: Connection) -> None:
 
 
 @pytest.mark.integration
-def test_reconcile_removed_repos_purges_repo_and_cascades_all_five_tables(
+def test_reconcile_removed_repos_purges_repo_and_cascades_all_six_tables(
     conn: Connection,
 ) -> None:
     index_repo(
@@ -508,9 +533,13 @@ def test_reconcile_removed_repos_purges_repo_and_cascades_all_five_tables(
 
     # Capture the victim's file_id(s) BEFORE the purge -- once the repo row is gone,
     # post-hoc reconstruction via a repo-name JOIN is impossible.
+    removed_repo_id = _repo_id(conn, "acme/removed")
     removed_file_id = _file_id(conn, "only_feature.py", repo="acme/removed")
+    _seed_reference_edge(conn, repo_id=removed_repo_id, file_id=removed_file_id)
+    conn.commit()
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 1
     assert _count(conn, "chunks", f"file_id = {removed_file_id}") == 1
+    assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 1
     conn.rollback()  # clear the reads' autobegun txn before reconcile's own conn.begin()
 
     deleted = reconcile_removed_repos(conn, desired_repos=["acme/kept"])
@@ -521,6 +550,7 @@ def test_reconcile_removed_repos_purges_repo_and_cascades_all_five_tables(
     assert _count(conn, "files", "path = 'only_feature.py'") == 0
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 0  # cascade
     assert _count(conn, "chunks", f"file_id = {removed_file_id}") == 0  # cascade
+    assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 0  # cascade
 
     # acme/kept is completely untouched.
     assert _count(conn, "repos", "name = 'acme/kept'") == 1

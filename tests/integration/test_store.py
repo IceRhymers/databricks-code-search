@@ -131,8 +131,21 @@ def test_rerun_is_idempotent(conn: Connection) -> None:
 @pytest.mark.integration
 def test_mark_and_sweep_removes_deleted_file(conn: Connection) -> None:
     _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
+    repo_id = conn.execute(text("SELECT id FROM repos WHERE name = 'acme/widgets'")).scalar_one()
     removed_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'util.py'")).scalar_one()
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 1
+
+    # index_repo has no reference_edges writer yet (#84); seed one directly to
+    # prove the sweep's FK cascade reaches this table too.
+    conn.execute(
+        text(
+            "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
+            "VALUES (:r, :f, 'call', 'target_fn', 1)"
+        ),
+        {"r": repo_id, "f": removed_file_id},
+    )
+    conn.commit()
+    assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 1
 
     # Reads above autobegan a txn; clear it so index_repo gets a clean connection
     # (production hands a fresh engine.connect() per repo).
@@ -144,6 +157,7 @@ def test_mark_and_sweep_removes_deleted_file(conn: Connection) -> None:
 
     assert _count(conn, "files", "path = 'util.py'") == 0
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 0  # cascade
+    assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 0  # cascade
     assert _count(conn, "files") == 1
     assert _count(conn, "files", "commit = 'sha_second'") == 1
 

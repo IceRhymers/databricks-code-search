@@ -58,7 +58,13 @@ def test_create_engine_local_mode_never_touches_sdk(
 
 @pytest.mark.unit
 def test_metadata_has_exactly_durable_core_tables() -> None:
-    assert set(Base.metadata.tables) == {"repos", "files", "symbols", "repo_branches"}
+    assert set(Base.metadata.tables) == {
+        "repos",
+        "files",
+        "symbols",
+        "repo_branches",
+        "reference_edges",
+    }
 
 
 @pytest.mark.unit
