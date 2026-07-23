@@ -130,7 +130,7 @@ from indexer.store import (
     reconcile_removed_repos,
     reconcile_retired_branches,
 )
-from indexer.symbols import extract_symbols
+from indexer.symbols import extract_file
 
 logger = logging.getLogger("indexer.job")
 
@@ -467,11 +467,12 @@ def run(
                         ok += 1
                         assert outcome.counts is not None
                         logger.info(
-                            "indexed %s@%s: files=%d symbols=%d swept=%d",
+                            "indexed %s@%s: files=%d symbols=%d edges=%d swept=%d",
                             entry.name,
                             outcome.branch,
                             outcome.counts.files,
                             outcome.counts.symbols,
+                            outcome.counts.edges,
                             outcome.counts.swept,
                         )
 
@@ -1017,10 +1018,10 @@ def _index_one_branch(
                         exc_info=True,
                     )
                     chunk_writer = None
-                items = ((pf, extract_symbols(pf)) for pf in files)
+                items = ((pf, extract_file(pf)) for pf in files)
             else:
                 # Lazy generator: files stream through the open transaction (bounded memory).
-                items = ((pf, extract_symbols(pf)) for pf in iter_source_files(root))
+                items = ((pf, extract_file(pf)) for pf in iter_source_files(root))
 
             with engine.connect() as conn:
                 counts = index_fn(

@@ -26,9 +26,9 @@ from dataclasses import dataclass
 from sqlalchemy import Connection, delete, func, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from app.db.models import INDEX_SEMANTICS_VERSION, File, Repo, RepoBranch, Symbol
+from app.db.models import INDEX_SEMANTICS_VERSION, File, ReferenceEdge, Repo, RepoBranch, Symbol
 from indexer.hashing import content_sha
-from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+from indexer.languages import FileExtraction, IndexCounts, ParsedFile
 
 logger = logging.getLogger("indexer.store")
 
@@ -76,7 +76,7 @@ def index_repo(
     branch: str,
     is_default: bool,
     head_sha: str,
-    items: Iterable[tuple[ParsedFile, list[ExtractedSymbol]]],
+    items: Iterable[tuple[ParsedFile, FileExtraction]],
     chunk_writer: ChunkWriter | None = None,
 ) -> IndexCounts:
     """Upsert one ``(repo, branch)``'s files/symbols and sweep this branch's stale membership.
@@ -98,10 +98,10 @@ def index_repo(
        whose content already exists under another branch gets THIS branch
        unioned into its ``branches`` array (one row, shared content); a file
        whose content differs from every existing version gets its own row. Then
-       delete-and-reinsert its ``symbols`` (no natural key), then call
-       ``chunk_writer`` (if given) so chunk writes commit/roll back with the
-       rest of that file's row. Each processed file's ``(path, content_sha)`` is
-       collected into this branch's seen-set.
+       delete-and-reinsert its ``symbols`` and ``reference_edges`` (neither has a
+       natural key), then call ``chunk_writer`` (if given) so chunk writes
+       commit/roll back with the rest of that file's row. Each processed file's
+       ``(path, content_sha)`` is collected into this branch's seen-set.
     4. Membership sweep, keyed on THIS branch's seen-set (never on ``commit``,
        which is ambiguous under dedup): strip ``branch`` from any row's
        ``branches`` array that is not in the seen-set, then delete any row left
@@ -121,6 +121,7 @@ def index_repo(
     """
     file_count = 0
     symbol_count = 0
+    edge_count = 0
     seen_paths: list[str] = []
     seen_shas: list[str] = []
 
@@ -157,7 +158,7 @@ def index_repo(
         )
         baseline_commit, baseline_version = conn.execute(branch_stmt).one()
 
-        for pf, syms in items:
+        for pf, ex in items:
             sha = content_sha(pf.content)
             file_stmt = (
                 pg_insert(File)
@@ -197,7 +198,7 @@ def index_repo(
             seen_shas.append(sha)
 
             conn.execute(delete(Symbol).where(Symbol.file_id == file_id))
-            if syms:
+            if ex.symbols:
                 conn.execute(
                     pg_insert(Symbol),
                     [
@@ -209,10 +210,34 @@ def index_repo(
                             "start_line": s.start_line,
                             "end_line": s.end_line,
                         }
-                        for s in syms
+                        for s in ex.symbols
                     ],
                 )
-                symbol_count += len(syms)
+                symbol_count += len(ex.symbols)
+
+            # UNCONDITIONAL, same as the symbols delete above: a file whose edges
+            # all vanish (e.g. every call/import site removed) must shed its stale
+            # rows even when this run's ex.edges is empty.
+            conn.execute(delete(ReferenceEdge).where(ReferenceEdge.file_id == file_id))
+            if ex.edges:
+                conn.execute(
+                    pg_insert(ReferenceEdge),
+                    [
+                        {
+                            "file_id": file_id,
+                            "repo_id": repo_id,
+                            "edge_kind": e.kind,
+                            "target_name": e.target,
+                            "line": e.line,
+                            "enclosing_name": e.enclosing.name if e.enclosing else None,
+                            "enclosing_kind": e.enclosing.kind if e.enclosing else None,
+                            "enclosing_start_line": e.enclosing.start_line if e.enclosing else None,
+                            "enclosing_end_line": e.enclosing.end_line if e.enclosing else None,
+                        }
+                        for e in ex.edges
+                    ],
+                )
+                edge_count += len(ex.edges)
 
             if chunk_writer is not None:
                 chunk_writer(conn, repo_id, file_id, pf)
@@ -236,7 +261,7 @@ def index_repo(
             baseline_version=baseline_version,
         )
 
-    return IndexCounts(files=file_count, symbols=symbol_count, swept=swept)
+    return IndexCounts(files=file_count, symbols=symbol_count, swept=swept, edges=edge_count)
 
 
 def _sweep_membership(

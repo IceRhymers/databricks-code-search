@@ -129,7 +129,7 @@ def _index_fn(
     chunk_writer: Any = None,
 ) -> IndexCounts:
     files = len(list(items))
-    return IndexCounts(files=files, symbols=0, swept=0)
+    return IndexCounts(files=files, symbols=0, swept=0, edges=0)
 
 
 # No-op reconcile fns: a clean run in these tests always passes

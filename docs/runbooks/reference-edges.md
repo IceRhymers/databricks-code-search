@@ -27,14 +27,41 @@ joins through `files` with the same `coalesce(default_branch,'HEAD')` conjunct u
 everywhere else), and `files.commit` is documented-ambiguous under multi-branch dedup and
 must gain no new readers.
 
-**This table is dormant until #84 ships a writer.** `0005` only creates the schema; no
-code path inserts rows yet. `indexer/store.py`'s cascade-owning functions (`index_repo`'s
-membership sweep, `reconcile_retired_branches`, `reconcile_removed_repos`) already
-enumerate `reference_edges` alongside `symbols`/`chunks` in their docstrings and rely on
-the same FK-cascade mechanism proven in §7.2 of the design doc and in
+**#84 shipped the writer.** `indexer/symbols.py`'s `extract_file` walks each file's parse
+tree once, emitting both `symbols` and `reference_edges` candidates from the same pass
+(`indexer/languages.py`'s `EDGE_NODE_KINDS`, Python-only for now — the other six languages
+land in #85). `indexer/store.py::index_repo` writes them exactly like `symbols`: an
+unconditional per-file `DELETE` followed by a bulk reinsert, inside the same transaction as
+the rest of that file's row, so a file whose edges all vanish still sheds its stale rows.
+`indexer/store.py`'s cascade-owning functions (`index_repo`'s membership sweep,
+`reconcile_retired_branches`, `reconcile_removed_repos`) already enumerate
+`reference_edges` alongside `symbols`/`chunks` in their docstrings and rely on the same
+FK-cascade mechanism proven in §7.2 of the design doc and in
 `tests/integration/test_reconcile.py` / `test_store.py` — no behavior change was needed to
 make the cascade correct, because both `repos -> reference_edges` and
 `files -> reference_edges` are `ON DELETE CASCADE` foreign keys.
+
+**What gets extracted (Python, #84):**
+
+- **`call`** edges target the rightmost identifier of the callee: `f()` / `a.b.f()` /
+  `self.f()` all target `f`. Callees with no rightmost identifier (`xs[0]()`, the outer call
+  of `f()()`) are skipped — candidate-set semantics, not full resolution.
+- **`import`** edges target the full dotted path as written, alias-insensitive:
+  `import a.b.c as d` targets `a.b.c`, not `d`. `from a.b import c, d as e` yields two edges
+  (`a.b.c`, `a.b.d`). Relative imports preserve source fidelity (`from . import x` ->
+  `.x`; `from ..p import q` -> `..p.q`). A wildcard `from a.b import *` yields one edge for
+  the module itself (`a.b`).
+- **Enclosing attribution** is the innermost *named* definition on the walk stack when the
+  call/import node is visited (`None` = module/top-level scope) — a call in a class body
+  outside any method attributes to the class, not to `None`.
+- Duplicate sites (the same target called twice on one line) are two rows by design; there
+  is no uniqueness constraint, and the query-time resolver (#86) ranks candidates.
+
+**Operational consequence of the `INDEX_SEMANTICS_VERSION` bump (2 -> 3, #84):** every
+already-indexed branch's stored `(head_sha, index_semantics_version)` stamp now mismatches
+the running code's version, so the *next* run of every branch is a full re-index (not a
+skip) purely to backfill `reference_edges` — expected, one-time, and already how the `2`
+bump behaved for `chunks`.
 
 ## 2. Indexes
 

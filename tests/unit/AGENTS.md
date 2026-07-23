@@ -15,13 +15,14 @@ Hermetic unit tests: no network, no database, no Databricks SDK instantiation. E
 | `test_chunking.py` | `indexer.parse.iter_chunks` chunking behavior. |
 | `test_ci_branch.py` | `scripts/ci_branch.py` lifecycle with the SDK fully faked; pins that teardown NEVER raises and every create carries a TTL (leak protection for cancelled CI runs). |
 | `test_db_client.py` | Engine factory local (`PGHOST`) mode builds without instantiating the SDK; ORM models expose exactly the durable-core columns, constraints, and GIN indexes. |
+| `test_edges.py` | `indexer.symbols.extract_file`'s reference-edge extraction (#84, Python): call-target resolution (rightmost identifier), import-target resolution (dotted paths, aliases, relative imports, wildcards), enclosing-symbol attribution, non-Python languages yield no edges, `extract_symbols` wrapper equivalence, determinism. |
 | `test_embed.py` | `app.embed`: batching, retry, dim-mismatch, lazy SDK import — every test injects a fake `client`, `databricks.sdk` is never imported. |
 | `test_fetch.py` | `indexer.fetch` via `httpx.MockTransport` + in-memory tarballs. |
 | `test_grants.py` | Least-privilege grant builders: presence AND absence of privileges per role; hostile identifiers rejected before SQL is produced. |
 | `test_grep.py` | Grep line extraction + matcher building (`extract_line_matches`, `_build_matchers`); byte-offset invariant `line_text.encode("utf-8")[s:e] == matched`. |
 | `test_job.py` | `indexer.job`: `read_github_token` + orchestration with every I/O boundary faked (fake `WorkspaceClient`, injected `config_loader`, etc.). |
 | `test_job_redaction.py` | GitHub-token redaction proof + source-level tripwire (two independent guards). |
-| `test_languages.py` | Language/symbol source-of-truth maps: `SYMBOL_KINDS` ⊆ `EXT_TO_LANG` values, no orphans. |
+| `test_languages.py` | Language/symbol source-of-truth maps: `SYMBOL_KINDS` ⊆ `EXT_TO_LANG` values, no orphans; `EDGE_NODE_KINDS` ⊆ `EXT_TO_LANG` values, no orphans; every `EDGE_NODE_KINDS` kind is within `reference_edges`' DB CHECK set. |
 | `test_main.py` | MCP server payload builders (`_search_code_payload` / `_list_repos_payload` / `_get_file_payload`), error mapping, and the `observability`-marked logging choke-point tests; fake engine/connection + fake `GrepResult`. |
 | `test_migration_source.py` | Static source assertions on the linear migrations: fixed revision ids, `down_revision` chain, `pg_trgm` invariants. |
 | `test_migration_source_semantic.py` | Static source assertions on the semantic `0004` revision (its DDL only runs on a Lakebase branch, so source reads are the unit-tier guard). |

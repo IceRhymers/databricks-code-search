@@ -26,12 +26,16 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-INDEX_SEMANTICS_VERSION = 2
+INDEX_SEMANTICS_VERSION = 3
 """Version of the indexing semantics the current code produces.
 
 2: semantic search default-on -- every already-indexed branch must re-index once so
 ``chunks`` backfills (the skip seam compares ``(head_sha, INDEX_SEMANTICS_VERSION)``,
 and without a bump a repo already at HEAD would skip forever and never get chunks).
+
+3: reference edges -- every already-indexed branch must re-index once so
+``reference_edges`` backfills; without a bump a branch at HEAD would skip forever
+and never get edges.
 
 Bump this whenever the *meaning* of what gets written changes: any change to
 ``indexer/symbols.py``, to ``indexer/parse.py``'s chunking, or to

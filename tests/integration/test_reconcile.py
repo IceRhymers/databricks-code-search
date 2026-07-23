@@ -25,7 +25,7 @@ from app.db.client import create_db_engine
 from app.db.grants import build_job_grants
 from app.db.models import Base
 from indexer.chunk_store import write_chunks
-from indexer.languages import ExtractedSymbol, ParsedFile
+from indexer.languages import ExtractedSymbol, FileExtraction, ParsedFile
 from indexer.store import (
     ReconcileCounts,
     index_repo,
@@ -80,8 +80,11 @@ def _pf(path: str, content: str) -> ParsedFile:
 
 def _items(
     *specs: tuple[str, str, list[ExtractedSymbol]],
-) -> list[tuple[ParsedFile, list[ExtractedSymbol]]]:
-    return [(_pf(path, content), syms) for path, content, syms in specs]
+) -> list[tuple[ParsedFile, FileExtraction]]:
+    return [
+        (_pf(path, content), FileExtraction(symbols=syms, edges=[]))
+        for path, content, syms in specs
+    ]
 
 
 MAIN = ("main.py", "def f():\n    return 1\n", [ExtractedSymbol("f", "function", 1, 2)])
@@ -148,7 +151,14 @@ def _cfg() -> Settings:
 def _seed_reference_edge(
     conn: Connection, *, repo_id: int, file_id: int, target_name: str = "target_fn"
 ) -> None:
-    """Seed one raw reference edge row (indexer.store has no writer yet -- #84)."""
+    """Seed one raw reference edge row directly.
+
+    These reconcile tests exercise the storage primitives (retirement/purge
+    cascades) in isolation from the real extractor, which landed in #84
+    (``indexer.symbols.extract_file`` / ``indexer.store.index_repo``'s edge
+    writer) -- seeding a row by hand keeps this module focused on
+    ``reconcile_retired_branches``/``reconcile_removed_repos`` alone.
+    """
     conn.execute(
         text(
             "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "

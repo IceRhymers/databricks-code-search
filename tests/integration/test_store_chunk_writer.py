@@ -25,7 +25,7 @@ from app.config import SEMANTIC_EMBEDDING_DIM
 from app.db.client import create_db_engine
 from app.db.models import Base
 from indexer.chunk_store import write_chunks
-from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+from indexer.languages import ExtractedSymbol, FileExtraction, IndexCounts, ParsedFile
 from indexer.store import index_repo
 
 SCHEMA = "test_store_chunk_writer"
@@ -94,13 +94,22 @@ MAIN = ("main.py", "def f():\n    return 1\n", [ExtractedSymbol("f", "function",
 UTIL = ("util.py", "def g():\n    return 2\n", [ExtractedSymbol("g", "function", 1, 2)])
 
 
+def _items(
+    *specs: tuple[str, str, list[ExtractedSymbol]],
+) -> list[tuple[ParsedFile, FileExtraction]]:
+    return [
+        (_pf(path, content), FileExtraction(symbols=syms, edges=[]))
+        for path, content, syms in specs
+    ]
+
+
 @pytest.mark.integration
 def test_chunk_writer_none_is_byte_identical_to_the_core_path(conn: Connection) -> None:
-    items = [(_pf(path, content), syms) for path, content, syms in (MAIN, UTIL)]
+    items = _items(MAIN, UTIL)
     counts = index_repo(
         conn, name="acme/widgets", branch="main", is_default=True, head_sha="sha_first", items=items
     )
-    assert counts == IndexCounts(files=2, symbols=2, swept=0)
+    assert counts == IndexCounts(files=2, symbols=2, swept=0, edges=0)
     assert _count(conn, "files") == 2
     assert _count(conn, "symbols") == 2
     assert _count(conn, "chunks") == 0  # no chunk_writer -> chunks untouched
@@ -108,7 +117,7 @@ def test_chunk_writer_none_is_byte_identical_to_the_core_path(conn: Connection) 
 
 @pytest.mark.integration
 def test_chunk_writer_writes_inside_the_transaction(conn: Connection) -> None:
-    items = [(_pf(path, content), syms) for path, content, syms in (MAIN, UTIL)]
+    items = _items(MAIN, UTIL)
     counts = index_repo(
         conn,
         name="acme/widgets",
@@ -118,7 +127,7 @@ def test_chunk_writer_writes_inside_the_transaction(conn: Connection) -> None:
         items=items,
         chunk_writer=_stub_chunk_writer,
     )
-    assert counts == IndexCounts(files=2, symbols=2, swept=0)
+    assert counts == IndexCounts(files=2, symbols=2, swept=0, edges=0)
     assert _count(conn, "chunks") == 2
 
     main_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
@@ -127,7 +136,7 @@ def test_chunk_writer_writes_inside_the_transaction(conn: Connection) -> None:
 
 @pytest.mark.integration
 def test_reindex_is_idempotent_for_chunks(conn: Connection) -> None:
-    items = [(_pf(path, content), syms) for path, content, syms in (MAIN, UTIL)]
+    items = _items(MAIN, UTIL)
     index_repo(
         conn,
         name="acme/widgets",
@@ -147,13 +156,13 @@ def test_reindex_is_idempotent_for_chunks(conn: Connection) -> None:
         items=items,
         chunk_writer=_stub_chunk_writer,
     )
-    assert counts == IndexCounts(files=2, symbols=2, swept=0)
+    assert counts == IndexCounts(files=2, symbols=2, swept=0, edges=0)
     assert _count(conn, "chunks") == 2  # delete-and-reinsert, not duplicated
 
 
 @pytest.mark.integration
 def test_chunks_cascade_delete_when_file_is_swept(conn: Connection) -> None:
-    items = [(_pf(path, content), syms) for path, content, syms in (MAIN, UTIL)]
+    items = _items(MAIN, UTIL)
     index_repo(
         conn,
         name="acme/widgets",
@@ -168,7 +177,7 @@ def test_chunks_cascade_delete_when_file_is_swept(conn: Connection) -> None:
     conn.rollback()
 
     # Re-index without util.py at a new SHA -> util.py (and its chunks) swept.
-    main_only = [(_pf(*MAIN[:2]), MAIN[2])]
+    main_only = _items(MAIN)
     counts = index_repo(
         conn,
         name="acme/widgets",
@@ -178,7 +187,7 @@ def test_chunks_cascade_delete_when_file_is_swept(conn: Connection) -> None:
         items=main_only,
         chunk_writer=_stub_chunk_writer,
     )
-    assert counts == IndexCounts(files=1, symbols=1, swept=1)
+    assert counts == IndexCounts(files=1, symbols=1, swept=1, edges=0)
     assert _count(conn, "files", "path = 'util.py'") == 0
     assert _count(conn, "chunks", f"file_id = {util_file_id}") == 0  # cascade
     assert _count(conn, "chunks") == 1

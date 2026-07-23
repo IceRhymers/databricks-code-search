@@ -309,8 +309,9 @@ class _RecordingIndex:
         self.calls.append(name)
         self.chunk_writer = chunk_writer
         files = len(materialized)
-        symbols = sum(len(syms) for _pf, syms in materialized)
-        counts = IndexCounts(files=files, symbols=symbols, swept=0)
+        symbols = sum(len(ex.symbols) for _pf, ex in materialized)
+        edges = sum(len(ex.edges) for _pf, ex in materialized)
+        counts = IndexCounts(files=files, symbols=symbols, swept=0, edges=edges)
         self.counts.append(counts)
         return counts
 
@@ -428,7 +429,7 @@ def test_run_parses_files_and_symbols() -> None:
     assert code == 0
     # main.py + README.md both stored; main.py yields one function symbol.
     assert idx.calls == ["acme/widgets"]
-    assert idx.counts == [IndexCounts(files=2, symbols=1, swept=0)]
+    assert idx.counts == [IndexCounts(files=2, symbols=1, swept=0, edges=0)]
 
 
 # --- import health (the circular-import regression guard) -------------------
@@ -666,7 +667,7 @@ def test_semantic_ceiling_exceeded_degrades_but_still_indexes_the_core() -> None
     assert idx.chunk_writer is None  # ...with chunks skipped
     # Proves the core index got the real work, not an empty items generator: "not skipped"
     # and "correctly indexed" are different claims, and only the latter is the contract.
-    assert idx.counts[0] == IndexCounts(files=2, symbols=1, swept=0)
+    assert idx.counts[0] == IndexCounts(files=2, symbols=1, swept=0, edges=0)
 
 
 @pytest.mark.unit
@@ -708,7 +709,7 @@ def test_semantic_cap_override_exceeded_still_degrades_to_core_index() -> None:
     assert code == 0  # a semantic-only breach never fails the repo
     assert idx.calls == ["acme/widgets"]
     assert idx.chunk_writer is None  # the override (1), not the global cap (5), fired
-    assert idx.counts[0] == IndexCounts(files=2, symbols=1, swept=0)
+    assert idx.counts[0] == IndexCounts(files=2, symbols=1, swept=0, edges=0)
 
 
 @pytest.mark.unit
@@ -1173,7 +1174,7 @@ def test_one_branchs_conflict_does_not_stop_the_repos_other_branches(
         seen.append(branch)
         if branch == "main":
             raise StaleIndexError(f"repo_branches row for {name}@{branch} changed")
-        return IndexCounts(files=1, symbols=0, swept=0)
+        return IndexCounts(files=1, symbols=0, swept=0, edges=0)
 
     with caplog.at_level(logging.INFO, logger="indexer.job"):
         code = _run(_config(repos=["acme/widgets"], branches=["feature"]), _index, github=github)
@@ -1195,7 +1196,7 @@ def test_one_branchs_failure_does_not_stop_the_repos_other_branches() -> None:
         seen.append(branch)
         if branch == "main":
             raise RuntimeError("boom")
-        return IndexCounts(files=1, symbols=0, swept=0)
+        return IndexCounts(files=1, symbols=0, swept=0, edges=0)
 
     code = _run(_config(repos=["acme/widgets"], branches=["feature"]), _index, github=github)
 
@@ -1343,7 +1344,7 @@ class _BarrierIndex:
         list(items)
         self.barrier.wait()
         self.calls.append(name)
-        return IndexCounts(files=0, symbols=0, swept=0)
+        return IndexCounts(files=0, symbols=0, swept=0, edges=0)
 
 
 @pytest.mark.unit
@@ -1424,7 +1425,7 @@ def test_mixed_run_accounts_for_every_repo(caplog: pytest.LogCaptureFixture) -> 
         list(items)
         if name == "acme/conflicted":
             raise StaleIndexError(f"repos row for {name} changed mid-transaction")
-        return IndexCounts(files=1, symbols=0, swept=0)
+        return IndexCounts(files=1, symbols=0, swept=0, edges=0)
 
     engine = _FakeEngine(
         stamps={("acme/skipped", "main"): ("sha_skipped", INDEX_SEMANTICS_VERSION)}
@@ -1462,7 +1463,7 @@ def test_engine_is_disposed_only_after_every_worker_returned(
         list(items)
         time.sleep(0.05)
         finished.append(time.monotonic())
-        return IndexCounts(files=0, symbols=0, swept=0)
+        return IndexCounts(files=0, symbols=0, swept=0, edges=0)
 
     engine = _FakeEngine()
     monkeypatch.setattr(job, "create_db_engine", lambda **_kw: engine)
@@ -1535,7 +1536,7 @@ def test_records_from_other_modules_inherit_the_repo_context(
     def _logs_elsewhere(conn: Any, *, name: str, items: Any, **_: Any) -> IndexCounts:
         list(items)
         logging.getLogger("indexer.store").warning("a record from another module")
-        return IndexCounts(files=0, symbols=0, swept=0)
+        return IndexCounts(files=0, symbols=0, swept=0, edges=0)
 
     log_filter = job.RepoLogFilter()
     caplog.handler.addFilter(log_filter)
@@ -1611,12 +1612,12 @@ class _SymbolCollector:
 
     def __call__(self, conn: Any, *, name: str, items: Any, **_: Any) -> IndexCounts:
         collected: list[tuple[str, str, str, str, int, int]] = []
-        for pf, syms in items:
-            for sym in syms:
+        for pf, ex in items:
+            for sym in ex.symbols:
                 assert isinstance(sym, ExtractedSymbol)
                 collected.append((name, pf.path, sym.name, sym.kind, sym.start_line, sym.end_line))
         self.rows.extend(collected)
-        return IndexCounts(files=0, symbols=len(collected), swept=0)
+        return IndexCounts(files=0, symbols=len(collected), swept=0, edges=0)
 
     @property
     def sorted_rows(self) -> list[tuple[str, str, str, str, int, int]]:
@@ -1833,7 +1834,7 @@ def _ok_outcome(
         discovery_complete=discovery_complete,
         outcomes=[
             BranchOutcome(
-                branch=b, status="indexed", counts=IndexCounts(files=1, symbols=0, swept=0)
+                branch=b, status="indexed", counts=IndexCounts(files=1, symbols=0, swept=0, edges=0)
             )
             for b in branches
         ],
@@ -2023,7 +2024,7 @@ def test_reconciliation_runs_after_fanout_drains() -> None:
     def _index_fn(conn: Any, *, name: str, items: Any, **_: Any) -> IndexCounts:
         list(items)
         order.append(f"index:{name}")
-        return IndexCounts(files=1, symbols=0, swept=0)
+        return IndexCounts(files=1, symbols=0, swept=0, edges=0)
 
     class _OrderedReconcile(_RecordingReconcile):
         def removed_fn(self, conn: Any, *, desired_repos: Any) -> list[str]:

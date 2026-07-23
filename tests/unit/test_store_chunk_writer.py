@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Delete, Insert, Update
 
-from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+from indexer.languages import ExtractedSymbol, FileExtraction, IndexCounts, ParsedFile
 from indexer.store import StaleIndexError, index_repo
 
 
@@ -73,6 +73,10 @@ class _FakeConn:
             return _FakeResult()
         if isinstance(stmt, Delete) and table == "symbols":
             return _FakeResult()
+        if isinstance(stmt, Insert) and table == "reference_edges":
+            return _FakeResult()
+        if isinstance(stmt, Delete) and table == "reference_edges":
+            return _FakeResult()
         if isinstance(stmt, Update) and table == "repo_branches":
             return _FakeResult(rowcount=self._stamp_rowcount)
         raise AssertionError(f"unexpected statement against {table!r}: {stmt}")
@@ -84,7 +88,12 @@ def _pf(path: str, content: str) -> ParsedFile:
 
 @pytest.mark.unit
 def test_chunk_writer_defaults_to_none_and_behavior_is_unchanged() -> None:
-    items = [(_pf("a.py", "x = 1\n"), [ExtractedSymbol("x", "variable", 1, 1)])]
+    items = [
+        (
+            _pf("a.py", "x = 1\n"),
+            FileExtraction(symbols=[ExtractedSymbol("x", "variable", 1, 1)], edges=[]),
+        )
+    ]
     counts = index_repo(
         _FakeConn(),
         name="acme/widgets",
@@ -93,7 +102,7 @@ def test_chunk_writer_defaults_to_none_and_behavior_is_unchanged() -> None:
         head_sha="sha1",
         items=items,
     )
-    assert counts == IndexCounts(files=1, symbols=1, swept=0)
+    assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
 
 
 @pytest.mark.unit
@@ -104,8 +113,8 @@ def test_chunk_writer_is_called_once_per_file_with_repo_id_and_file_id() -> None
         calls.append((repo_id, file_id, pf.path))
 
     items = [
-        (_pf("a.py", "x = 1\n"), []),
-        (_pf("b.py", "y = 2\n"), []),
+        (_pf("a.py", "x = 1\n"), FileExtraction(symbols=[], edges=[])),
+        (_pf("b.py", "y = 2\n"), FileExtraction(symbols=[], edges=[])),
     ]
     index_repo(
         _FakeConn(),
@@ -122,7 +131,7 @@ def test_chunk_writer_is_called_once_per_file_with_repo_id_and_file_id() -> None
 @pytest.mark.unit
 def test_no_chunk_writer_means_no_extra_calls() -> None:
     # A None chunk_writer must never itself be invoked (it isn't callable).
-    items = [(_pf("a.py", "x = 1\n"), [])]
+    items = [(_pf("a.py", "x = 1\n"), FileExtraction(symbols=[], edges=[]))]
     # No AttributeError/TypeError from trying to call None -> proves the `if
     # chunk_writer is not None` guard is doing its job.
     index_repo(
@@ -140,7 +149,7 @@ def test_no_chunk_writer_means_no_extra_calls() -> None:
 def test_stamp_matching_no_row_raises_stale_index_error() -> None:
     # The CAS UPDATE matching zero rows means the repo_branches row moved out
     # from under the statement-2 baseline; index_repo must abort rather than stamp.
-    items = [(_pf("a.py", "x = 1\n"), [])]
+    items = [(_pf("a.py", "x = 1\n"), FileExtraction(symbols=[], edges=[]))]
     with pytest.raises(StaleIndexError, match="acme/widgets"):
         index_repo(
             _FakeConn(stamp_rowcount=0),

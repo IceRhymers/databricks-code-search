@@ -24,7 +24,13 @@ from sqlalchemy import Connection, text
 from app.db.client import create_db_engine
 from app.db.grants import build_job_grants
 from app.db.models import INDEX_SEMANTICS_VERSION, Base
-from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+from indexer.languages import (
+    ExtractedEdge,
+    ExtractedSymbol,
+    FileExtraction,
+    IndexCounts,
+    ParsedFile,
+)
 from indexer.store import StaleIndexError, _stamp_repo_branch, index_repo
 
 SCHEMA = "test_store"
@@ -58,9 +64,20 @@ def _pf(path: str, content: str) -> ParsedFile:
 
 
 def _items(
-    *specs: tuple[str, str, list[ExtractedSymbol]],
-) -> list[tuple[ParsedFile, list[ExtractedSymbol]]]:
-    return [(_pf(path, content), syms) for path, content, syms in specs]
+    *specs: (
+        tuple[str, str, list[ExtractedSymbol]]
+        | tuple[str, str, list[ExtractedSymbol], list[ExtractedEdge]]
+    ),
+) -> list[tuple[ParsedFile, FileExtraction]]:
+    result: list[tuple[ParsedFile, FileExtraction]] = []
+    for spec in specs:
+        if len(spec) == 3:
+            path, content, syms = spec
+            edges: list[ExtractedEdge] = []
+        else:
+            path, content, syms, edges = spec
+        result.append((_pf(path, content), FileExtraction(symbols=syms, edges=edges)))
+    return result
 
 
 MAIN = ("main.py", "def f():\n    return 1\n", [ExtractedSymbol("f", "function", 1, 2)])
@@ -79,7 +96,7 @@ def _index_default(
     *,
     name: str,
     head_sha: str,
-    items: Iterable[tuple[ParsedFile, list[ExtractedSymbol]]],
+    items: Iterable[tuple[ParsedFile, FileExtraction]],
 ) -> IndexCounts:
     """Shorthand for the pre-multi-branch call shape: one default branch, "main"."""
     return index_repo(
@@ -92,7 +109,7 @@ def test_first_run_populates_and_stamps_commit(conn: Connection) -> None:
     counts = _index_default(
         conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL)
     )
-    assert counts == IndexCounts(files=2, symbols=2, swept=0)
+    assert counts == IndexCounts(files=2, symbols=2, swept=0, edges=0)
 
     assert _count(conn, "repos") == 1
     assert _count(conn, "files") == 2
@@ -122,7 +139,7 @@ def test_rerun_is_idempotent(conn: Connection) -> None:
     counts = _index_default(
         conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL)
     )
-    assert counts == IndexCounts(files=2, symbols=2, swept=0)
+    assert counts == IndexCounts(files=2, symbols=2, swept=0, edges=0)
     assert _count(conn, "repos") == 1
     assert _count(conn, "files") == 2
     assert _count(conn, "symbols") == 2
@@ -130,21 +147,20 @@ def test_rerun_is_idempotent(conn: Connection) -> None:
 
 @pytest.mark.integration
 def test_mark_and_sweep_removes_deleted_file(conn: Connection) -> None:
-    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
-    repo_id = conn.execute(text("SELECT id FROM repos WHERE name = 'acme/widgets'")).scalar_one()
+    # util.py has a real call site so the writer produces a reference_edges row
+    # -- proves the sweep's FK cascade reaches this table too.
+    util_symbol = ExtractedSymbol("g", "function", 1, 3)
+    util_with_edge = (
+        "util.py",
+        "def g():\n    helper()\n    return 2\n",
+        [util_symbol],
+        [ExtractedEdge(kind="call", target="helper", line=2, enclosing=util_symbol)],
+    )
+    _index_default(
+        conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, util_with_edge)
+    )
     removed_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'util.py'")).scalar_one()
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 1
-
-    # index_repo has no reference_edges writer yet (#84); seed one directly to
-    # prove the sweep's FK cascade reaches this table too.
-    conn.execute(
-        text(
-            "INSERT INTO reference_edges (repo_id, file_id, edge_kind, target_name, line) "
-            "VALUES (:r, :f, 'call', 'target_fn', 1)"
-        ),
-        {"r": repo_id, "f": removed_file_id},
-    )
-    conn.commit()
     assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 1
 
     # Reads above autobegan a txn; clear it so index_repo gets a clean connection
@@ -153,7 +169,7 @@ def test_mark_and_sweep_removes_deleted_file(conn: Connection) -> None:
 
     # Re-run without util.py and with a new head SHA -> util.py is swept.
     counts = _index_default(conn, name="acme/widgets", head_sha="sha_second", items=_items(MAIN))
-    assert counts == IndexCounts(files=1, symbols=1, swept=1)
+    assert counts == IndexCounts(files=1, symbols=1, swept=1, edges=0)
 
     assert _count(conn, "files", "path = 'util.py'") == 0
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 0  # cascade
@@ -176,12 +192,132 @@ def test_sweep_is_repo_scoped(conn: Connection) -> None:
 
     # Re-index A without util.py at a new SHA -> A's util.py swept, B untouched.
     counts = _index_default(conn, name="acme/a", head_sha="a_second", items=_items(MAIN))
-    assert counts == IndexCounts(files=1, symbols=1, swept=1)
+    assert counts == IndexCounts(files=1, symbols=1, swept=1, edges=0)
 
     assert _count(conn, "files", "repo_id = (SELECT id FROM repos WHERE name = 'acme/b')") == (
         b_files_before
     )
     assert _count(conn, "files", "commit = 'b_first'") == 1  # B's row unchanged
+
+
+# --- Reference edges: writer, stale replacement, idempotency, zero-edge shed ---
+
+
+@pytest.mark.integration
+def test_indexing_writes_correct_reference_edge_rows(conn: Connection) -> None:
+    symbol = ExtractedSymbol("f", "function", 1, 3)
+    item = (
+        "main.py",
+        "def f():\n    helper()\n    return 1\n",
+        [symbol],
+        [ExtractedEdge(kind="call", target="helper", line=2, enclosing=symbol)],
+    )
+    counts = _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
+    assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=1)
+
+    repo_id = conn.execute(text("SELECT id FROM repos WHERE name = 'acme/widgets'")).scalar_one()
+    file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    row = conn.execute(
+        text(
+            "SELECT repo_id, file_id, edge_kind, target_name, line, "
+            "enclosing_name, enclosing_kind, enclosing_start_line, enclosing_end_line "
+            "FROM reference_edges WHERE file_id = :f"
+        ),
+        {"f": file_id},
+    ).one()
+    assert row == (repo_id, file_id, "call", "helper", 2, "f", "function", 1, 3)
+
+
+@pytest.mark.integration
+def test_reindex_replaces_stale_edges_for_the_same_file(conn: Connection) -> None:
+    """Same file identity (content/content_sha unchanged) across two runs: edges are
+    deleted and reinserted, not accumulated -- proven by driving the two runs'
+    ``ex.edges`` directly rather than depending on the real extractor to disagree
+    with itself on unchanged content.
+    """
+    symbol = ExtractedSymbol("f", "function", 1, 3)
+    content = "def f():\n    target()\n    return 1\n"
+    first_edge = ExtractedEdge(kind="call", target="old_target", line=2, enclosing=symbol)
+    _index_default(
+        conn,
+        name="acme/widgets",
+        head_sha="sha_first",
+        items=_items(("main.py", content, [symbol], [first_edge])),
+    )
+    file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert _count(conn, "reference_edges", f"file_id = {file_id}") == 1
+    conn.rollback()
+
+    second_edge = ExtractedEdge(kind="call", target="new_target", line=2, enclosing=symbol)
+    _index_default(
+        conn,
+        name="acme/widgets",
+        head_sha="sha_first",
+        items=_items(("main.py", content, [symbol], [second_edge])),
+    )
+
+    same_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert same_file_id == file_id
+    targets = (
+        conn.execute(
+            text("SELECT target_name FROM reference_edges WHERE file_id = :f"), {"f": file_id}
+        )
+        .scalars()
+        .all()
+    )
+    assert targets == ["new_target"]
+
+
+@pytest.mark.integration
+def test_reindex_with_identical_items_does_not_duplicate_edges(conn: Connection) -> None:
+    symbol = ExtractedSymbol("f", "function", 1, 3)
+    item = (
+        "main.py",
+        "def f():\n    helper()\n    return 1\n",
+        [symbol],
+        [ExtractedEdge(kind="call", target="helper", line=2, enclosing=symbol)],
+    )
+    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
+    conn.rollback()
+    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
+
+    file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert _count(conn, "reference_edges", f"file_id = {file_id}") == 1
+
+
+@pytest.mark.integration
+def test_reindex_to_zero_edges_sheds_all_rows(conn: Connection) -> None:
+    """The unconditional-delete guard: same file identity, edges vanish on re-index.
+
+    Content (and thus ``content_sha``) is held IDENTICAL across both runs so the
+    upsert resolves to the SAME ``file_id`` -- isolating the write-side guard
+    (``ex.edges`` empty must still run the delete) from the unrelated
+    delete-and-reinsert-under-a-new-file-id path already covered above.
+    """
+    symbol = ExtractedSymbol("f", "function", 1, 3)
+    content = "def f():\n    helper()\n    return 1\n"
+    edge = ExtractedEdge(kind="call", target="helper", line=2, enclosing=symbol)
+    _index_default(
+        conn,
+        name="acme/widgets",
+        head_sha="sha_first",
+        items=_items(("main.py", content, [symbol], [edge])),
+    )
+    file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert _count(conn, "reference_edges", f"file_id = {file_id}") == 1
+    conn.rollback()
+
+    # Same content (same file_id) but this run's extraction yields zero edges.
+    counts = _index_default(
+        conn,
+        name="acme/widgets",
+        head_sha="sha_second",
+        items=_items(("main.py", content, [symbol], [])),
+    )
+    assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
+    same_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert same_file_id == file_id
+    assert _count(conn, "reference_edges", f"file_id = {file_id}") == 0
 
 
 @pytest.mark.integration
@@ -272,10 +408,13 @@ def test_midrun_failure_rolls_back_entirely(conn: Connection) -> None:
     symbols_before = _count(conn, "symbols")
     conn.rollback()  # clear the read txn before the next index_repo (see note above)
 
-    def poison() -> Iterator[tuple[ParsedFile, list[ExtractedSymbol]]]:
+    def poison() -> Iterator[tuple[ParsedFile, FileExtraction]]:
         # First item is a NEW file that would be inserted; then blow up mid-stream
         # so the exception propagates out of index_repo's conn.begin().
-        yield _pf("new.py", "def h():\n    return 3\n"), [ExtractedSymbol("h", "function", 1, 2)]
+        yield (
+            _pf("new.py", "def h():\n    return 3\n"),
+            FileExtraction(symbols=[ExtractedSymbol("h", "function", 1, 2)], edges=[]),
+        )
         raise RuntimeError("poison item")
 
     with pytest.raises(RuntimeError, match="poison item"):
@@ -435,7 +574,7 @@ def test_per_branch_cas_resume_is_independent_per_branch(conn: Connection) -> No
         head_sha="sha_a2",
         items=_items(MAIN),
     )
-    assert counts == IndexCounts(files=1, symbols=1, swept=0)
+    assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
 
     stamps = dict(conn.execute(text("SELECT branch, last_indexed_commit FROM repo_branches")).all())
     assert stamps == {"a": "sha_a2", "b": "sha_b"}
@@ -479,7 +618,7 @@ def test_empty_seen_set_skips_sweep_and_preserves_membership(conn: Connection) -
     counts = index_repo(
         conn, name="acme/widgets", branch="a", is_default=True, head_sha="sha_a2", items=[]
     )
-    assert counts == IndexCounts(files=0, symbols=0, swept=0)
+    assert counts == IndexCounts(files=0, symbols=0, swept=0, edges=0)
 
     # main.py's membership in 'a' is untouched -- the sweep was skipped, not run.
     assert _count(conn, "files", "path = 'main.py'") == 1
