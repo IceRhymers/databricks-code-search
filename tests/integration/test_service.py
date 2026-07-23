@@ -25,7 +25,7 @@ from sqlalchemy.engine import Engine
 from app import service
 from app.config import Settings
 from app.db.client import create_db_engine
-from app.db.models import Base, File, Repo, Symbol
+from app.db.models import Base, File, ReferenceEdge, Repo, Symbol
 from indexer.hashing import content_sha
 
 SCHEMA_PREFIX = "test_service"
@@ -521,3 +521,142 @@ def test_permalink_branch_or_multi_branch_picks_smallest_intersection_and_round_
     content = file_payload["content"] or ""
     assert 'fmt.Println("feature")' in content
     assert 'fmt.Println("main")' not in content
+
+
+# ---------------------------------------- find_references_payload / list_imports_payload
+
+
+class RefSeeded(NamedTuple):
+    engine: Engine
+    cfg: Settings
+    acme_id: int
+    beta_id: int
+
+
+@pytest.fixture
+def ref_seeded() -> Iterator[RefSeeded]:
+    """Same PGOPTIONS idiom as ``seeded``, with a small call/import edge + symbol corpus."""
+    schema = _unique(f"{SCHEMA_PREFIX}_ref")
+    admin_engine = create_db_engine()
+    admin_conn = admin_engine.connect()
+    prev_pgoptions = os.environ.get("PGOPTIONS")
+    engine: Engine | None = None
+    try:
+        admin_conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        admin_conn.execute(text(f"CREATE SCHEMA {schema}"))
+        admin_conn.execute(text(f"SET search_path TO {schema}, public"))
+        admin_conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        admin_conn.commit()
+
+        Base.metadata.create_all(bind=admin_conn)
+        admin_conn.commit()
+
+        acme_id = admin_conn.execute(
+            insert(Repo).values(name="acme/widgets", default_branch="main").returning(Repo.id)
+        ).scalar_one()
+        beta_id = admin_conn.execute(
+            insert(Repo).values(name="beta/tools", default_branch="main").returning(Repo.id)
+        ).scalar_one()
+
+        def _file(repo_id: int, path: str) -> int:
+            content = f"# {path}\n"
+            return admin_conn.execute(
+                insert(File)
+                .values(
+                    repo_id=repo_id,
+                    path=path,
+                    lang="python",
+                    content=content,
+                    content_sha=content_sha(content),
+                    branches=["main"],
+                )
+                .returning(File.id)
+            ).scalar_one()
+
+        target_id = _file(acme_id, "src/target.py")
+        admin_conn.execute(
+            insert(Symbol).values(
+                file_id=target_id, repo_id=acme_id, name="Handler", kind="function", start_line=2
+            )
+        )
+        caller_id = _file(acme_id, "src/caller.py")
+        admin_conn.execute(
+            insert(ReferenceEdge).values(
+                file_id=caller_id,
+                repo_id=acme_id,
+                edge_kind="call",
+                target_name="Handler",
+                line=5,
+                enclosing_name="run",
+                enclosing_kind="function",
+            )
+        )
+        importer_id = _file(acme_id, "src/importer.py")
+        admin_conn.execute(
+            insert(ReferenceEdge).values(
+                file_id=importer_id,
+                repo_id=acme_id,
+                edge_kind="import",
+                target_name="os.path",
+                line=1,
+            )
+        )
+        admin_conn.commit()
+
+        os.environ["PGOPTIONS"] = f"-c search_path={schema},public"
+        engine = create_db_engine()
+        yield RefSeeded(engine=engine, cfg=_cfg(), acme_id=acme_id, beta_id=beta_id)
+    finally:
+        if engine is not None:
+            engine.dispose()
+        if prev_pgoptions is None:
+            os.environ.pop("PGOPTIONS", None)
+        else:
+            os.environ["PGOPTIONS"] = prev_pgoptions
+        admin_conn.rollback()
+        admin_conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        admin_conn.commit()
+        admin_conn.close()
+        admin_engine.dispose()
+
+
+@pytest.mark.integration
+def test_find_references_payload_end_to_end_wire_shape(ref_seeded: RefSeeded) -> None:
+    payload = service.find_references_payload(ref_seeded.engine, ref_seeded.cfg, "Handler", 200)
+
+    assert payload["query"] == "Handler"
+    assert payload["kind"] == "references"
+    assert payload["site_count"] == 1
+    assert payload["resolution_summary"] == {"unique": 1, "ambiguous": 0, "unresolved": 0}
+    (site,) = payload["sites"]
+    assert site["repo"] == "acme/widgets"
+    assert site["file"] == "src/caller.py"
+    assert site["enclosing_symbol"] == {"name": "run", "kind": "function"}
+    (candidate,) = site["candidates"]
+    assert candidate["repo"] == "acme/widgets"
+    assert candidate["file"] == "src/target.py"
+    assert candidate["same_repo"] is True
+    assert "symbol_id" not in candidate
+
+
+@pytest.mark.integration
+def test_list_imports_payload_end_to_end_wire_shape(ref_seeded: RefSeeded) -> None:
+    payload = service.list_imports_payload(ref_seeded.engine, ref_seeded.cfg, "acme/widgets", 200)
+
+    assert payload["kind"] == "imports"
+    assert payload["repo"] == "acme/widgets"
+    assert payload["repo_known"] is True
+    assert payload["site_count"] == 1
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 1}
+    (site,) = payload["sites"]
+    assert site["edge_kind"] == "import"
+    assert site["target_name"] == "os.path"
+
+
+@pytest.mark.integration
+def test_list_imports_payload_unknown_repo_against_real_corpus(ref_seeded: RefSeeded) -> None:
+    payload = service.list_imports_payload(ref_seeded.engine, ref_seeded.cfg, "ghost/repo", 200)
+
+    assert payload["repo_known"] is False
+    assert payload["sites"] == []
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}

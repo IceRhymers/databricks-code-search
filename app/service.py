@@ -44,6 +44,7 @@ from app.query.parser import (
 )
 from app.search.errors import QueryTooBroadError
 from app.search.grep import FileCursor, grep_search
+from app.search.references import EdgeSite, ReferenceResult, resolve_references
 from app.search.semantic import _semantic_search_payload as semantic_search_payload  # noqa: F401
 from app.search.symbols import SymbolResult, symbol_search
 
@@ -907,4 +908,174 @@ def get_file_payload(
         "content": content,
         "found": found,
         "commit": commit,
+    }
+
+
+# ------------------------------------------------------------------- reference resolution
+
+
+def _site_payload(site: EdgeSite, name_map: dict[int, str]) -> dict[str, Any]:
+    """Shape one resolved :class:`~app.search.references.EdgeSite` for the wire.
+
+    ``symbol_id`` is deliberately absent from each candidate dict (D1/D4): it is a query-time
+    ranking tiebreak, never persisted, never a caller-facing identifier.
+    """
+    enclosing_symbol = (
+        {"name": site.enclosing_name, "kind": site.enclosing_kind}
+        if site.enclosing_name is not None
+        else None
+    )
+    return {
+        "repo": name_map.get(site.repo_id, str(site.repo_id)),
+        "file": site.path,
+        "line": site.line,
+        "edge_kind": site.edge_kind,
+        "target_name": site.target_name,
+        "enclosing_symbol": enclosing_symbol,
+        "resolution": site.resolution,
+        "candidate_count": site.candidate_count,
+        "candidates_truncated": site.candidates_truncated,
+        "candidates": [
+            {
+                "repo": name_map.get(candidate.repo_id, str(candidate.repo_id)),
+                "file": candidate.path,
+                "line": candidate.start_line,
+                "name": candidate.name,
+                "kind": candidate.kind,
+                "same_repo": candidate.same_repo,
+                "same_file": candidate.same_file,
+                "kind_match": candidate.kind_match,
+            }
+            for candidate in site.candidates
+        ],
+    }
+
+
+def _reference_result_to_payload(
+    result: ReferenceResult, name_map: dict[int, str]
+) -> dict[str, Any]:
+    """Shared envelope shape for :func:`find_references_payload` / :func:`list_imports_payload`:
+    ``sites`` + ``site_count`` + a ``resolution_summary`` histogram + truncation flags."""
+    resolution_summary = {"unique": 0, "ambiguous": 0, "unresolved": 0}
+    for site in result.sites:
+        resolution_summary[site.resolution] += 1
+    return {
+        "sites": [_site_payload(site, name_map) for site in result.sites],
+        "site_count": len(result.sites),
+        "resolution_summary": resolution_summary,
+        "truncated": result.truncated,
+        "truncation_reason": result.truncation_reason,
+    }
+
+
+def _reference_repo_name_map(conn: Any, result: ReferenceResult, cfg: Settings) -> dict[int, str]:
+    """Resolve every repo id across a :class:`ReferenceResult`'s sites AND candidates to names.
+
+    Run in a SEPARATE ``conn.begin()`` + ``SET LOCAL statement_timeout`` AFTER
+    :func:`resolve_references` returns -- its own ``set_config`` committed with its
+    transaction, so this lookup would otherwise run uncapped (mirrors ``search_code_payload``'s
+    post-leg ``_repo_name_map`` call).
+    """
+    repo_ids = {site.repo_id for site in result.sites}
+    repo_ids |= {candidate.repo_id for site in result.sites for candidate in site.candidates}
+    if not repo_ids:
+        return {}
+    with conn.begin():
+        conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(cfg.statement_timeout_ms)}")
+        return _repo_name_map(conn)
+
+
+def find_references_payload(
+    engine: Engine, cfg: Settings, name: str, limit: int, branch: str | None = None
+) -> dict[str, Any]:
+    """Resolve ``name``'s call sites to ranked candidate-set definitions.
+
+    Corpus-wide (no ``repo`` scope) over ``edge_kind="call"`` edges. Ambiguity is never
+    collapsed: an ``"ambiguous"`` site's ``candidates`` list carries every ranked candidate up
+    to the per-name cap (AC1). ``limit`` is the caller's already-clamped row limit (mirrors
+    :func:`search_code_payload` -- clamping is the caller's responsibility, e.g. the future
+    MCP tool registration in #87).
+    """
+    with engine.connect() as conn:
+        try:
+            result = resolve_references(
+                conn,
+                target_name=name,
+                edge_kind="call",
+                branch=branch,
+                row_limit=limit,
+                statement_timeout_ms=cfg.statement_timeout_ms,
+            )
+        except QueryTooBroadError:
+            return {
+                "query": name,
+                "kind": "references",
+                "symbol": name,
+                "branch": branch,
+                "sites": [],
+                "site_count": 0,
+                "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+                "truncated": True,
+                "truncation_reason": None,
+                "query_too_broad": True,
+            }
+        name_map = _reference_repo_name_map(conn, result, cfg)
+
+    return {
+        "query": name,
+        "kind": "references",
+        "symbol": name,
+        "branch": branch,
+        "query_too_broad": False,
+        **_reference_result_to_payload(result, name_map),
+    }
+
+
+def list_imports_payload(
+    engine: Engine, cfg: Settings, repo: str, limit: int, branch: str | None = None
+) -> dict[str, Any]:
+    """Enumerate a repo's ``import`` edge sites (``repo`` is REQUIRED -- see D8: a corpus-wide
+    listing would filter on ``edge_kind`` alone, the trailing column of
+    ``ix_reference_edges_repo_kind (repo_id, edge_kind)``, which is not index-served).
+
+    ``repo_known=False`` is a structured "no such repo" miss (mirrors ``get_file_payload``'s
+    ``found: False``) -- distinct from a known repo with zero import sites, which returns
+    ``repo_known=True`` and an empty ``sites`` list. Import edges are largely EXTERNAL by
+    design (D3: exact dotted-path match only, no last-segment split), so most sites are
+    expected to resolve ``"unresolved"`` -- that is not itself an error.
+    """
+    with engine.connect() as conn:
+        try:
+            result = resolve_references(
+                conn,
+                edge_kind="import",
+                repo=repo,
+                branch=branch,
+                row_limit=limit,
+                statement_timeout_ms=cfg.statement_timeout_ms,
+            )
+        except QueryTooBroadError:
+            return {
+                "query": repo,
+                "kind": "imports",
+                "repo": repo,
+                "branch": branch,
+                "repo_known": True,
+                "sites": [],
+                "site_count": 0,
+                "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+                "truncated": True,
+                "truncation_reason": None,
+                "query_too_broad": True,
+            }
+        name_map = _reference_repo_name_map(conn, result, cfg)
+
+    return {
+        "query": repo,
+        "kind": "imports",
+        "repo": repo,
+        "branch": branch,
+        "repo_known": result.repo_known,
+        "query_too_broad": False,
+        **_reference_result_to_payload(result, name_map),
     }

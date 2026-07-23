@@ -18,6 +18,7 @@ from app.config import Settings
 from app.query.parser import parse
 from app.search.errors import QueryTooBroadError
 from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
+from app.search.references import CandidateSymbol, EdgeSite, ReferenceResult
 from app.search.symbols import SymbolMatch, SymbolResult
 
 # --------------------------------------------------------------------------- fixtures
@@ -490,3 +491,210 @@ def test_query_has_symbol_atom_excludes_negated_symbol() -> None:
     assert service._query_has_symbol_atom(parse("-sym:foo")) is False
     # A positive sym: alongside a negated one still counts.
     assert service._query_has_symbol_atom(parse("-sym:foo sym:bar")) is True
+
+
+# ---------------------------------------- find_references_payload / list_imports_payload
+
+
+def _candidate(
+    *,
+    symbol_id: int = 1,
+    repo_id: int = 7,
+    path: str = "src/handler.go",
+    name: str = "Handler",
+    kind: str | None = "function",
+    start_line: int | None = 3,
+    same_repo: bool = True,
+    same_file: bool = False,
+    kind_match: bool = True,
+) -> CandidateSymbol:
+    return CandidateSymbol(
+        symbol_id=symbol_id,
+        repo_id=repo_id,
+        path=path,
+        name=name,
+        kind=kind,
+        start_line=start_line,
+        same_repo=same_repo,
+        same_file=same_file,
+        kind_match=kind_match,
+    )
+
+
+def _site(
+    *,
+    repo_id: int = 7,
+    file_id: int = 1,
+    path: str = "src/caller.go",
+    line: int = 10,
+    edge_kind: str = "call",
+    target_name: str = "Handler",
+    enclosing_name: str | None = None,
+    enclosing_kind: str | None = None,
+    resolution: str = "unique",
+    candidate_count: int = 1,
+    candidates_truncated: bool = False,
+    candidates: tuple[CandidateSymbol, ...] = (),
+) -> EdgeSite:
+    return EdgeSite(
+        repo_id=repo_id,
+        file_id=file_id,
+        path=path,
+        line=line,
+        edge_kind=edge_kind,
+        target_name=target_name,
+        enclosing_name=enclosing_name,
+        enclosing_kind=enclosing_kind,
+        resolution=resolution,
+        candidate_count=candidate_count,
+        candidates_truncated=candidates_truncated,
+        candidates=candidates,
+    )
+
+
+def _result(
+    *,
+    sites: tuple[EdgeSite, ...] = (),
+    truncated: bool = False,
+    truncation_reason: str | None = None,
+    repo_known: bool = True,
+) -> ReferenceResult:
+    return ReferenceResult(
+        sites=sites, truncated=truncated, truncation_reason=truncation_reason, repo_known=repo_known
+    )
+
+
+@pytest.mark.unit
+def test_find_references_payload_key_set_and_nested_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    site = _site(
+        resolution="ambiguous",
+        candidate_count=2,
+        candidates=(_candidate(symbol_id=1), _candidate(symbol_id=2, same_repo=False, repo_id=8)),
+    )
+    monkeypatch.setattr(service, "resolve_references", lambda *a, **k: _result(sites=(site,)))
+    monkeypatch.setattr(
+        service, "_repo_name_map", lambda conn: {7: "acme/widgets", 8: "beta/tools"}
+    )
+
+    payload = service.find_references_payload(_FakeEngine([]), _cfg(), "Handler", 200)
+
+    assert payload["query"] == "Handler"
+    assert payload["kind"] == "references"
+    assert payload["symbol"] == "Handler"
+    assert payload["branch"] is None
+    assert payload["query_too_broad"] is False
+    assert payload["site_count"] == 1
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 1, "unresolved": 0}
+    assert "repo_known" not in payload  # only list_imports_payload carries this key
+
+    [site_payload] = payload["sites"]
+    assert site_payload["repo"] == "acme/widgets"
+    assert site_payload["file"] == "src/caller.go"
+    assert site_payload["edge_kind"] == "call"
+    assert site_payload["enclosing_symbol"] is None
+    # AC1: ambiguity is never collapsed -- both ranked candidates survive to the wire.
+    assert len(site_payload["candidates"]) == 2
+    candidate_payload = site_payload["candidates"][0]
+    assert "symbol_id" not in candidate_payload
+    assert candidate_payload["repo"] == "acme/widgets"
+    assert candidate_payload["same_repo"] is True
+    assert candidate_payload["kind_match"] is True
+
+
+@pytest.mark.unit
+def test_find_references_payload_empty_result_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service, "resolve_references", lambda *a, **k: _result())
+    monkeypatch.setattr(service, "_repo_name_map", lambda conn: {})
+
+    payload = service.find_references_payload(_FakeEngine([]), _cfg(), "Missing", 200)
+
+    assert payload["sites"] == []
+    assert payload["site_count"] == 0
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}
+    assert payload["truncated"] is False
+    assert payload["query_too_broad"] is False
+
+
+@pytest.mark.unit
+def test_find_references_payload_query_too_broad(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_k: object) -> ReferenceResult:
+        raise QueryTooBroadError("too broad")
+
+    monkeypatch.setattr(service, "resolve_references", _raise)
+
+    payload = service.find_references_payload(_FakeEngine([]), _cfg(), "Handler", 200)
+
+    assert payload["query_too_broad"] is True
+    assert payload["truncated"] is True
+    assert payload["sites"] == []
+    assert payload["site_count"] == 0
+
+
+@pytest.mark.unit
+def test_find_references_payload_branch_echo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(service, "resolve_references", lambda *a, **k: _result())
+    monkeypatch.setattr(service, "_repo_name_map", lambda conn: {})
+
+    payload = service.find_references_payload(
+        _FakeEngine([]), _cfg(), "Handler", 200, branch="feature/x"
+    )
+
+    assert payload["branch"] == "feature/x"
+
+
+@pytest.mark.unit
+def test_list_imports_payload_key_set_and_repo_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    site = _site(
+        edge_kind="import", target_name="a.b.c", resolution="unresolved", candidate_count=0
+    )
+    monkeypatch.setattr(service, "resolve_references", lambda *a, **k: _result(sites=(site,)))
+    monkeypatch.setattr(service, "_repo_name_map", lambda conn: {7: "acme/widgets"})
+
+    payload = service.list_imports_payload(_FakeEngine([]), _cfg(), "acme/widgets", 200)
+
+    assert payload["kind"] == "imports"
+    assert payload["repo"] == "acme/widgets"
+    assert payload["repo_known"] is True
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 1}
+    [site_payload] = payload["sites"]
+    assert site_payload["edge_kind"] == "import"
+    assert site_payload["target_name"] == "a.b.c"
+
+
+@pytest.mark.unit
+def test_list_imports_payload_unknown_repo_is_structured_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "resolve_references", lambda *a, **k: _result(repo_known=False))
+    # No repos to resolve -- `_repo_name_map` must not even be reached, but stub it defensively.
+    monkeypatch.setattr(service, "_repo_name_map", lambda conn: {})
+
+    payload = service.list_imports_payload(_FakeEngine([]), _cfg(), "ghost/repo", 200)
+
+    assert payload["repo_known"] is False
+    assert payload["sites"] == []
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}
+
+
+@pytest.mark.unit
+def test_list_imports_payload_query_too_broad(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_k: object) -> ReferenceResult:
+        raise QueryTooBroadError("too broad")
+
+    monkeypatch.setattr(service, "resolve_references", _raise)
+
+    payload = service.list_imports_payload(_FakeEngine([]), _cfg(), "acme/widgets", 200)
+
+    assert payload["query_too_broad"] is True
+    assert payload["truncated"] is True
+    assert payload["repo_known"] is True  # unknown vs. timeout are distinct outcomes
+    assert payload["sites"] == []
+
+
+@pytest.mark.unit
+def test_reference_builders_importable_without_perturbing_search_code_export_set() -> None:
+    # Regression guard (plan D8 note): no existing unit test pins an exact `app.service`
+    # export set (test_main.py pins search_code's ENVELOPE, not the module's exports), so two
+    # additive builders are safe to add. This just proves they're importable as documented.
+    assert callable(service.find_references_payload)
+    assert callable(service.list_imports_payload)
