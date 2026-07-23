@@ -12,10 +12,10 @@ landed on a given deploy target.
 `reference_edges` is a **raw, unresolved** call/import edge extracted from one file's
 content-version: `(edge_kind, target_name, line, enclosing_*)` per site tree-sitter finds,
 with `edge_kind IN ('call', 'import')` enforced by a CHECK constraint. It is part of the
-knowledge-graph epic (#82): a later child (#86) resolves `target_name` to a concrete
-`symbols` row at **query time**, by name-join — this table deliberately carries **no
-foreign key to `symbols`**. Symbol ids churn on every per-file delete-and-reinsert, and an
-FK would couple the two rewrite orders inside the indexing transaction for no query
+knowledge-graph epic (#82): `target_name` is resolved to concrete `symbols` rows at
+**query time**, by name-join — shipped in #86 (see §4) — this table deliberately carries
+**no foreign key to `symbols`**. Symbol ids churn on every per-file delete-and-reinsert, and
+an FK would couple the two rewrite orders inside the indexing transaction for no query
 benefit.
 
 The enclosing symbol (the function/class a call or import site sits inside, if any) is
@@ -67,10 +67,10 @@ bump behaved for `chunks`.
 
 | Index | Serves |
 |---|---|
-| `ix_reference_edges_target_name` (btree) | The resolver's name-equality join (`symbols.name = reference_edges.target_name`) once #86 ships |
+| `ix_reference_edges_target_name` (btree) | The resolver's name-equality join (`symbols.name = reference_edges.target_name`), shipped in #86 (§4) |
 | `ix_reference_edges_target_trgm` (GIN, `gin_trgm_ops`) | Partial/substring reference lookups, parity with `ix_symbols_name_trgm` |
 | `ix_reference_edges_file_id` (btree) | The per-file delete-and-reinsert writer (#84) and the `ON DELETE CASCADE` fired by the sweep/reconcile paths — Postgres does not auto-index a foreign key, and both are hot paths |
-| `ix_reference_edges_repo_kind` (btree, `(repo_id, edge_kind)`) | Per-repo kind scans (e.g. a future `list_imports` MCP tool) |
+| `ix_reference_edges_repo_kind` (btree, `(repo_id, edge_kind)`) | Per-repo kind scans, e.g. `list_imports_payload`'s required `repo` scope (§4, #86) |
 
 ## 3. Deploy coupling — this migration is NOT schema-only
 
@@ -115,6 +115,98 @@ SELECT has_table_privilege('<app-sp-client-id>', 'reference_edges', 'SELECT'),
 
 Both must return `true`. If either is `false`, run the re-grant command above — it is
 idempotent, safe to run against a target that's already current.
+
+## 4. Query-time resolution (#86)
+
+`app/search/references.py` resolves a raw `reference_edges` row's `target_name` to the
+`symbols` rows it could plausibly mean, entirely at query time — nothing from this
+resolution is ever written back to `reference_edges` or `symbols`, and no extraction-time
+symbol FK was added. `resolve_references(conn, ...)` is the entry point; `app/service.py`
+wraps it in two additive payload builders, `find_references_payload` (corpus-wide,
+`edge_kind="call"`) and `list_imports_payload` (`edge_kind="import"`, `repo` required). MCP
+tool registration for these is a later child (#87), not #86.
+
+**Two-query design, deliberately not one joined query.** Query 1 selects matching edge
+sites from `reference_edges`/`files`/`repos`; query 2 selects candidate `symbols` for the
+distinct `target_name`s query 1 returned, from `symbols`/`files`/`repos`. Neither query
+references the other's tables. A single `reference_edges JOIN symbols ON target_name =
+name` (both reaching through `files`/`repos`) would let SQLAlchemy auto-correlate the two
+`files`/`repos` legs against each other, silently mis-scoping which candidate belongs to
+which site — the same auto-correlation hazard `app/search/symbols.py` avoids for `sym:`
+lookups. Query 2 bounds its **fetch itself** (not just the returned payload) with a SQL
+window function per `target_name` (`ROW_NUMBER() OVER (PARTITION BY symbols.name ORDER BY
+...)`, capped at `DEFAULT_CANDIDATE_CAP = 32`), so a hot name (`get`, `run`, `__init__`)
+never pulls its entire corpus-wide match set into memory. `COUNT(*) OVER` carries the TRUE
+pre-cap count alongside the trimmed rows, so ambiguity is never rewritten to "unique" just
+because the candidate list was capped.
+
+**Candidate-set contract.** Each edge site resolves to zero, one, or many ranked
+candidates — `resolution` is `"unresolved"` (0), `"unique"` (1), or `"ambiguous"` (2+),
+derived from the true pre-cap `candidate_count`. Ranking (same-repo before cross-repo, then
+kind-appropriate, then same-file, tiebreaking on `(repo_id, path, start_line, symbol_id)`
+for a deterministic total order) runs in Python after query 2, since every signal is
+relational to the `(site, candidate)` pair. Ranking is **membership-preserving**: a
+lower-ranked candidate is sorted later, never dropped, so genuine ambiguity is always
+represented in full (up to the cap) rather than silently collapsed to one answer.
+
+**Import edges resolve to their full dotted path, no last-segment split.** `import`
+`target_name` is the complete dotted path as written (see §1); `symbols.name` is bare, so
+an import edge resolves to a candidate only in the rare case a symbol is literally named
+that full dotted string. This is pinned deliberately, not a gap: (1) it keeps one
+exact-equality, index-served predicate identical for both edge kinds, with no functional
+index and no client-side splitting; (2) a dotted import genuinely points at an
+external/stdlib module most of the time, so representing it as `"unresolved"` (= external)
+is *correct*, not a miss; (3) a last-segment heuristic (`a.b.get` → every symbol named
+`get`) would manufacture false ambiguity and defeat precision. `list_imports_payload`'s
+value is *enumerating* import sites with their `target_name`, not resolving them to local
+definitions.
+
+**`repo` is required for `list_imports_payload`.** A corpus-wide import listing would
+filter on `edge_kind` alone — the trailing column of `ix_reference_edges_repo_kind
+(repo_id, edge_kind)`, not index-served on its own — so corpus-wide listing is out of
+scope. `repo_known: False` is a structured "no such repo" miss (mirrors `get_file_payload`'s
+`found: False`), distinguishable from a known repo with zero import sites
+(`repo_known: True`, `sites: []`).
+
+**Branch scoping matches `search_code`/`get_file` exactly**, applied independently to BOTH
+the edge site's file and each candidate's file: an explicit `branch` uses
+`files.branches @> ARRAY[:branch]`; omitted, it falls back to
+`coalesce(repos.default_branch, 'HEAD') = ANY(files.branches)` — the same predicate
+`get_file_payload` uses, asserted byte-identical in `tests/unit/test_references.py` and
+exercised end-to-end in `tests/integration/test_references.py`.
+
+**Quality measurement (`scripts/measure_reference_resolution.py`).** An offline script
+reuses `app.search.references.build_candidate_count_select` and `classify_resolution` — the
+SAME join semantics and branch predicate the live resolver's query 2 uses — so its
+distribution agrees with the serve path by construction rather than re-implementing the
+join. **`call` edges are the primary headline metric**, the only number compared against
+the epic's deep-dive baseline (28.8% unique / 33.4% ambiguous / 37.8% external); the
+`import`-edge distribution is reported separately, labeled informational (expected close to
+0% resolution, validating the exact-dotted-match decision above). Run it with:
+
+```
+uv run python scripts/measure_reference_resolution.py --edge-kind both
+```
+
+Recorded distribution (self-indexed corpus: this repo's own git-tracked source tree —
+206 files, 2,947 symbols, 15,412 reference edges across Python/JS/TS/TSX — default branch,
+measured on 2026-07-23; see the #86 PR body for the full script output):
+
+```
+call edges -- HEADLINE AC4 metric (n=14226):
+  unique         4144   29.1%   (baseline 28.8%)
+  ambiguous      4208   29.6%   (baseline 33.4%)
+  unresolved     5874   41.3%   (baseline 37.8%)
+
+import edges -- informational, expected ~0% resolution (validates D3) (n=1186):
+  unique           15    1.3%
+  ambiguous         8    0.7%
+  unresolved     1163   98.1%
+```
+
+The re-measured `call`-edge distribution tracks the baseline closely (within ~4 points on
+every bucket); `import` edges resolve at ~2% total, confirming they are overwhelmingly
+external/stdlib targets as D3 predicts.
 
 ## Reference
 
