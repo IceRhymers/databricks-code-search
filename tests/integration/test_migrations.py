@@ -973,7 +973,15 @@ def test_reference_edges_adp_same_role_covers_new_table() -> None:
             {"r": repo_id, "f": file_id},
         )
         conn.execute(text("DELETE FROM reference_edges"))
-        conn.execute(text("RESET ROLE"))
+
+        # Negative proof: the job role's grants are DML-only (SELECT/INSERT/
+        # UPDATE/DELETE) -- no DDL, matching build_job_grants' least-privilege
+        # intent. A future accidental widening of that builder should fail here.
+        # (The failed TRUNCATE aborts the tx; rollback below also undoes SET ROLE,
+        # same as test_grant_enforcement_via_set_role.)
+        with pytest.raises(ProgrammingError) as excinfo:
+            conn.execute(text("TRUNCATE reference_edges"))
+        assert isinstance(excinfo.value.orig, psycopg.errors.InsufficientPrivilege)
         conn.rollback()
     finally:
         conn.rollback()

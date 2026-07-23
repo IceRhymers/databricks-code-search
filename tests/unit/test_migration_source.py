@@ -13,6 +13,7 @@ read by these assertions instead of silently escaping them.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -203,9 +204,17 @@ def test_0005_downgrade_drops_indexes_then_table(source_0005: str) -> None:
 
 @pytest.mark.unit
 def test_0005_no_symbol_fk(source_0005: str) -> None:
-    """Epic #82 rule: reference_edges must never gain a symbols FK at the source level."""
-    for forbidden in ('ForeignKey("symbols', "REFERENCES symbols", '"symbols.id"'):
-        assert forbidden not in source_0005, f"0005 migration must not reference {forbidden!r}"
+    """Epic #82 rule: reference_edges must never gain a symbols FK at the source level.
+
+    Quote-agnostic (matches ``symbols.id`` under either quoting style) so this
+    tripwire survives formatter drift, unlike a literal-substring check.
+    """
+    assert re.search(r"symbols\.id", source_0005) is None, (
+        "0005 migration must not reference a symbols.id FK target"
+    )
+    assert "REFERENCES symbols" not in source_0005, (
+        "0005 migration must not reference symbols via raw SQL REFERENCES"
+    )
 
 
 @pytest.mark.unit
