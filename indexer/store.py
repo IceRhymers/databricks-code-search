@@ -105,7 +105,7 @@ def index_repo(
     4. Membership sweep, keyed on THIS branch's seen-set (never on ``commit``,
        which is ambiguous under dedup): strip ``branch`` from any row's
        ``branches`` array that is not in the seen-set, then delete any row left
-       with an empty array (cascades ``symbols``/``chunks``). Pure DML, no
+       with an empty array (cascades ``symbols``/``chunks``/``reference_edges``). Pure DML, no
        ``TEMP TABLE`` (the job role has no guaranteed database-level TEMP
        privilege on Lakebase). **Skipped (with a WARNING) when the parsed file
        set is empty** -- an empty seen-set would otherwise strip ``branch`` from
@@ -380,9 +380,9 @@ def reconcile_retired_branches(
        emptied array, which would leave a zombie row the next step's
        cardinality check can't see.
     3. Delete rows left with zero membership (``cardinality(branches) = 0``);
-       a strict subset of step 2's rowcount. ``symbols`` and ``chunks`` are
-       removed by FK cascade, the same invariant ``_sweep_membership`` relies
-       on (see its docstring, indexer/store.py).
+       a strict subset of step 2's rowcount. ``symbols``, ``chunks``, and
+       ``reference_edges`` are removed by FK cascade, the same invariant
+       ``_sweep_membership`` relies on (see its docstring, indexer/store.py).
     4. Delete the matching ``repo_branches`` registry rows.
 
     Invariants: repo-scoped on every statement; membership subtraction only,
@@ -467,11 +467,13 @@ def reconcile_removed_repos(conn: Connection, *, desired_repos: Collection[str])
        RETURNING name`` -- one atomic statement, no prior ``SELECT``. Every
        victim row's cascade is proven at the database level, not the ORM:
        ``repos`` -> ``files`` and ``repos`` -> ``symbols`` and ``repos`` ->
-       ``repo_branches`` are direct ``ON DELETE CASCADE`` foreign keys
-       (``app/db/models.py``), ``files`` -> ``symbols`` is the same, and
+       ``repo_branches`` and ``repos`` -> ``reference_edges`` are direct
+       ``ON DELETE CASCADE`` foreign keys (``app/db/models.py``), ``files`` ->
+       ``symbols`` and ``files`` -> ``reference_edges`` are the same, and
        ``files`` -> ``chunks`` cascades via the raw DDL in
        ``app/alembic/versions/0004_semantic_chunks.py`` -- so a two-hop
-       ``repos`` -> ``files`` -> ``chunks`` delete fires as one statement.
+       ``repos`` -> ``files`` -> ``chunks``/``reference_edges`` delete fires as
+       one statement.
        ``RETURNING name`` reads back only ``repos`` rows, i.e. exactly the
        purged repo names, with no separate count query needed. The job role
        already holds ``DELETE`` on every table in this schema
