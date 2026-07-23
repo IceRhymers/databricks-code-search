@@ -8,6 +8,7 @@ from tree_sitter_language_pack import get_parser
 
 from app.db.models import ReferenceEdge
 from indexer.languages import EDGE_NODE_KINDS, EXT_TO_LANG, MAX_FILE_BYTES, SYMBOL_KINDS
+from indexer.symbols import _EDGE_EXTRACTORS
 
 
 @pytest.mark.unit
@@ -44,6 +45,38 @@ def test_edge_node_kinds_are_within_the_db_check_set() -> None:
 
     mapped_kinds = {kind for kinds in EDGE_NODE_KINDS.values() for kind in kinds.values()}
     assert mapped_kinds <= allowed, f"EDGE_NODE_KINDS has a kind outside the DB CHECK set: {sql!r}"
+
+
+@pytest.mark.unit
+def test_every_symbol_language_has_an_edge_map() -> None:
+    """Coverage guard (issue #85): any language that extracts symbols must also
+    declare an edge node-map, so a newly-added language can't silently ship
+    symbols with no reference edges."""
+    missing = set(SYMBOL_KINDS) - set(EDGE_NODE_KINDS)
+    assert not missing, (
+        f"languages in SYMBOL_KINDS with no EDGE_NODE_KINDS entry: {sorted(missing)}"
+    )
+
+
+@pytest.mark.unit
+def test_symbol_and_edge_node_types_are_disjoint_per_language() -> None:
+    """_combined_kinds merges the two maps with dict.update, which silently
+    clobbers a symbol entry on collision; the merge's losslessness is enforced
+    here, not assumed."""
+    for lang, kinds in SYMBOL_KINDS.items():
+        overlap = set(kinds) & set(EDGE_NODE_KINDS.get(lang, {}))
+        assert not overlap, (
+            f"{lang}: node types in both SYMBOL_KINDS and EDGE_NODE_KINDS: {sorted(overlap)}"
+        )
+
+
+@pytest.mark.unit
+def test_every_symbol_language_has_an_edge_extractor() -> None:
+    """extract_file indexes _EDGE_EXTRACTORS[lang] unconditionally for any
+    parsed language; a missing entry is a runtime KeyError for every file of
+    that language, so this guard is mandatory."""
+    missing = set(SYMBOL_KINDS) - set(_EDGE_EXTRACTORS)
+    assert not missing, f"languages with symbols but no edge extractor: {sorted(missing)}"
 
 
 @pytest.mark.unit

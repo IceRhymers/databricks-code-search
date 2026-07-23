@@ -5,8 +5,7 @@ Both :mod:`indexer.parse` (extension -> language) and :mod:`indexer.symbols`
 never disagree on language names. Language values MUST be valid
 ``tree_sitter_language_pack`` parser names. ``EDGE_NODE_KINDS`` maps, per
 language, tree-sitter node ``.type`` -> reference-edge kind (``call``/``import``);
-a language absent from the map yields zero edges (Python only for #84; #85
-adds the rest).
+a language absent from the map yields zero edges.
 """
 
 from __future__ import annotations
@@ -79,12 +78,40 @@ SYMBOL_KINDS: dict[str, dict[str, str]] = {
 # Per language: tree-sitter node ``.type`` -> reference-edge kind stored in
 # ``reference_edges``. Every value MUST be within the DB CHECK set
 # (``ReferenceEdge.__table__``'s ``ck_reference_edges_edge_kind``), enforced by
-# a unit test. Python only for #84 -- #85 adds the other six languages.
+# a unit test.
 EDGE_NODE_KINDS: dict[str, dict[str, str]] = {
     "python": {
         "call": "call",
         "import_statement": "import",
         "import_from_statement": "import",
+    },
+    "javascript": {
+        "call_expression": "call",  # f(x), a.b.f(), obj?.m()
+        "new_expression": "call",  # new Foo() -> constructor reference
+        "import_statement": "import",  # ES imports (all specifier shapes)
+    },
+    "typescript": {
+        "call_expression": "call",  # incl. f<T>(x)
+        "new_expression": "call",
+        "import_statement": "import",  # incl. import type / import x = require(...)
+    },
+    "tsx": {
+        "call_expression": "call",
+        "new_expression": "call",
+        "import_statement": "import",
+    },
+    "go": {
+        "call_expression": "call",  # f(), pkg.F(), obj.Method(); go/defer wrap this
+        "import_spec": "import",  # per-spec node -> per-import anchors, single & grouped
+    },
+    "java": {
+        "method_invocation": "call",  # f(), obj.m(), C.stat(), this.n(), super.s(), obj.<T>m()
+        "object_creation_expression": "call",  # new Foo(), new a.b.Foo(), new Foo<T>()
+        "import_declaration": "import",  # import a.b.C; static; a.b.*
+    },
+    "rust": {
+        "call_expression": "call",  # f(), a::b::g(), Foo::new(), x.method()
+        "use_declaration": "import",  # use trees: scoped, grouped, nested, self, wildcard, as
     },
 }
 
