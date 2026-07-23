@@ -118,6 +118,14 @@ def _signals(payload: dict[str, Any]) -> dict[str, Any]:
         # indistinguishable in the logs from a genuine no-match.
         "unsupported_filter": payload.get("unsupported_filter"),
         "nothing_to_embed": payload.get("nothing_to_embed"),
+        # Reference-tool signals (list_imports/find_references). A repo typo otherwise reads
+        # log-identically to an empty repo, and a misdirected list_imports call returns empty
+        # and is otherwise indistinguishable from a genuine no-match -- the unsupported_filter
+        # precedent exactly. All None-safe on payloads that do not carry them.
+        "repo_known": payload.get("repo_known"),
+        "unsupported_direction": payload.get("unsupported_direction"),
+        "missing_repo": payload.get("missing_repo"),
+        "missing_target": payload.get("missing_target"),
     }
 
 
@@ -159,6 +167,8 @@ _clamp_limit = service.clamp_limit
 _search_code_payload = service.search_code_payload
 _list_repos_payload = service.list_repos_payload
 _get_file_payload = service.get_file_payload
+_find_references_payload = service.find_references_payload
+_list_imports_payload = service.list_imports_payload
 
 
 def _append_branch_atom(query: str, branch: str) -> str:
@@ -321,6 +331,92 @@ async def get_file(repo: str, path: str, ctx: Context, branch: str | None = None
     )
 
 
+async def find_references(
+    symbol: str, ctx: Context, limit: int = 200, branch: str | None = None
+) -> str:
+    """Find candidate call sites of ``symbol`` corpus-wide, each with its ranked definitions.
+
+    CANDIDATE-SET semantics, NOT compiler-precise references: results are name-resolved over
+    raw ``call`` edges (grep-not-LSP). Each site is a place that calls something NAMED
+    ``symbol``; its ``candidates`` are the ``symbols`` definitions that name could plausibly
+    mean, ranked -- never a single authoritative binding. Ambiguity is preserved in full, never
+    collapsed to one answer.
+
+    ``symbol`` is matched exactly against the callee's rightmost identifier (``a.b.f()`` and
+    ``self.f()`` both match ``f``). ``branch`` scopes BOTH the call site's file and each
+    candidate's file (exact ``branches`` membership); omitted, both fall back to each repo's
+    default branch. ``limit`` caps the number of call sites scanned (clamped to a server
+    maximum).
+
+    Payload: ``symbol``, ``branch``, ``site_count``, ``sites``, a top-level ``resolution_summary``
+    histogram (``{"unique":N,"ambiguous":N,"unresolved":N}``), ``truncated``, and
+    ``query_too_broad``. Each entry in ``sites`` carries ``repo``, ``file``, ``line``,
+    ``edge_kind`` (``"call"``), ``target_name``, ``enclosing_symbol`` (``{"name","kind"}`` of the
+    function/class the call sits in, or ``null`` for module scope), ``resolution``
+    (``"unique"``=1 candidate, ``"ambiguous"``=2+, ``"unresolved"``=0), ``candidate_count`` (the
+    TRUE pre-cap count -- correct even when the candidate list is capped), ``candidates_truncated``,
+    and a ranked ``candidates`` list. Each candidate carries ``repo``, ``file``, ``line``,
+    ``name``, ``kind``, and the ranking signals ``same_repo`` / ``same_file`` / ``kind_match``.
+
+    Composition -- "what tests cover symbol X": call ``find_references(X)`` and client-side
+    filter ``sites`` by your test-path convention (e.g. ``file`` starts with ``"tests/"``); each
+    surviving site's ``enclosing_symbol`` names the covering test. No separate tool is needed.
+    """
+    lc = ctx.request_context.lifespan_context
+    engine, cfg = lc["engine"], lc["config"]
+    limit = _clamp_limit(limit, cfg)
+    return await _dispatch(
+        "find_references",
+        lambda: _find_references_payload(engine, cfg, symbol, limit, branch),
+    )
+
+
+async def list_imports(
+    ctx: Context,
+    repo: str | None = None,
+    target: str | None = None,
+    direction: str = "imports",
+    branch: str | None = None,
+    limit: int = 200,
+) -> str:
+    """Enumerate ``import`` edge sites in one of two directions (candidate-set semantics).
+
+    ``direction="imports"`` (default): list the import sites IN a repo -- **``repo`` is
+    REQUIRED** (a corpus-wide import listing is not index-served and is out of scope). An
+    optional ``target`` narrows to sites importing that exact dotted path.
+    ``direction="imported_by"``: find who imports a module -- **``target`` is REQUIRED** (the
+    exact dotted path, e.g. ``"os.path"``), searched corpus-wide; an optional ``repo`` narrows
+    to importers within that one repo.
+
+    Invalid input returns a STRUCTURED payload, never an error: an unknown ``direction`` sets
+    ``unsupported_direction`` (echoing the value); ``imports`` with no ``repo`` sets
+    ``missing_repo``; ``imported_by`` with no ``target`` sets ``missing_target``. Each also
+    carries a remedy ``reason`` and an empty result envelope.
+
+    Import edges target the FULL dotted path as written (no last-segment split), so most point
+    at external/stdlib modules and resolve ``"unresolved"`` -- that is expected and correct, not
+    an error. ``repo_known=False`` is a structured "no such repo" miss (distinct from a known
+    repo with zero import sites: ``repo_known=True`` with empty ``sites``); it is always ``True``
+    when no ``repo`` scope was requested.
+
+    Payload: ``kind`` (``"imports"``), ``direction``, ``repo``, ``target``, ``repo_known``,
+    ``branch``, ``site_count``, ``sites``, ``resolution_summary``, ``truncated``, and
+    ``query_too_broad``. Each ``sites`` entry has the same shape as ``find_references`` (``repo``,
+    ``file``, ``line``, ``edge_kind`` = ``"import"``, ``target_name``, ``enclosing_symbol`` |
+    ``null`` for module scope, ``resolution``, ``candidate_count``, ``candidates_truncated``,
+    ranked ``candidates``). ``limit`` caps the sites scanned (clamped to a server maximum).
+    """
+    lc = ctx.request_context.lifespan_context
+    engine, cfg = lc["engine"], lc["config"]
+    limit = _clamp_limit(limit, cfg)
+    return await _dispatch(
+        "list_imports",
+        lambda: _list_imports_payload(
+            engine, cfg, repo, limit, branch, target=target, direction=direction
+        ),
+    )
+
+
 # ------------------------------------------------------------------------- health / ready
 
 
@@ -369,6 +465,8 @@ def create_app() -> Starlette:
     mcp.tool()(semantic_search)
     mcp.tool()(list_repos)
     mcp.tool()(get_file)
+    mcp.tool()(find_references)
+    mcp.tool()(list_imports)
     mcp.custom_route("/health", methods=["GET"])(health)
     mcp.custom_route("/ready", methods=["GET"])(ready)
     return mcp.streamable_http_app()

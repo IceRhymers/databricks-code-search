@@ -248,6 +248,8 @@ stall the server. `statement_timeout` bounds the database, not the rescan.
 | `semantic_search` | `query`, `limit=50`, `branch=None` | ranked chunks with `rrf_score` |
 | `list_repos` | — | indexed repos with per-branch last-indexed metadata |
 | `get_file` | `repo`, `path`, `branch=None` | full file content, or `found: false` |
+| `find_references` | `symbol`, `limit=200`, `branch=None` | ranked candidate reference (call) sites with enclosing symbols |
+| `list_imports` | `repo=None`, `target=None`, `direction=imports`, `branch=None`, `limit=200` | import edge sites; `repo` required for `imports`, `target` required for `imported_by` |
 
 Every tool returns a JSON string. `limit` is clamped server-side: a non-positive value
 falls back to 200, and anything above 1000 is capped there.
@@ -278,6 +280,23 @@ job); disabled, it returns `semantic_enabled: false` and touches neither the dat
 the embedder. The target Lakebase project's managed preload including
 `lakebase_vector,lakebase_text` is a stated project assumption — see
 [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
+
+`find_references` and `list_imports` serve the knowledge-graph reference edges. They are
+**candidate-set, not compiler-precise** (grep-not-LSP): a call site is name-resolved to the
+`symbols` definitions its callee name could plausibly mean, ranked (`same_repo`/`same_file`/
+`kind_match`) but never collapsed to a single binding — `resolution` is `unique` (1
+candidate), `ambiguous` (2+), or `unresolved` (0), and the true pre-cap `candidate_count`
+survives capping. `list_imports` has two directions: `imports` enumerates a repo's import
+sites (`repo` required) and `imported_by` finds who imports a given dotted `target`
+corpus-wide (`target` required); invalid input comes back as a structured payload
+(`unsupported_direction`/`missing_repo`/`missing_target` with a `reason`), never an error, and
+import edges keep the full dotted path (so most read `unresolved` = external, by design).
+
+**"What tests cover symbol X"** needs no dedicated tool: call `find_references(X)` and
+client-side filter `sites` by your test-path convention (e.g. `file` starting with `tests/`);
+each surviving site's `enclosing_symbol` names the covering test. Two follow-ups are
+deliberately **deferred** past #87: repo/kind-scoped `find_references` filters, and per-file
+forward imports ("what does file F import").
 
 Two HTTP routes sit alongside the MCP mount: `GET /health` is liveness and never touches
 the database, and `GET /ready` runs `SELECT 1 FROM repos LIMIT 1` so that a role holding

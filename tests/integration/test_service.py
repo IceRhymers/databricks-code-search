@@ -660,3 +660,67 @@ def test_list_imports_payload_unknown_repo_against_real_corpus(ref_seeded: RefSe
     assert payload["repo_known"] is False
     assert payload["sites"] == []
     assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}
+
+
+@pytest.mark.integration
+def test_list_imports_payload_imported_by_finds_importer(ref_seeded: RefSeeded) -> None:
+    # "who imports os.path" -- corpus-wide over ix_reference_edges_target_name; the seeded
+    # importer site comes back with no repo scope requested (repo_known always True).
+    payload = service.list_imports_payload(
+        ref_seeded.engine, ref_seeded.cfg, target="os.path", direction="imported_by"
+    )
+
+    assert payload["kind"] == "imports"
+    assert payload["direction"] == "imported_by"
+    assert payload["target"] == "os.path"
+    assert payload["repo"] is None
+    assert payload["repo_known"] is True
+    assert payload["site_count"] == 1
+    (site,) = payload["sites"]
+    assert site["repo"] == "acme/widgets"
+    assert site["file"] == "src/importer.py"
+    assert site["line"] == 1
+    assert site["edge_kind"] == "import"
+
+
+@pytest.mark.integration
+def test_list_imports_payload_imported_by_unknown_target_is_empty_not_error(
+    ref_seeded: RefSeeded,
+) -> None:
+    payload = service.list_imports_payload(
+        ref_seeded.engine, ref_seeded.cfg, target="nonexistent.module", direction="imported_by"
+    )
+
+    assert payload["query_too_broad"] is False
+    assert payload["repo_known"] is True
+    assert payload["sites"] == []
+    assert payload["site_count"] == 0
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}
+
+
+@pytest.mark.integration
+def test_list_imports_payload_imported_by_repo_narrowing(ref_seeded: RefSeeded) -> None:
+    # The seeded importer is in acme/widgets, so narrowing to it keeps the site; narrowing to
+    # beta/tools (which has no such import) drops it -- a known repo with zero matching sites.
+    acme = service.list_imports_payload(
+        ref_seeded.engine,
+        ref_seeded.cfg,
+        "acme/widgets",
+        200,
+        target="os.path",
+        direction="imported_by",
+    )
+    assert acme["repo"] == "acme/widgets"
+    assert acme["repo_known"] is True
+    assert acme["site_count"] == 1
+
+    beta = service.list_imports_payload(
+        ref_seeded.engine,
+        ref_seeded.cfg,
+        "beta/tools",
+        200,
+        target="os.path",
+        direction="imported_by",
+    )
+    assert beta["repo_known"] is True
+    assert beta["sites"] == []

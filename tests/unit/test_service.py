@@ -655,6 +655,11 @@ def test_list_imports_payload_key_set_and_repo_scope(monkeypatch: pytest.MonkeyP
     assert payload["kind"] == "imports"
     assert payload["repo"] == "acme/widgets"
     assert payload["repo_known"] is True
+    # Additive uniform keys carried by BOTH directions (hardening, not repair -- the pre-existing
+    # individual-key assertions above still pass unchanged under these additions).
+    assert payload["direction"] == "imports"
+    assert payload["target"] is None
+    assert payload["query"] == "acme/widgets"  # query echoes repo for the imports direction
     assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 1}
     [site_payload] = payload["sites"]
     assert site_payload["edge_kind"] == "import"
@@ -672,6 +677,7 @@ def test_list_imports_payload_unknown_repo_is_structured_miss(
     payload = service.list_imports_payload(_FakeEngine([]), _cfg(), "ghost/repo", 200)
 
     assert payload["repo_known"] is False
+    assert payload["direction"] == "imports"
     assert payload["sites"] == []
     assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}
 
@@ -688,7 +694,139 @@ def test_list_imports_payload_query_too_broad(monkeypatch: pytest.MonkeyPatch) -
     assert payload["query_too_broad"] is True
     assert payload["truncated"] is True
     assert payload["repo_known"] is True  # unknown vs. timeout are distinct outcomes
+    assert payload["direction"] == "imports"
+    assert payload["target"] is None
     assert payload["sites"] == []
+
+
+class _FailingEngine:
+    """An engine that raises the instant a builder tries to open a connection.
+
+    Proves the PRE-DB validation branches return WITHOUT any DB round trip (mirrors the
+    grep-never-runs fake in the pagination tests above).
+    """
+
+    def connect(self) -> Any:
+        raise AssertionError("list_imports_payload validation must not touch the DB")
+
+
+@pytest.mark.unit
+def test_list_imports_payload_imported_by_routing_and_key_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(conn: Any, **kwargs: Any) -> ReferenceResult:
+        captured.update(kwargs)
+        site = _site(
+            edge_kind="import",
+            path="src/importer.py",
+            target_name="os.path",
+            resolution="unresolved",
+            candidate_count=0,
+        )
+        return _result(sites=(site,))
+
+    monkeypatch.setattr(service, "resolve_references", _capture)
+    monkeypatch.setattr(service, "_repo_name_map", lambda conn: {7: "acme/widgets"})
+
+    payload = service.list_imports_payload(
+        _FakeEngine([]), _cfg(), target="os.path", direction="imported_by"
+    )
+
+    # Routing: corpus-wide over target_name, no repo scope.
+    assert captured["target_name"] == "os.path"
+    assert captured["edge_kind"] == "import"
+    assert captured["repo"] is None
+    # Uniform key set on the imported_by path.
+    assert payload["kind"] == "imports"
+    assert payload["direction"] == "imported_by"
+    assert payload["target"] == "os.path"
+    assert payload["repo"] is None
+    assert payload["repo_known"] is True
+    assert payload["query"] == "os.path"  # query echoes target for imported_by
+    assert payload["query_too_broad"] is False
+    assert payload["site_count"] == 1
+
+
+@pytest.mark.unit
+def test_list_imports_payload_imported_by_repo_narrowing_and_branch_echo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture(conn: Any, **kwargs: Any) -> ReferenceResult:
+        captured.update(kwargs)
+        return _result()
+
+    monkeypatch.setattr(service, "resolve_references", _capture)
+    monkeypatch.setattr(service, "_repo_name_map", lambda conn: {})
+
+    payload = service.list_imports_payload(
+        _FakeEngine([]),
+        _cfg(),
+        "acme/widgets",
+        200,
+        branch="feature/x",
+        target="os.path",
+        direction="imported_by",
+    )
+
+    # An optional repo narrows the corpus-wide "who imports X" to one repo; branch threads through.
+    assert captured["repo"] == "acme/widgets"
+    assert captured["target_name"] == "os.path"
+    assert captured["branch"] == "feature/x"
+    assert payload["repo"] == "acme/widgets"
+    assert payload["branch"] == "feature/x"
+
+
+@pytest.mark.unit
+def test_list_imports_payload_unsupported_direction_is_structured_pre_db() -> None:
+    payload = service.list_imports_payload(
+        _FailingEngine(), _cfg(), "acme/widgets", 200, direction="sideways"
+    )
+
+    assert payload["unsupported_direction"] == "sideways"
+    assert "reason" in payload
+    assert payload["direction"] == "sideways"  # echoed unchanged
+    assert payload["query"] == ""  # pinned deterministic value (Critic note 3)
+    # Full empty envelope.
+    assert payload["kind"] == "imports"
+    assert payload["repo_known"] is True
+    assert payload["sites"] == []
+    assert payload["site_count"] == 0
+    assert payload["resolution_summary"] == {"unique": 0, "ambiguous": 0, "unresolved": 0}
+    assert payload["truncated"] is False
+    assert payload["truncation_reason"] is None
+    assert payload["query_too_broad"] is False
+
+
+@pytest.mark.unit
+def test_list_imports_payload_missing_repo_is_structured_pre_db() -> None:
+    # direction="imports" (default) with no repo: a structured miss, no DB touch.
+    payload = service.list_imports_payload(_FailingEngine(), _cfg())
+
+    assert payload["missing_repo"] is True
+    assert "reason" in payload
+    assert payload["direction"] == "imports"
+    assert payload["repo"] is None
+    assert payload["query"] == ""  # pinned deterministic value (Critic note 3)
+    assert payload["sites"] == []
+    assert payload["query_too_broad"] is False
+
+
+@pytest.mark.unit
+def test_list_imports_payload_missing_target_is_structured_pre_db() -> None:
+    # direction="imported_by" with no target: a structured miss, no DB touch.
+    payload = service.list_imports_payload(_FailingEngine(), _cfg(), direction="imported_by")
+
+    assert payload["missing_target"] is True
+    assert "reason" in payload
+    assert payload["direction"] == "imported_by"
+    assert payload["target"] is None
+    assert payload["query"] == ""  # pinned deterministic value (Critic note 3)
+    assert payload["sites"] == []
+    assert payload["query_too_broad"] is False
 
 
 @pytest.mark.unit

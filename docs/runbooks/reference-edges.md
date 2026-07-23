@@ -123,8 +123,21 @@ idempotent, safe to run against a target that's already current.
 resolution is ever written back to `reference_edges` or `symbols`, and no extraction-time
 symbol FK was added. `resolve_references(conn, ...)` is the entry point; `app/service.py`
 wraps it in two additive payload builders, `find_references_payload` (corpus-wide,
-`edge_kind="call"`) and `list_imports_payload` (`edge_kind="import"`, `repo` required). MCP
-tool registration for these is a later child (#87), not #86.
+`edge_kind="call"`) and `list_imports_payload` (`edge_kind="import"`).
+
+**MCP tools shipped in #87.** Both builders are now exposed as MCP tools in `app/main.py`:
+`find_references(symbol, limit, branch)` and `list_imports(repo, target, direction, branch,
+limit)`. `list_imports` gained a `direction` parameter (an additive, signature-compatible
+extension of the builder): `direction="imports"` enumerates a repo's import sites (`repo`
+required), and `direction="imported_by"` finds who imports a given dotted `target`
+corpus-wide (`target` required, index-served by `ix_reference_edges_target_name`). Invalid
+input returns a structured payload (`unsupported_direction`/`missing_repo`/`missing_target`
+with a `reason`), never an exception, validated PRE-DB in the service-layer builder so the #88
+Web UI inherits it. The "what tests cover symbol X" question composes from the existing
+primitive — `find_references(X)` plus a client-side `sites[].file` test-path filter, each
+surviving site's `enclosing_symbol` naming the covering test — so no new tool was added.
+Deferred past #87: repo/kind-scoped `find_references` filters, and per-file forward imports
+("what does file F import").
 
 **Two-query design, deliberately not one joined query.** Query 1 selects matching edge
 sites from `reference_edges`/`files`/`repos`; query 2 selects candidate `symbols` for the
@@ -161,12 +174,16 @@ is *correct*, not a miss; (3) a last-segment heuristic (`a.b.get` → every symb
 value is *enumerating* import sites with their `target_name`, not resolving them to local
 definitions.
 
-**`repo` is required for `list_imports_payload`.** A corpus-wide import listing would
-filter on `edge_kind` alone — the trailing column of `ix_reference_edges_repo_kind
-(repo_id, edge_kind)`, not index-served on its own — so corpus-wide listing is out of
-scope. `repo_known: False` is a structured "no such repo" miss (mirrors `get_file_payload`'s
-`found: False`), distinguishable from a known repo with zero import sites
-(`repo_known: True`, `sites: []`).
+**`repo` is required for `direction=imports`; `direction=imported_by` is target-required,
+index-served by `ix_reference_edges_target_name`.** A corpus-wide *bare* import listing
+(`imports` with no `repo`) would filter on `edge_kind` alone — the trailing column of
+`ix_reference_edges_repo_kind (repo_id, edge_kind)`, not index-served on its own — so it is
+out of scope and returns a `missing_repo` validation payload. The `imported_by` direction is
+the opposite case: it filters on `target_name` equality, which the btree
+`ix_reference_edges_target_name` serves corpus-wide, so no `repo` is needed (one may still be
+passed to narrow the result). `repo_known: False` is a structured "no such repo" miss (mirrors
+`get_file_payload`'s `found: False`), distinguishable from a known repo with zero import sites
+(`repo_known: True`, `sites: []`); it is always `True` when no `repo` scope was requested.
 
 **Branch scoping matches `search_code`/`get_file` exactly**, applied independently to BOTH
 the edge site's file and each candidate's file: an explicit `branch` uses

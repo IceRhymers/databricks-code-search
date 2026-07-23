@@ -101,6 +101,49 @@ def validate_search_payload(payload: dict[str, Any]) -> Result:
     return Result(True, f"search_code: {file_count} file(s) with well-formed matches")
 
 
+def validate_references_payload(payload: dict[str, Any]) -> Result:
+    """Assert the reference-tool envelope SHAPE (``find_references`` / ``list_imports``).
+
+    Deliberately shape-only and zero-sites-accepting: a live corpus's symbols are
+    unpredictable, so requiring a non-empty result would false-RED. A missing key or wrong
+    type still fails (never false-GREEN): ``kind`` is a str; ``direction`` (when present) is a
+    str; ``sites`` is a list with ``site_count == len(sites)``; ``resolution_summary`` is a dict
+    with EXACTLY the keys ``{"unique","ambiguous","unresolved"}``, all ints; ``truncated`` and
+    ``query_too_broad`` are present and bool; each site has a str ``file``, an int ``line``, and
+    a list ``candidates``.
+    """
+    if not isinstance(payload.get("kind"), str):
+        return Result(False, f"references: kind = {payload.get('kind')!r}, expected a str")
+    if "direction" in payload and not isinstance(payload["direction"], str):
+        return Result(False, f"references: direction = {payload['direction']!r}, expected a str")
+    sites = payload.get("sites")
+    if not isinstance(sites, list):
+        return Result(False, "references: 'sites' is not a list")
+    if payload.get("site_count") != len(sites):
+        return Result(
+            False,
+            f"references: site_count = {payload.get('site_count')!r}, expected {len(sites)}",
+        )
+    summary = payload.get("resolution_summary")
+    if not isinstance(summary, dict) or set(summary) != {"unique", "ambiguous", "unresolved"}:
+        return Result(
+            False, f"references: resolution_summary keys = {summary!r}, expected the 3 buckets"
+        )
+    if not all(isinstance(v, int) for v in summary.values()):
+        return Result(False, "references: resolution_summary values are not all ints")
+    for flag in ("truncated", "query_too_broad"):
+        if not isinstance(payload.get(flag), bool):
+            return Result(False, f"references: {flag} = {payload.get(flag)!r}, expected a bool")
+    for si, s in enumerate(sites):
+        if not isinstance(s, dict) or not isinstance(s.get("file"), str):
+            return Result(False, f"references: sites[{si}].file is not a str")
+        if not isinstance(s.get("line"), int):
+            return Result(False, f"references: sites[{si}].line is not an int")
+        if not isinstance(s.get("candidates"), list):
+            return Result(False, f"references: sites[{si}].candidates is not a list")
+    return Result(True, f"references: {len(sites)} site(s) with well-formed envelope")
+
+
 # ------------------------------------------------------------------------------ live legs
 #
 # Heavy imports (httpx / mcp / sqlalchemy / databricks.sdk) are lazy so the pure predicates
@@ -187,7 +230,11 @@ def _check_db(expect_indexed: bool) -> list[Result]:
 
 
 def _check_mcp(app_url: str, query: str, headers: dict[str, str] | None = None) -> Result:
-    """Live MCP leg: call ``search_code`` over authenticated streamable HTTP, validate envelope."""
+    """Live MCP leg: call ``search_code`` + ``find_references`` over authenticated streamable
+    HTTP and validate each envelope. ``list_imports`` is NOT added here -- it needs a valid repo
+    argument, and deriving one via ``list_repos`` adds fragility for no additional coverage of
+    the shared ``_dispatch`` path both reference tools already ride.
+    """
     import asyncio
     import json
 
@@ -209,10 +256,21 @@ def _check_mcp(app_url: str, query: str, headers: dict[str, str] | None = None) 
         async with streamablehttp_client(f"{app_url}/mcp", headers=auth_headers) as (r, w, _):
             async with ClientSession(r, w) as session:
                 await session.initialize()
-                res = await session.call_tool("search_code", {"query": query})
-                text_parts = [c.text for c in res.content if getattr(c, "type", None) == "text"]
-                payload = json.loads(text_parts[0]) if text_parts else {}
-                return validate_search_payload(payload)
+
+                async def _call(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+                    res = await session.call_tool(tool, args)
+                    parts = [c.text for c in res.content if getattr(c, "type", None) == "text"]
+                    return json.loads(parts[0]) if parts else {}
+
+                search = validate_search_payload(await _call("search_code", {"query": query}))
+                if not search.ok:
+                    return search
+                refs = validate_references_payload(
+                    await _call("find_references", {"symbol": query})
+                )
+                if not refs.ok:
+                    return refs
+                return Result(True, f"{search.detail}; {refs.detail}")
 
     return asyncio.run(_run())
 
