@@ -21,6 +21,9 @@ dependencies = [
     "tree-sitter-language-pack",
     "pydantic-settings",
     "pyyaml>=6.0",
+    # >=2021.11.10: floor for finditer(..., timeout=...) support, which app/search/grep.py's
+    # per-request match budget depends on.
+    "regex>=2021.11.10",
 ]
 
 # webui/ is a SEPARATE deploy artifact from the MCP app: it imports app.* from a
@@ -45,6 +48,7 @@ dev = [
     "httpx",
     "asgi-lifespan",
     "types-PyYAML",
+    "types-regex",
 ]
 
 [tool.setuptools.packages.find]

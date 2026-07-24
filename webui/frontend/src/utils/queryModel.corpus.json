@@ -114,5 +114,13 @@
   ] },
   { "query": "foo-", "verdict": "safe", "python_parses": true, "atoms": [
     { "field": null, "value": "foo-", "start": 0, "end": 4 }
+  ] },
+  { "query": "commit:abc1234", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "commit", "value": "abc1234", "start": 0, "end": 14 }
+  ] },
+  { "query": "repo:acme commit:abc1234 foo", "verdict": "safe", "python_parses": true, "atoms": [
+    { "field": "repo", "value": "acme", "start": 0, "end": 9 },
+    { "field": "commit", "value": "abc1234", "start": 10, "end": 24 },
+    { "field": null, "value": "foo", "start": 25, "end": 28 }
   ] }
 ]

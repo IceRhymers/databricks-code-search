@@ -27,15 +27,17 @@ Bounds (bounded resource use is correctness, not polish):
 
 Caveats (load-bearing, documented, never silently wrong):
 
-* **NOT RE2.** Python ``re`` is not Postgres POSIX ARE, and matching here is line-oriented:
-  ``^``/``$`` are line anchors, ``.`` never crosses lines, and cross-line constructs (e.g.
-  ``(?s)...``) do not span lines. A Postgres-valid regex that Python ``re`` rejects is
-  skipped (that atom contributes no highlights) and ``regex_incompatible`` is set. The SQL
-  predicate already selected the file; grep only degrades the *highlighting*. Case folding
-  can also diverge: ``re.IGNORECASE`` (Python Unicode folding) and Postgres ``lower()`` do
-  not agree on every non-ASCII pair (e.g. ``ß``/``SS``, Turkish dotless ``i``), so a file
-  the SQL predicate matched case-insensitively may yield zero Python highlights and drop
-  out. ASCII is unaffected.
+* **NOT RE2.** Python's ``regex`` module (a ``re``-compatible superset, still not RE2) is not
+  Postgres POSIX ARE, and matching here is line-oriented: ``^``/``$`` are line anchors, ``.``
+  never crosses lines, and cross-line constructs (e.g. ``(?s)...``) do not span lines. A
+  Postgres-valid regex that ``regex`` rejects is skipped (that atom contributes no highlights)
+  and ``regex_incompatible`` is set. Because ``regex`` accepts a strict superset of what stdlib
+  ``re`` accepted, this is a pure improvement: ``regex_incompatible`` fires less often than
+  under ``re``, never more. The SQL predicate already selected the file; grep only degrades
+  the *highlighting*. Case folding can also diverge: ``regex.IGNORECASE`` (Python Unicode
+  folding) and Postgres ``lower()`` do not agree on every non-ASCII pair (e.g. ``ß``/``SS``,
+  Turkish dotless ``i``), so a file the SQL predicate matched case-insensitively may yield zero
+  Python highlights and drop out. ASCII is unaffected.
 * **Highlight-driven results.** A file appears only if at least one line produces a
   non-empty highlight span, so two query shapes the SQL predicate does match still return
   no files. Both are announced by name rather than returning a silent empty result
@@ -57,10 +59,22 @@ Caveats (load-bearing, documented, never silently wrong):
   a file the SQL predicate matched case-insensitively that yields zero Python highlights
   drops out with patterns present, non-empty, and of non-zero width -- so it is still
   entirely unsignalled. Fixing that needs a new provable signal, not one of these two.
-* **Uncapped Python CPU.** The byte cap bounds memory and aggregate bytes scanned but NOT
-  CPU/wall-clock: a catastrophic-backtracking ``re`` pattern on a single under-cap file runs
-  unbounded, holds the GIL, and can starve the app. ``statement_timeout`` does not cover
-  Python work. No guard for this ships yet; the real fix is an RE2 binding.
+* **Bounded Python CPU (match budget).** The byte cap bounds memory and aggregate bytes
+  scanned but not CPU/wall-clock; a per-request match budget (the ``regex`` module's
+  ``timeout=``) covers that third leg. Its value comes from ``Settings.match_budget_ms`` /
+  ``CODE_SEARCH_MATCH_BUDGET_MS`` (default 2000ms), threaded through ``grep_search``. Trip
+  semantics: scanning stops, fully-scanned files are kept, and the result is flagged
+  ``truncated=True`` + ``truncation_reason="match_budget"`` (a budgeted result never
+  masquerades as complete). Cursor semantics have two cases -- a *pre-file* trip (the deadline
+  is already past when the next file's row is dequeued) leaves that file unconsumed, so
+  ``next_cursor`` resumes at it fresh (a later fresh budget may clear it); a *mid-file* trip
+  (the ``regex`` engine's ``timeout=`` fires while scanning a file) treats that file as
+  consumed, discards its partial matches, and ``next_cursor`` steps past it so pagination
+  never stalls forever on one pathological file. The ``regex`` module releases the GIL while
+  matching, so even a budgeted pathological match keeps the event loop responsive rather than
+  pinning it. Residual risk: an attacker can still burn up to ``match_budget_ms`` x
+  concurrent-request-slots of CPU per volley -- availability is preserved (GIL released), but
+  request rate limiting is out of scope here.
 * **Per-file memory** relies on the indexer's per-file byte cap (``MAX_FILE_BYTES``) keeping
   any single ``content`` bounded; ``File.size`` is nullable/unpopulated here, so a ``size``
   pre-filter is intentionally NOT used.
@@ -69,13 +83,13 @@ Caveats (load-bearing, documented, never silently wrong):
   wraps the predicate in ``not_(...)``, it does not validate the pattern), so a
   Postgres-invalid POSIX ARE such as ``/[/`` reaches the database whether the atom is written
   as ``/[/`` or ``-/[/``. Postgres raises ``InvalidRegularExpression`` (SQLSTATE class 22, a
-  Data Exception), which SQLAlchemy surfaces as ``sqlalchemy.exc.DataError`` -- a different
-  class from the ``OperationalError`` :func:`app.search.errors.reraise_or_query_too_broad`
-  catches, so it never reaches that mapper at all and propagates straight out of
-  ``grep_search`` uncaught, exactly like any other unexpected fault (``app/main.py``'s
-  ``_dispatch`` logs the traceback and re-raises). This is polarity-independent and
-  pre-existing (true for ``/[/`` before negation shipped, and unchanged by it): grep only
-  ever skips a negated broken regex's Python-side highlight compilation (see
+  Data Exception), which SQLAlchemy surfaces as ``sqlalchemy.exc.DataError``. This module's
+  raw-execution sites catch the common :class:`~sqlalchemy.exc.DBAPIError` ancestor and route
+  it through :func:`app.search.errors.reraise_or_recoverable`, which maps it to a typed
+  :class:`~app.search.errors.RegexInvalidError` -- the service layer (``app/service.py``)
+  turns that into the ``regex_invalid`` payload field, never an uncaught fault. This is
+  polarity-independent (true for ``/[/`` whether the atom is written as ``/[/`` or ``-/[/``):
+  grep only ever skips a negated broken regex's Python-side highlight compilation (see
   :func:`_collect_matchers`); the SQL predicate is compiled server-side regardless.
 
 Byte offsets are UTF-8, line-local, half-open ``[start, end)``: for a :class:`LineMatch`,
@@ -86,12 +100,14 @@ are a documented follow-up).
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, assert_never
 
+import regex
 from sqlalchemy import Connection, select, text, tuple_
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 
 from app.db.models import File
 from app.query.compiler import DEFAULT_ROW_LIMIT, compile_query
@@ -111,12 +127,24 @@ from app.query.parser import (
     parse,
     resolve_case,
 )
-from app.search.errors import reraise_or_query_too_broad
+from app.search.errors import reraise_or_recoverable
 
 # 8 MiB of content pulled/scanned per request (aggregate across files).
 DEFAULT_MAX_CONTENT_BYTES = 8 * 1024 * 1024
 # Per-request DB-time bound; a cancellation surfaces as QueryTooBroadError.
 DEFAULT_STATEMENT_TIMEOUT_MS = 5000
+# Per-request wall-clock bound on Python-side pattern matching (regex module's timeout=);
+# the third leg of the per-request resource triangle beside DB time and bytes scanned.
+DEFAULT_MATCH_BUDGET_MS = 2000
+
+
+class MatchBudgetExceeded(Exception):
+    """The per-request match budget tripped mid-scan (module-private, never crosses out).
+
+    Raised by :func:`extract_line_matches` when a supplied ``deadline`` is reached; caught
+    inside :func:`grep_search`, which turns it into a ``truncation_reason="match_budget"``
+    partial result. It never reaches ``app/search/errors.py`` or a caller.
+    """
 
 
 # --------------------------------------------------------------------------- contract
@@ -178,7 +206,8 @@ class FileMatches:
 @dataclass(frozen=True)
 class GrepResult:
     """A grep result. ``truncated`` (with ``truncation_reason``) flags a partial result;
-    a total failure raises :class:`QueryTooBroadError` instead of returning.
+    a total failure raises :class:`QueryTooBroadError` or
+    :class:`~app.search.errors.RegexInvalidError` instead of returning.
 
     ``no_content_atom`` and ``zero_width_only_atoms`` are raw structural facts about this leg
     only. grep reports; it does not know whether a second leg answered the query -- a
@@ -202,7 +231,7 @@ class GrepResult:
 
     files: tuple[FileMatches, ...]  # in (repo_id, path, content_sha) order
     truncated: bool  # byte cap OR (row cap tripped AND no cursor kwarg was supplied)
-    truncation_reason: str | None  # "byte_cap" | "row_cap" | None
+    truncation_reason: str | None  # "byte_cap" | "row_cap" | "match_budget" | None
     regex_incompatible: bool  # some Regex atom failed Python re.compile
     no_content_atom: bool  # no affirmative content atom to highlight (filter-only OR fully
     # negated, e.g. ``lang:go`` OR ``-foo`` alone); nothing compiled away either way
@@ -222,10 +251,10 @@ class GrepResult:
 # ----------------------------------------------------------------------- pure helpers
 
 
-def _collect_matchers(node: Node, flags: int, patterns: list[re.Pattern[str]]) -> bool:
+def _collect_matchers(node: Node, flags: int, patterns: list[regex.Pattern[str]]) -> bool:
     """Append every affirmative Substring/Regex leaf's compiled pattern to ``patterns``.
 
-    Returns True if any (affirmative) Regex leaf failed Python ``re.compile`` (NOT-RE2
+    Returns True if any (affirmative) Regex leaf failed ``regex.compile`` (NOT-RE2
     degradation). Filters (repo/path/lang/sym) contribute no patterns.
 
     A :class:`Not` subtree contributes nothing and is not recursed into: grep highlights only
@@ -238,12 +267,12 @@ def _collect_matchers(node: Node, flags: int, patterns: list[re.Pattern[str]]) -
     """
     match node:
         case Substring(value=value):
-            patterns.append(re.compile(re.escape(value), flags))
+            patterns.append(regex.compile(regex.escape(value), flags))
             return False
         case Regex(pattern=pattern):
             try:
-                patterns.append(re.compile(pattern, flags))
-            except re.error:
+                patterns.append(regex.compile(pattern, flags))
+            except regex.error:
                 return True
             return False
         case Not():
@@ -266,21 +295,21 @@ def _collect_matchers(node: Node, flags: int, patterns: list[re.Pattern[str]]) -
             assert_never(node)
 
 
-def _build_matchers(node: Node, case_sensitive: bool) -> tuple[list[re.Pattern[str]], bool]:
+def _build_matchers(node: Node, case_sensitive: bool) -> tuple[list[regex.Pattern[str]], bool]:
     """Collect every Substring/Regex leaf (any And/Or nesting) into compiled patterns.
 
-    Filters contribute none. Substring -> ``re.compile(re.escape(value))``; Regex ->
-    ``re.compile(pattern)`` catching ``re.error`` (skip that atom, flag incompatible).
-    ``flags = re.IGNORECASE if not case_sensitive else 0``. Returns
+    Filters contribute none. Substring -> ``regex.compile(regex.escape(value))``; Regex ->
+    ``regex.compile(pattern)`` catching ``regex.error`` (skip that atom, flag incompatible).
+    ``flags = regex.IGNORECASE if not case_sensitive else 0``. Returns
     ``(patterns, regex_incompatible)``. Pure -- no DB import.
     """
-    flags = re.IGNORECASE if not case_sensitive else 0
-    patterns: list[re.Pattern[str]] = []
+    flags = regex.IGNORECASE if not case_sensitive else 0
+    patterns: list[regex.Pattern[str]] = []
     regex_incompatible = _collect_matchers(node, flags, patterns)
     return patterns, regex_incompatible
 
 
-def _no_content_atom(patterns: Sequence[re.Pattern[str]], regex_incompatible: bool) -> bool:
+def _no_content_atom(patterns: Sequence[regex.Pattern[str]], regex_incompatible: bool) -> bool:
     """True when the query carries no affirmative content atom to highlight.
 
     ``patterns`` is empty for two structurally different queries, both reported identically
@@ -300,7 +329,9 @@ def _no_content_atom(patterns: Sequence[re.Pattern[str]], regex_incompatible: bo
     return not patterns and not regex_incompatible
 
 
-def _zero_width_only_atoms(patterns: Sequence[re.Pattern[str]], regex_incompatible: bool) -> bool:
+def _zero_width_only_atoms(
+    patterns: Sequence[regex.Pattern[str]], regex_incompatible: bool
+) -> bool:
     """True when every content atom provably matches zero-width, so nothing can highlight.
 
     ``re._parser.parse(src).getwidth()`` returns ``(min_width, max_width)``; a ``max_width``
@@ -378,7 +409,9 @@ def _char_to_byte_ranges(line: str, spans: list[tuple[int, int]]) -> tuple[tuple
     return tuple(ranges)
 
 
-def extract_line_matches(content: str, patterns: Sequence[re.Pattern[str]]) -> list[LineMatch]:
+def extract_line_matches(
+    content: str, patterns: Sequence[regex.Pattern[str]], *, deadline: float | None = None
+) -> list[LineMatch]:
     """Extract per-line matches from ``content`` for the given compiled ``patterns``.
 
     Splits on ``"\\n"`` (1-based line numbers) and strips one trailing ``"\\r"`` per line
@@ -387,6 +420,15 @@ def extract_line_matches(content: str, patterns: Sequence[re.Pattern[str]]) -> l
     any atom are merged into a sorted, non-overlapping set; merged char endpoints are
     converted to UTF-8 byte offsets. Only lines with >=1 span produce a :class:`LineMatch`.
     Pure -- no DB import.
+
+    ``deadline`` is an absolute ``time.monotonic()`` timestamp bounding Python-side CPU. When
+    ``None`` (the default), matching is unbudgeted and every ``finditer`` call is issued with
+    no ``timeout=`` -- existing direct callers/tests pay no timeout-checking overhead and see
+    identical behaviour. When set, each pattern is matched with the remaining time as the
+    ``regex`` module's ``timeout=``; if the deadline is already past before a pattern runs, or
+    the ``regex`` engine trips its own ``TimeoutError`` mid-iteration on a pathological match,
+    this raises :class:`MatchBudgetExceeded` (the ``regex`` module releases the GIL while
+    matching, so a budgeted pathological scan does not starve the event loop).
     """
     if not patterns:
         return []
@@ -395,9 +437,21 @@ def extract_line_matches(content: str, patterns: Sequence[re.Pattern[str]]) -> l
         line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
         spans: list[tuple[int, int]] = []
         for pattern in patterns:
-            for m in pattern.finditer(line):
-                if m.end() > m.start():  # drop zero-width matches
-                    spans.append((m.start(), m.end()))
+            if deadline is None:
+                # Unbudgeted path: no timeout= kwarg, no per-call clock read.
+                finditer = pattern.finditer(line)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MatchBudgetExceeded()
+                finditer = pattern.finditer(line, timeout=remaining)
+            try:
+                for m in finditer:
+                    if m.end() > m.start():  # drop zero-width matches
+                        spans.append((m.start(), m.end()))
+            except TimeoutError:
+                # regex module raises builtin TimeoutError mid-iteration when timeout= trips.
+                raise MatchBudgetExceeded() from None
         if not spans:
             continue
         byte_ranges = _char_to_byte_ranges(line, _merge_spans(spans))
@@ -415,6 +469,7 @@ def grep_search(
     row_limit: int = DEFAULT_ROW_LIMIT,
     max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    match_budget_ms: int = DEFAULT_MATCH_BUDGET_MS,
     cursor: FileCursor | None | _Unset = _UNSET,
 ) -> GrepResult:
     """Run a zoekt-style ``query`` and return file-grouped, per-line matches.
@@ -427,9 +482,12 @@ def grep_search(
 
     A per-request ``statement_timeout`` bounds DB time (a cancellation raises
     :class:`QueryTooBroadError`); ``max_content_bytes`` bounds app memory / aggregate bytes
-    scanned (a cap sets ``truncated`` + ``truncation_reason``). See the module docstring for
-    the NOT-RE2 and uncapped-Python-CPU caveats. Raises ``QueryParseError`` on a malformed
-    query (propagated from :func:`parse`).
+    scanned (a cap sets ``truncated`` + ``truncation_reason``); ``match_budget_ms`` bounds
+    Python-side pattern-matching wall-clock (a trip sets ``truncated`` +
+    ``truncation_reason="match_budget"``). A Postgres-invalid regex pattern (any polarity)
+    raises :class:`~app.search.errors.RegexInvalidError`. See the module docstring for the
+    NOT-RE2 and match-budget caveats. Raises ``QueryParseError`` on a malformed query
+    (propagated from :func:`parse`).
 
     ``cursor`` activates pagination mode when supplied at all, including ``None`` (page 1): a
     plain row-cap fill then reports ``truncated=False`` plus a non-null
@@ -457,6 +515,7 @@ def grep_search(
 
     files: list[FileMatches] = []
     byte_capped = False
+    budget_tripped = False
     last_candidate: FileCursor | None = None
 
     with conn.begin():
@@ -469,8 +528,8 @@ def grep_search(
 
         try:
             rows = conn.execute(stmt).all()
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
 
         # `>=` deliberately over-warns on an exact fit (row_limit files that are exactly all
         # of them still report truncated -- an accepted, conservative false-positive).
@@ -504,11 +563,32 @@ def grep_search(
             .order_by(File.repo_id, File.path, File.content_sha)
             .execution_options(yield_per=1)  # one-row server-side cursor; NOT bare stream_results
         )
+        # Computed AFTER the candidate query returns so candidate-selection DB time never eats
+        # the match budget. Per-row content-fetch latency (`yield_per=1`, below) DOES fall
+        # inside this deadline window by design -- it is interleaved with the Python-side
+        # matching the budget bounds, not excluded from it (see the pre-file check's comment
+        # for the consequence on the very first row of a page).
+        deadline = time.monotonic() + match_budget_ms / 1000.0
         running = 0
         result = conn.execute(content_stmt)
         try:
             for row in result:
                 content = row.content or ""
+                # Pre-file budget check: mirrors the byte-cap break's position (before
+                # `last_candidate` advances for this row). A trip here leaves this file
+                # unconsumed. If a PRIOR row was already consumed this call, `next_cursor`
+                # (below) points at it and a resumed page re-fetches this file fresh. If this
+                # trips on the very FIRST row of a page -- reachable via slow content-fetch
+                # latency, not just an undersized budget, since fetch time counts against the
+                # deadline too -- `last_candidate` is still None; falling back to `next_cursor
+                # = resume` (unchanged) below re-issues this same page with a fresh budget
+                # instead of a `next_cursor=None` dead end that would silently drop the rest of
+                # the corpus. Only page 1 with no incoming `resume` and no row consumed yet has
+                # no cursor to fall back to; that residual case yields `next_cursor=None` +
+                # `truncated=True`, safely retried by re-issuing the identical query.
+                if time.monotonic() >= deadline:
+                    budget_tripped = True
+                    break
                 # Char count is a valid lower bound on UTF-8 byte count, so this never
                 # under-counts the cap; checked BEFORE .encode()/processing so the cap is a
                 # real bound (overshoot <= one file) and avoids a transient copy of a huge file.
@@ -530,7 +610,14 @@ def grep_search(
                 # the resume key tracks candidates CONSUMED, not candidates EMITTED. See
                 # FileCursor's docstring.
                 last_candidate = FileCursor(row.repo_id, row.path, row.content_sha)
-                line_matches = extract_line_matches(content, patterns)
+                # Mid-file budget trip: `last_candidate` is ALREADY advanced past this row
+                # (above), so this file is CONSUMED and its partial line_matches are discarded
+                # entirely -- pagination steps past it rather than re-scanning it forever.
+                try:
+                    line_matches = extract_line_matches(content, patterns, deadline=deadline)
+                except MatchBudgetExceeded:
+                    budget_tripped = True
+                    break
                 if line_matches:
                     files.append(
                         FileMatches(
@@ -542,15 +629,27 @@ def grep_search(
                             tuple(line_matches),
                         )
                     )
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
         finally:
             result.close()
 
-    truncated = byte_capped or (row_capped and not pagination_mode)
+    truncated = byte_capped or budget_tripped or (row_capped and not pagination_mode)
     legacy_row_capped = row_capped and not pagination_mode
-    reason = "byte_cap" if byte_capped else ("row_cap" if legacy_row_capped else None)
-    next_cursor = last_candidate if (row_capped or byte_capped) else None
+    reason = (
+        "byte_cap"
+        if byte_capped
+        else ("match_budget" if budget_tripped else ("row_cap" if legacy_row_capped else None))
+    )
+    next_cursor: FileCursor | None
+    if budget_tripped and last_candidate is None and resume is not None:
+        # Pre-file trip on the very first row of a resumed page: nothing new was consumed this
+        # call, so falling back to the unchanged incoming `resume` cursor makes this page
+        # retryable with a fresh budget rather than reporting `next_cursor=None` (exhausted)
+        # while `truncated=True` -- see the pre-file check's comment above.
+        next_cursor = resume
+    else:
+        next_cursor = last_candidate if (row_capped or byte_capped or budget_tripped) else None
     return GrepResult(
         files=tuple(files),
         truncated=truncated,

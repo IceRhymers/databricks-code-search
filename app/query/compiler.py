@@ -23,7 +23,9 @@ Contract / divergence notes (load-bearing):
   case-flip set.
 * Regex is opaque. Regex/filter patterns bind RAW as parameters -- never escaped, never
   ``re.compile``-d. An invalid POSIX ARE surfaces as a DB execution error at query time,
-  not at compile time.
+  not at compile time -- which the search layer (:mod:`app.search.errors`) maps to a typed
+  ``RegexInvalidError`` -> the ``regex_invalid`` payload field, never an uncaught fault
+  (issue #75).
 * ``lang:`` normalization. ``File.lang == lang.strip().lower()``; unknown values match
   nothing (empty result) rather than raising. No ``indexer`` import.
 * Substring escaping. ``LIKE``/``ILIKE`` literals escape ``\\``, ``%``, ``_`` (backslash

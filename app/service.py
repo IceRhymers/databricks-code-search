@@ -43,7 +43,7 @@ from app.query.parser import (
     SymbolFilter,
     parse,
 )
-from app.search.errors import QueryTooBroadError
+from app.search.errors import QueryTooBroadError, RegexInvalidError
 from app.search.grep import FileCursor, grep_search
 from app.search.references import EdgeSite, ReferenceResult, resolve_references
 from app.search.semantic import _semantic_search_payload as semantic_search_payload  # noqa: F401
@@ -369,6 +369,7 @@ def _search_envelope(
     truncated: bool,
     truncation_reason: str | None,
     regex_incompatible: bool,
+    regex_invalid: str | None,
     query_too_broad: bool,
     query_parse_error: str | None,
     no_content_atom: bool,
@@ -388,6 +389,14 @@ def _search_envelope(
     (see :func:`app.search.grep._no_content_atom`).
     ``zero_width_only_atoms`` -- content atoms were present but every one provably matches
     zero-width (e.g. ``/^/``), so every span was dropped. Mutually exclusive by construction.
+
+    ``regex_invalid`` -- ``None`` normally; the Postgres-rejected pattern's message (e.g.
+    ``"invalid regular expression: brackets [] not balanced"``) when a ``Regex``/``repo:``/
+    ``file:``/``sym:`` pattern is not a valid Postgres POSIX ARE (see
+    :class:`app.search.errors.RegexInvalidError`). Distinct from ``regex_incompatible``:
+    that flag means Python ``re`` rejected a Postgres-valid pattern (results still returned,
+    highlighting degraded); ``regex_invalid`` means Postgres rejected the pattern outright
+    (the query could not run at all).
 
     Both are grep's per-leg fact AND-ed with "the symbol leg did not answer this query", so
     neither ever fires beside results the caller can see. That suppression is what carries
@@ -421,6 +430,7 @@ def _search_envelope(
         "truncated": truncated,
         "truncation_reason": truncation_reason,
         "regex_incompatible": regex_incompatible,
+        "regex_invalid": regex_invalid,
         "query_too_broad": query_too_broad,
         "query_parse_error": query_parse_error,
         "no_content_atom": no_content_atom,
@@ -453,7 +463,11 @@ def search_code_payload(
     kind}]`` and ``line`` = the definition's first line (no highlight ``text``, so
     ``grep_search("sym:X")`` -- which returns nothing highlight-driven -- is answered here).
     ``QueryParseError`` -> ``query_parse_error`` + empty files; ``QueryTooBroadError`` (either
-    leg) -> ``query_too_broad`` + ``truncated``. ``repo_id`` is resolved to ``Repo.name``.
+    leg) -> ``query_too_broad`` + ``truncated``; ``RegexInvalidError`` (either leg) ->
+    ``regex_invalid`` + the Postgres message, with ``truncated`` staying False (nothing was
+    attempted-and-cut, the query never ran) -- a grep-leg trip returns empty ``files``, a
+    symbol-leg-only trip keeps grep's already-fetched ``files`` (D4 partial-result contract,
+    mirroring ``QueryTooBroadError``). ``repo_id`` is resolved to ``Repo.name``.
     ``byte_ranges`` are UTF-8 line-local half-open offsets (a documented divergence from
     zoekt's char ``start_col``/``end_col``).
 
@@ -503,6 +517,7 @@ def search_code_payload(
         "row_limit": limit,
         "max_content_bytes": cfg.max_content_bytes,
         "statement_timeout_ms": cfg.statement_timeout_ms,
+        "match_budget_ms": cfg.match_budget_ms,
     }
     if pagination_mode:
         grep_kwargs["cursor"] = decoded_cursor
@@ -525,6 +540,7 @@ def search_code_payload(
                 truncated=False,
                 truncation_reason=None,
                 regex_incompatible=False,
+                regex_invalid=None,
                 query_too_broad=False,
                 query_parse_error=str(error),
                 no_content_atom=False,
@@ -558,6 +574,7 @@ def search_code_payload(
                     truncated=False,
                     truncation_reason=None,
                     regex_incompatible=False,
+                    regex_invalid=None,
                     query_too_broad=False,
                     query_parse_error=None,
                     no_content_atom=not has_content,
@@ -587,7 +604,29 @@ def search_code_payload(
                 truncated=True,
                 truncation_reason=None,
                 regex_incompatible=False,
+                regex_invalid=None,
                 query_too_broad=True,
+                query_parse_error=None,
+                no_content_atom=False,
+                zero_width_only_atoms=False,
+                next_cursor=(None if pagination_mode else _UNSET),
+                **commit_kwargs,
+            )
+        except RegexInvalidError as error:
+            # Postgres rejected the pattern outright -- unlike query_too_broad, nothing was
+            # attempted-and-cut, so `truncated` stays False (D4). The symbol leg would hit the
+            # same compiled predicates and fail identically, so it does not run either.
+            return _search_envelope(
+                query,
+                files=[],
+                file_count=0,
+                match_count=0,
+                duration_ns=int((time.monotonic() - t0) * 1e9),
+                truncated=False,
+                truncation_reason=None,
+                regex_incompatible=False,
+                regex_invalid=str(error),
+                query_too_broad=False,
                 query_parse_error=None,
                 no_content_atom=False,
                 zero_width_only_atoms=False,
@@ -604,6 +643,7 @@ def search_code_payload(
         # the symbol leg so folded symbols never repeat across pages.
         run_symbol_leg = not (pagination_mode and decoded_cursor is not None)
         query_too_broad = False
+        regex_invalid: str | None = None
         sym_result: SymbolResult | None
         if run_symbol_leg:
             try:
@@ -616,6 +656,13 @@ def search_code_payload(
             except QueryTooBroadError:
                 sym_result = None
                 query_too_broad = True
+            except RegexInvalidError as error:
+                # Symbol-leg-only trip (theoretically possible, practically shadowed by the
+                # grep leg compiling the same sym: predicate first): keep grep's files rather
+                # than discarding them, mirroring the query_too_broad partial-result contract
+                # (D4).
+                sym_result = None
+                regex_invalid = str(error)
         else:
             sym_result = None
 
@@ -782,6 +829,7 @@ def search_code_payload(
         truncated=truncated,
         truncation_reason=truncation_reason,
         regex_incompatible=result.regex_incompatible,
+        regex_invalid=regex_invalid,
         query_too_broad=query_too_broad,
         query_parse_error=None,
         no_content_atom=no_content_atom,

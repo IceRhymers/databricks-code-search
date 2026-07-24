@@ -18,7 +18,7 @@ import pytest
 
 from app import main, service
 from app.config import Settings
-from app.search.errors import QueryTooBroadError
+from app.search.errors import QueryTooBroadError, RegexInvalidError
 from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
 from app.search.symbols import SymbolMatch, SymbolResult
 
@@ -154,6 +154,7 @@ def test_search_code_payload_matches_golden_shape(monkeypatch: pytest.MonkeyPatc
     assert payload["truncated"] is False
     assert payload["truncation_reason"] is None
     assert payload["regex_incompatible"] is False
+    assert payload["regex_invalid"] is None
     assert payload["query_too_broad"] is False
     assert payload["query_parse_error"] is None
     # An ordinary content query proves nothing about the query shape: both flags stay False.
@@ -209,6 +210,24 @@ def test_search_code_query_too_broad_maps_to_signal(monkeypatch: pytest.MonkeyPa
     assert payload["files"] == []
     assert payload["query_parse_error"] is None
     # grep never returned, so there is no shape fact to report.
+    assert payload["no_content_atom"] is False
+    assert payload["zero_width_only_atoms"] is False
+
+
+@pytest.mark.unit
+def test_search_code_regex_invalid_maps_to_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_k: object) -> GrepResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "grep_search", _raise)
+    payload = main._search_code_payload(_FakeEngine([]), _cfg(), "/[/", 50)
+
+    assert payload["regex_invalid"] == "invalid regular expression: brackets [] not balanced"
+    # Unlike query_too_broad, nothing was attempted-and-cut -- the query never ran (D4).
+    assert payload["truncated"] is False
+    assert payload["query_too_broad"] is False
+    assert payload["files"] == []
+    assert payload["query_parse_error"] is None
     assert payload["no_content_atom"] is False
     assert payload["zero_width_only_atoms"] is False
 
@@ -341,6 +360,26 @@ def test_sym_leg_timeout_flags_query_too_broad_keeps_grep(monkeypatch: pytest.Mo
 
     assert payload["query_too_broad"] is True
     assert payload["truncated"] is True
+    assert payload["file_count"] == 1  # grep's content match is still returned
+    assert payload["match_count"] == 2
+
+
+@pytest.mark.unit
+def test_sym_leg_regex_invalid_keeps_grep_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Symbol-leg-only trip (D4): theoretically possible, practically shadowed by the grep leg
+    # compiling the same sym: predicate first. Keep grep's files, set regex_invalid.
+    monkeypatch.setattr(service, "grep_search", lambda *a, **k: _grep_result())
+
+    def _raise(*_a: object, **_k: object) -> SymbolResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "symbol_search", _raise)
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = main._search_code_payload(engine, _cfg(), "sym:[ foo", 50)
+
+    assert payload["regex_invalid"] == "invalid regular expression: brackets [] not balanced"
+    assert payload["query_too_broad"] is False
     assert payload["file_count"] == 1  # grep's content match is still returned
     assert payload["match_count"] == 2
 
@@ -595,6 +634,7 @@ def test_envelope_keys_are_pinned_shape_plus_exactly_two(monkeypatch: pytest.Mon
         "truncated",
         "truncation_reason",
         "regex_incompatible",
+        "regex_invalid",
         "query_too_broad",
         "query_parse_error",
     }
@@ -627,6 +667,7 @@ def test_envelope_carries_commit_keys_only_for_commit_query(
         "truncated",
         "truncation_reason",
         "regex_incompatible",
+        "regex_invalid",
         "query_too_broad",
         "query_parse_error",
     }
@@ -1235,6 +1276,40 @@ def test_signals_log_includes_both_flags() -> None:
     signals = main._signals({"no_content_atom": True, "zero_width_only_atoms": False})
     assert signals["no_content_atom"] is True
     assert signals["zero_width_only_atoms"] is False
+
+
+@pytest.mark.unit
+def test_match_budget_ms_defaults_to_2000_and_is_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Default matches DEFAULT_MATCH_BUDGET_MS in app/search/grep.py; the CODE_SEARCH_ prefix
+    # gives an automatic env override, exactly like statement_timeout_ms / max_content_bytes.
+    monkeypatch.delenv("CODE_SEARCH_MATCH_BUDGET_MS", raising=False)
+    assert Settings(lakebase_endpoint=None).match_budget_ms == 2000
+
+    monkeypatch.setenv("CODE_SEARCH_MATCH_BUDGET_MS", "500")
+    assert Settings(lakebase_endpoint=None).match_budget_ms == 500
+
+
+@pytest.mark.observability
+def test_signals_log_includes_truncation_reason() -> None:
+    # Which cap/budget tripped -- byte_cap/row_cap/match_budget -- must be recoverable from the
+    # log line, not just the bare `truncated` bool.
+    signals = main._signals({"truncated": True, "truncation_reason": "match_budget"})
+    assert signals["truncated"] is True
+    assert signals["truncation_reason"] == "match_budget"
+    # None-safe on payloads that never carry it (e.g. list_repos).
+    assert main._signals({})["truncation_reason"] is None
+
+
+@pytest.mark.observability
+def test_signals_log_includes_regex_invalid() -> None:
+    # Without this, a Postgres-rejected regex is log-indistinguishable from a genuine
+    # zero-result query.
+    signals = main._signals(
+        {"regex_invalid": "invalid regular expression: brackets [] not balanced"}
+    )
+    assert signals["regex_invalid"] == "invalid regular expression: brackets [] not balanced"
 
 
 @pytest.mark.observability

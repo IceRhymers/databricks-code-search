@@ -18,7 +18,7 @@ The pure halves of the query pipeline. `parser.py` turns a zoekt-style query str
 
 ### Working In This Directory
 - **Parser purity is a hard invariant.** `parser.py` (and this package `__init__`) must import nothing beyond stdlib; `test_parser_import_is_pure` runs `import app.query.parser` in a subprocess and fails on any sqlalchemy/SDK/tree-sitter leakage.
-- **Regex bodies are stored RAW, never `re.compile`d or escaped.** Postgres POSIX ARE ≠ Python `re`; validity is the DB's problem at execution time (`/[/` parses fine). The compiler binds patterns as parameters — never interpolate.
+- **Regex bodies are stored RAW, never `re.compile`d or escaped.** Postgres POSIX ARE ≠ Python `re`; validity is the DB's problem at execution time (`/[/` parses fine). The compiler binds patterns as parameters — never interpolate. `app/search/errors.py`'s `reraise_or_recoverable` maps a Postgres-invalid pattern to a typed `RegexInvalidError` -> the `regex_invalid` payload field (issue #75), never an uncaught fault.
 - **Case is query-global** (last `case:` wins) but stamped only on `Substring`/`Regex` leaves; the compiler derives it from any such leaf, and callers holding the raw query pass `resolve_case(query)` so a filter-only `case:yes file:x` still resolves exactly. `repo:` is ALWAYS case-insensitive (`~*`).
 - **The `coalesce(default_branch, 'HEAD')` expression must stay byte-identical** across its four sites: this compiler, the 0003 backfill, the semantic default leg, and `get_file_payload`.
 - `lang:` normalizes with `.strip().lower()` and unknown values match nothing (empty result, no error, no `indexer` import). Substring literals escape `\`, `%`, `_` (backslash first) with `escape="\\"`.

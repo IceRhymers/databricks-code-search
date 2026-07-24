@@ -220,12 +220,14 @@ Unsupported syntax. Most of these raise; the first is silent and therefore more 
 
 Two different engines run in sequence, and neither is zoekt's RE2:
 
-1. Postgres POSIX ARE (`~` / `~*`) selects which files match. Invalid patterns surface as
-   a query-time database error, not a parse error.
-2. Python `re` rescans those files to produce the highlighted line matches.
+1. Postgres POSIX ARE (`~` / `~*`) selects which files match. An invalid pattern (any
+   polarity) surfaces as the recoverable `regex_invalid` payload field carrying the
+   Postgres message, not a parse error and not a failed tool call.
+2. Python `regex` (a `re`-compatible superset, still not RE2) rescans those files to produce
+   the highlighted line matches.
 
 The practical consequences: `^` and `$` are line anchors and `.` never crosses lines;
-a Postgres-valid pattern that Python `re` rejects contributes no highlights *for that atom*
+a Postgres-valid pattern that Python `regex` rejects contributes no highlights *for that atom*
 and sets `regex_incompatible`, so a single-atom query of that shape returns nothing while
 other atoms in the same query still match; and case folding can disagree on non-ASCII pairs
 (`ß`/`SS`, Turkish dotless `ı`). ASCII is unaffected.
@@ -236,9 +238,13 @@ pattern like `/^/`, returns nothing even though the SQL predicate matched. `sym:
 exception: `search_code` runs a separate symbol leg, so `sym:Handler` returns definitions
 (carrying `symbols` and a `line`, but empty `text`) rather than falling into this hole.
 
-One more V1 limitation worth knowing before pointing agents at it: a
-catastrophic-backtracking regex on a single under-cap file runs unbounded in Python and can
-stall the server. `statement_timeout` bounds the database, not the rescan.
+Python-side matching is bounded by a per-request **match budget** (default 2000ms,
+configurable via `CODE_SEARCH_MATCH_BUDGET_MS`) so a catastrophic-backtracking regex on a
+single under-cap file cannot pin a worker: when the budget trips, scanning stops and the
+result comes back with `truncated=True` and `truncation_reason="match_budget"`. This
+complements `statement_timeout` (which bounds the database, not the rescan). The `regex`
+module releases the GIL while matching, so a budgeted pathological scan does not block the
+event loop.
 
 ## MCP tools
 
@@ -265,9 +271,12 @@ never the literal string `"HEAD"` unless that is genuinely the resolved branch (
 repo with no `default_branch` recorded).
 
 Recoverable conditions come back as payload fields —
-`query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`,
+`query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`, `regex_invalid`,
 `no_content_atom`, `zero_width_only_atoms`, `commit_not_indexed` — rather than errors, so
-an agent can react without a failed tool call. Pagination rides the same envelope as
+an agent can react without a failed tool call. `regex_invalid` is distinct from
+`regex_incompatible`: the latter means Python `regex` (not Postgres) rejected an otherwise-valid
+pattern and only degrades highlighting; `regex_invalid` means Postgres rejected the pattern
+outright and the query did not run. Pagination rides the same envelope as
 `next_cursor`, and the semantic tool adds its own status fields (`semantic_enabled`,
 `semantic_schema_missing`).
 
@@ -603,6 +612,7 @@ For the webui frontend specifically (requires Node):
 ```bash
 make webui-build           # npm ci + vite build -> webui/frontend/dist/ (commit the result)
 make webui-test            # vitest; advisory, not a repo gate
+make webui-verify-dist     # rebuild + fail if committed dist/ is stale (CI freshness gate; issue #80)
 ```
 
 This project is **Lakebase-only**: there is no local/CI Postgres image. The integration

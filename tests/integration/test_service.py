@@ -164,6 +164,21 @@ def test_bare_call_has_no_next_cursor_key(seeded: Seeded) -> None:
 
 
 @pytest.mark.integration
+def test_invalid_regex_returns_recoverable_regex_invalid_envelope(seeded: Seeded) -> None:
+    # The exact scenario issue #75 reports as a fault: a Postgres-invalid regex through the
+    # full search_code_payload stack, end-to-end against real Postgres, must come back as a
+    # recoverable envelope field -- never an uncaught DataError.
+    payload = service.search_code_payload(seeded.engine, seeded.cfg, "/[/", 200)
+
+    assert payload["regex_invalid"] is not None
+    assert "invalid regular expression" in payload["regex_invalid"]
+    assert payload["files"] == []
+    assert payload["file_count"] == 0
+    assert payload["truncated"] is False
+    assert payload["query_too_broad"] is False
+
+
+@pytest.mark.integration
 def test_page_one_folds_symbol_and_content_matches(seeded: Seeded) -> None:
     payload = service.search_code_payload(
         seeded.engine, seeded.cfg, "sym:Handler OR foo", 10, cursor=None

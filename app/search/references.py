@@ -33,13 +33,13 @@ from dataclasses import dataclass
 
 from sqlalchemy import Connection, Row, Select, Text, any_, func, literal, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.db.models import File, ReferenceEdge, Repo, Symbol
 from app.query.compiler import DEFAULT_ROW_LIMIT
-from app.search.errors import reraise_or_query_too_broad
+from app.search.errors import reraise_or_recoverable
 
 # Per-request DB-time bound; a cancellation surfaces as QueryTooBroadError (mirrors symbols.py).
 DEFAULT_STATEMENT_TIMEOUT_MS = 5000
@@ -382,8 +382,8 @@ def resolve_references(
                 repo_id = conn.execute(
                     select(Repo.id).where(Repo.name == repo)
                 ).scalar_one_or_none()
-            except OperationalError as error:
-                reraise_or_query_too_broad(error)
+            except DBAPIError as error:
+                reraise_or_recoverable(error)
             if repo_id is None:
                 return ReferenceResult(
                     (), truncated=False, truncation_reason=None, repo_known=False
@@ -398,8 +398,8 @@ def resolve_references(
         )
         try:
             site_rows = conn.execute(sites_stmt).all()
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
 
         truncated = len(site_rows) >= row_limit
 
@@ -411,8 +411,8 @@ def resolve_references(
             )
             try:
                 candidate_rows = conn.execute(candidates_stmt).all()
-            except OperationalError as error:
-                reraise_or_query_too_broad(error)
+            except DBAPIError as error:
+                reraise_or_recoverable(error)
             for row in candidate_rows:
                 candidates_by_name.setdefault(row.name, []).append(row)
 

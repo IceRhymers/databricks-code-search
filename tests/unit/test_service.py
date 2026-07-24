@@ -16,7 +16,7 @@ import pytest
 from app import service
 from app.config import Settings
 from app.query.parser import parse
-from app.search.errors import QueryTooBroadError
+from app.search.errors import QueryTooBroadError, RegexInvalidError
 from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
 from app.search.references import CandidateSymbol, EdgeSite, ReferenceResult
 from app.search.symbols import SymbolMatch, SymbolResult
@@ -215,6 +215,24 @@ def test_page_one_cursor_none_includes_next_cursor_key(monkeypatch: pytest.Monke
 
 
 @pytest.mark.unit
+def test_match_budget_truncation_reason_passes_through_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A grep match-budget trip surfaces as truncated=True + truncation_reason="match_budget"
+    # in the envelope unchanged -- the service layer never rewrites grep's truncation reason.
+    monkeypatch.setattr(
+        service,
+        "grep_search",
+        lambda *a, **k: _grep(truncated=True, truncation_reason="match_budget"),
+    )
+    monkeypatch.setattr(service, "symbol_search", lambda *a, **k: _no_sym())
+
+    payload = service.search_code_payload(_FakeEngine([]), _cfg(), "foo", 50)
+    assert payload["truncated"] is True
+    assert payload["truncation_reason"] == "match_budget"
+
+
+@pytest.mark.unit
 def test_pagination_mode_encodes_grep_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     file_cursor = FileCursor(repo_id=7, path="src/handler.go", content_sha="deadbeef")
     monkeypatch.setattr(
@@ -380,6 +398,86 @@ def test_query_too_broad_on_grep_omits_next_cursor_when_bare(
 
     monkeypatch.setattr(service, "grep_search", _raise)
     payload = service.search_code_payload(_FakeEngine([]), _cfg(), "foo", 50)
+    assert "next_cursor" not in payload
+
+
+# ------------------------------------------------- regex_invalid (issue #75)
+
+
+@pytest.mark.unit
+def test_regex_invalid_on_grep_leg_returns_empty_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_k: object) -> GrepResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "grep_search", _raise)
+    payload = service.search_code_payload(_FakeEngine([]), _cfg(), "/[/", 50)
+
+    assert payload["regex_invalid"] == "invalid regular expression: brackets [] not balanced"
+    assert payload["files"] == []
+    # Unlike QueryTooBroadError, nothing was attempted-and-cut -- the query never ran (D4).
+    assert payload["truncated"] is False
+    assert payload["truncation_reason"] is None
+    assert payload["query_too_broad"] is False
+
+
+@pytest.mark.unit
+def test_regex_invalid_on_symbol_leg_keeps_grep_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    grep_result = GrepResult(
+        files=(
+            FileMatches(
+                repo_id=7,
+                path="src/handler.go",
+                lang="go",
+                content_sha="deadbeef",
+                branches=("main",),
+                line_matches=(LineMatch(1, "foo", ((0, 3),)),),
+            ),
+        ),
+        truncated=False,
+        truncation_reason=None,
+        regex_incompatible=False,
+        no_content_atom=False,
+        zero_width_only_atoms=False,
+        next_cursor=None,
+    )
+    monkeypatch.setattr(service, "grep_search", lambda *a, **k: grep_result)
+
+    def _raise(*_a: object, **_k: object) -> SymbolResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "symbol_search", _raise)
+    engine = _FakeEngine([_FakeResult([_Row(id=7, name="acme/widgets")])])
+
+    payload = service.search_code_payload(engine, _cfg(), "sym:[ foo", 50)
+
+    assert payload["regex_invalid"] == "invalid regular expression: brackets [] not balanced"
+    assert payload["file_count"] == 1  # grep's content match is kept, not discarded (D4)
+
+
+@pytest.mark.unit
+def test_regex_invalid_on_grep_sets_next_cursor_null_in_pagination_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(*_a: object, **_k: object) -> GrepResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "grep_search", _raise)
+    payload = service.search_code_payload(_FakeEngine([]), _cfg(), "/[/", 50, cursor=None)
+
+    assert payload["regex_invalid"] is not None
+    assert payload["next_cursor"] is None
+
+
+@pytest.mark.unit
+def test_regex_invalid_on_grep_omits_next_cursor_when_bare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(*_a: object, **_k: object) -> GrepResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "grep_search", _raise)
+    payload = service.search_code_payload(_FakeEngine([]), _cfg(), "/[/", 50)
+
     assert "next_cursor" not in payload
 
 

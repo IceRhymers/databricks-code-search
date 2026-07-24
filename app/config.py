@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # Aggregate content bytes grep pulls/scans per request (memory bound).
     max_content_bytes: int = 8 * 1024 * 1024
 
+    # Per-request wall-clock bound on Python-side pattern matching in grep (regex module's
+    # timeout=). Complements statement_timeout_ms (DB time) and max_content_bytes (bytes) as
+    # the third leg of the per-request resource triangle.
+    match_budget_ms: int = 2000
+
     # Default and hard-cap for search_code(limit): <=0 -> row_limit; > max -> max_row_limit.
     row_limit: int = 200
     max_row_limit: int = 1000

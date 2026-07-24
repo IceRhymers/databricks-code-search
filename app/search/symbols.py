@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from typing import assert_never
 
 from sqlalchemy import Connection, Select, or_, select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 
 from app.db.models import File, Symbol
 from app.query.compiler import DEFAULT_ROW_LIMIT, compile_query
@@ -72,7 +72,7 @@ from app.query.parser import (
     parse,
     resolve_case,
 )
-from app.search.errors import reraise_or_query_too_broad
+from app.search.errors import reraise_or_recoverable
 
 # Per-request DB-time bound; a cancellation surfaces as QueryTooBroadError.
 DEFAULT_STATEMENT_TIMEOUT_MS = 5000
@@ -195,6 +195,7 @@ def symbol_search(
     Two-step: ``compile_query`` selects the eligible file ids, then a pure projection returns the
     symbols in those files whose name matches the query's ``sym:`` atoms. Runs in one transaction
     with a per-request ``statement_timeout`` (a cancellation raises :class:`QueryTooBroadError`).
+    A Postgres-invalid ``sym:`` pattern raises :class:`~app.search.errors.RegexInvalidError`.
     Raises ``QueryParseError`` on a malformed query (propagated from :func:`parse`). A query with
     no ``sym:`` atom short-circuits to an empty result (``no_symbol_atom=True``) without a DB hit.
     """
@@ -218,8 +219,8 @@ def symbol_search(
         candidate = compile_query(node, limit=row_limit, case_sensitive=case_sensitive)
         try:
             file_ids = [row.id for row in conn.execute(candidate).all()]
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
 
         # `>=` conservatively over-warns on an exact fit, matching grep's row-cap semantics.
         file_capped = len(file_ids) >= row_limit
@@ -232,8 +233,8 @@ def symbol_search(
         )
         try:
             rows = conn.execute(stmt).all()
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
 
     symbol_capped = len(rows) >= row_limit
     truncated = file_capped or symbol_capped
