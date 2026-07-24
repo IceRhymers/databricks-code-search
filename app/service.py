@@ -517,6 +517,7 @@ def search_code_payload(
         "row_limit": limit,
         "max_content_bytes": cfg.max_content_bytes,
         "statement_timeout_ms": cfg.statement_timeout_ms,
+        "match_budget_ms": cfg.match_budget_ms,
     }
     if pagination_mode:
         grep_kwargs["cursor"] = decoded_cursor

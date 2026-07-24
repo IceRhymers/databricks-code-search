@@ -14,6 +14,7 @@ starting at 0, so each test gets a clean connection/corpus.
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Iterator
 from typing import NamedTuple
@@ -689,3 +690,143 @@ def test_negated_content_predicate_does_not_resurrect_null_content_row(seeded: S
     # The two real go files both contain "foo" -> excluded by -foo, not by the null check --
     # so candidate_paths is empty for an entirely different (and also correct) reason.
     assert candidate_paths == set()
+
+
+# ------------------------------------------------------------------- 13. match budget (#38)
+#
+# The pathological regex below was reverified empirically against the installed `regex`
+# version: `(?:(?:a{1,10}){1,10}){1,10}b` over a long run of `a`s with no trailing `b`
+# catastrophically backtracks in Python. Postgres's NFA engine does NOT backtrack, so the
+# file is selected cheaply as a candidate via the short `aaab` line (which the SQL predicate
+# matches); the CPU blow-up only happens in the Python line-by-line rescan, which the match
+# budget bounds. A benign OR arm supplies a second file the SQL predicate selects independently
+# so a fully-scanned file survives the trip.
+
+_CATASTROPHIC = r"(?:(?:a{1,10}){1,10}){1,10}b"
+
+
+@pytest.mark.integration
+def test_match_budget_trip_is_recoverable_and_partial() -> None:
+    # File A (benign) sorts before file B (pathological) in (repo_id, path) order, so A is
+    # FULLY scanned before the budget trips inside B. A's matches survive; B is discarded.
+    schema = _unique(SCHEMA_PREFIX)
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        conn.commit()
+        Base.metadata.create_all(bind=conn)
+        conn.commit()
+        repo_id = _insert_repo(conn, "solo/repo")
+        _insert_file(conn, repo_id, "a_benign.txt", lang=None, content="alpha match here\n")
+        # Line 1: a long run of `a`s with no `b` (the catastrophic input). Line 2 `aaab` is what
+        # the SQL predicate matches to make this file a candidate at all.
+        _insert_file(conn, repo_id, "z_patho.txt", lang=None, content="a" * 55 + "\naaab\n")
+        conn.commit()
+
+        query = f"alpha OR /{_CATASTROPHIC}/"
+        started = time.monotonic()
+        result = grep_search(conn, query, match_budget_ms=100)
+        elapsed = time.monotonic() - started
+
+        # One-sided timing only: the budgeted call returns instead of hanging on the backtrack.
+        assert elapsed < 5
+        assert result.truncated is True
+        assert result.truncation_reason == "match_budget"
+        # The fully-scanned benign file A survives; the pathological B is discarded.
+        assert _paths(result) == ["a_benign.txt"]
+    finally:
+        conn.rollback()
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_match_budget_pagination_steps_past_pathological_file() -> None:
+    # Pagination mode: page 1 dies INSIDE the pathological file B (which sorts before benign C).
+    # Because the mid-file trip treats B as consumed, next_cursor points PAST B; a page 2 with a
+    # fresh budget then returns C -- pagination never stalls forever on the pathological file.
+    schema = _unique(SCHEMA_PREFIX)
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        conn.commit()
+        Base.metadata.create_all(bind=conn)
+        conn.commit()
+        repo_id = _insert_repo(conn, "solo/repo")
+        patho_content = "a" * 55 + "\naaab\n"
+        _insert_file(conn, repo_id, "b_patho.txt", lang=None, content=patho_content)
+        _insert_file(conn, repo_id, "c_benign.txt", lang=None, content="hit here\n")
+        conn.commit()
+
+        query = f"hit OR /{_CATASTROPHIC}/"
+        page1 = grep_search(conn, query, match_budget_ms=100, cursor=None)
+        assert page1.truncated is True
+        assert page1.truncation_reason == "match_budget"
+        # Mid-file trip consumed B: the cursor resumes PAST it, not at it.
+        assert page1.next_cursor == FileCursor(repo_id, "b_patho.txt", content_sha(patho_content))
+
+        # Page 2 with a FRESH normal budget resumes after B and returns the benign C.
+        started = time.monotonic()
+        page2 = grep_search(conn, query, match_budget_ms=2000, cursor=page1.next_cursor)
+        assert time.monotonic() - started < 5
+        assert _paths(page2) == ["c_benign.txt"]
+        assert page2.truncated is False
+        assert page2.truncation_reason is None
+    finally:
+        conn.rollback()
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_match_budget_pre_file_trip_on_first_row_of_resumed_page_falls_back_to_resume_cursor() -> (
+    None
+):
+    # Regression test: a pre-file trip on the very FIRST content row of a resumed page must not
+    # strand the cursor. `last_candidate` is None (nothing consumed yet this call), so without
+    # the fallback, `next_cursor` would come out None while `truncated=True` -- indistinguishable
+    # from "exhausted" to a caller, silently dropping the rest of the corpus. A negative
+    # `match_budget_ms` deterministically puts the deadline in the past BEFORE the content query
+    # even runs, so this trips on row 0 with no dependency on DB timing (fully one-sided/non-flaky,
+    # unlike relying on a slow first-row fetch).
+    schema = _unique(SCHEMA_PREFIX)
+    engine = create_db_engine()
+    conn = engine.connect()
+    try:
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+        conn.execute(text(f"SET search_path TO {schema}, public"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        conn.commit()
+        Base.metadata.create_all(bind=conn)
+        conn.commit()
+        repo_id = _insert_repo(conn, "solo/repo")
+        _insert_file(conn, repo_id, "m_benign.txt", lang=None, content="alpha match here\n")
+        conn.commit()
+
+        # Sorts before the seeded file's (repo_id, path, content_sha) key, so the file remains
+        # a candidate on resume -- mimics a caller resuming after some earlier, unrelated file.
+        resume_cursor = FileCursor(repo_id, "", "")
+        result = grep_search(conn, "alpha", match_budget_ms=-1000, cursor=resume_cursor)
+
+        assert result.truncated is True
+        assert result.truncation_reason == "match_budget"
+        assert result.files == ()
+        # Falls back to the unchanged incoming cursor, not None -- the page is retryable with a
+        # fresh budget instead of looking exhausted.
+        assert result.next_cursor == resume_cursor
+    finally:
+        conn.rollback()
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.commit()
+        conn.close()
+        engine.dispose()

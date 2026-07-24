@@ -215,6 +215,24 @@ def test_page_one_cursor_none_includes_next_cursor_key(monkeypatch: pytest.Monke
 
 
 @pytest.mark.unit
+def test_match_budget_truncation_reason_passes_through_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A grep match-budget trip surfaces as truncated=True + truncation_reason="match_budget"
+    # in the envelope unchanged -- the service layer never rewrites grep's truncation reason.
+    monkeypatch.setattr(
+        service,
+        "grep_search",
+        lambda *a, **k: _grep(truncated=True, truncation_reason="match_budget"),
+    )
+    monkeypatch.setattr(service, "symbol_search", lambda *a, **k: _no_sym())
+
+    payload = service.search_code_payload(_FakeEngine([]), _cfg(), "foo", 50)
+    assert payload["truncated"] is True
+    assert payload["truncation_reason"] == "match_budget"
+
+
+@pytest.mark.unit
 def test_pagination_mode_encodes_grep_next_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     file_cursor = FileCursor(repo_id=7, path="src/handler.go", content_sha="deadbeef")
     monkeypatch.setattr(
