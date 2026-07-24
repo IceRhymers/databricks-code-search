@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     row_limit: int = 200
     max_row_limit: int = 1000
 
+    # Byte ceiling on every serialized MCP tool response (~4 bytes/token heuristic:
+    # 100_000 bytes ≈ 25k tokens). A per-request `max_bytes` tool param clamps this DOWN,
+    # never up (app/main.py's `_effective_budget`). No tokenizer dependency -- the budget is
+    # enforced against the exact `json.dumps` wire string, not an estimate.
+    mcp_max_response_bytes: int = 100_000
+
     # Gates the semantic_search code path. Default True: the target Lakebase project's
     # managed shared_preload_libraries including lakebase_vector,lakebase_text is a stated
     # project assumption (see docs/runbooks/semantic-enablement.md). Opt out with

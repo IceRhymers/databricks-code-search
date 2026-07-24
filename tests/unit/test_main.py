@@ -1291,6 +1291,17 @@ def test_match_budget_ms_defaults_to_2000_and_is_env_overridable(
     assert Settings(lakebase_endpoint=None).match_budget_ms == 500
 
 
+@pytest.mark.unit
+def test_mcp_max_response_bytes_defaults_to_100000_and_is_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODE_SEARCH_MCP_MAX_RESPONSE_BYTES", raising=False)
+    assert Settings(lakebase_endpoint=None).mcp_max_response_bytes == 100_000
+
+    monkeypatch.setenv("CODE_SEARCH_MCP_MAX_RESPONSE_BYTES", "5000")
+    assert Settings(lakebase_endpoint=None).mcp_max_response_bytes == 5000
+
+
 @pytest.mark.observability
 def test_signals_log_includes_truncation_reason() -> None:
     # Which cap/budget tripped -- byte_cap/row_cap/match_budget -- must be recoverable from the
