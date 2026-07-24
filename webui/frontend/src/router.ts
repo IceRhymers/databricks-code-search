@@ -16,7 +16,18 @@ export type Route =
       branch: string | null;
     }
   | { page: "repos" }
-  | { page: "semantic"; query: string };
+  | { page: "semantic"; query: string }
+  | { page: "graph"; mode: "references"; symbol: string; branch: string | null }
+  | {
+      page: "graph";
+      mode: "imports";
+      repo: string;
+      target: string;
+      // Verbatim string, NOT a union: an unknown value must flow through to the builder's
+      // structured unsupported_direction 200 rather than being coerced/validated here.
+      direction: string;
+      branch: string | null;
+    };
 
 export function parseLocation(): Route {
   const { pathname, search, hash } = window.location;
@@ -39,6 +50,24 @@ export function parseLocation(): Route {
   }
   if (pathname === "/semantic") {
     return { page: "semantic", query: params.get("q") ?? "" };
+  }
+  if (pathname === "/references") {
+    return {
+      page: "graph",
+      mode: "references",
+      symbol: params.get("symbol") ?? "",
+      branch: params.get("branch"),
+    };
+  }
+  if (pathname === "/imports") {
+    return {
+      page: "graph",
+      mode: "imports",
+      repo: params.get("repo") ?? "",
+      target: params.get("target") ?? "",
+      direction: params.get("direction") ?? "imports",
+      branch: params.get("branch"),
+    };
   }
   return { page: "search", query: params.get("q") ?? "" };
 }

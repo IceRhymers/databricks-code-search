@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getSemanticStatus } from "./api/client";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { FilePage } from "./pages/FilePage";
+import { GraphPage } from "./pages/GraphPage";
 import { ReposPage } from "./pages/ReposPage";
 import { SearchPage } from "./pages/SearchPage";
 import { SemanticPage } from "./pages/SemanticPage";
@@ -27,6 +28,7 @@ export function App(): JSX.Element {
         <nav>
           <a href="/">Search</a>
           {semanticEnabled && <a href="/semantic">Semantic</a>}
+          <a href="/references">Graph</a>
           <a href="/repos">Repos</a>
         </nav>
         <ThemeToggle />
@@ -45,6 +47,7 @@ export function App(): JSX.Element {
         )}
         {route.page === "repos" && <ReposPage />}
         {route.page === "semantic" && <SemanticPage initialQuery={route.query} />}
+        {route.page === "graph" && <GraphPage key={route.mode} route={route} />}
       </main>
     </div>
   );

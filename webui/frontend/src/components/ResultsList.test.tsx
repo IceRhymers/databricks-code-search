@@ -52,4 +52,25 @@ describe("ResultsList", () => {
     const markup = renderToStaticMarkup(<ResultsList files={[file()]} />);
     expect(markup).not.toContain("commit-badge");
   });
+
+  it("renders a /references?symbol= link next to a symbol match", () => {
+    const markup = renderToStaticMarkup(
+      <ResultsList
+        files={[
+          file({
+            matches: [
+              {
+                line: 2,
+                text: "func Handler() {}",
+                byte_ranges: [],
+                symbols: [{ name: "Handler", kind: "function" }],
+              },
+            ],
+          }),
+        ]}
+      />
+    );
+    expect(markup).toContain('href="/references?symbol=Handler"');
+    expect(markup).toContain(">refs<");
+  });
 });

@@ -109,3 +109,102 @@ export interface ReposResponse {
 export function listRepos(): Promise<ReposResponse> {
   return getJson<ReposResponse>("/api/repos");
 }
+
+// -------------------------------------------------------------- reference/import graph tools
+//
+// Wire types for /api/references + /api/imports -- thin passthroughs over the SAME
+// app/service.py builders the MCP find_references/list_imports tools wrap (see
+// webui/main.py::api_references / api_imports and docs/runbooks/webui.md). CANDIDATE-SET
+// semantics throughout: a site is a place that names something; its `candidates` are the
+// definitions that name could plausibly mean, ranked, never collapsed to one answer.
+
+export interface GraphCandidate {
+  repo: string;
+  file: string;
+  line: number;
+  name: string;
+  kind: string;
+  same_repo: boolean;
+  same_file: boolean;
+  kind_match: boolean;
+}
+
+export interface ReferenceSite {
+  repo: string;
+  file: string;
+  line: number;
+  edge_kind: string;
+  target_name: string;
+  enclosing_symbol: { name: string; kind: string } | null;
+  resolution: "unique" | "ambiguous" | "unresolved";
+  // True pre-cap count -- correct even when `candidates` itself is capped.
+  candidate_count: number;
+  candidates_truncated: boolean;
+  candidates: GraphCandidate[];
+}
+
+interface ResolutionSummary {
+  unique: number;
+  ambiguous: number;
+  unresolved: number;
+}
+
+// Fields shared by both envelopes (app.service._reference_result_to_payload).
+interface ReferenceEnvelopeBase {
+  sites: ReferenceSite[];
+  site_count: number;
+  resolution_summary: ResolutionSummary;
+  truncated: boolean;
+  truncation_reason: string | null;
+}
+
+export interface ReferencesEnvelope extends ReferenceEnvelopeBase {
+  query: string;
+  kind: "references";
+  symbol: string;
+  branch: string | null;
+  // Folded QueryTooBroadError -- never an exception; a structured signal like every other
+  // recoverable condition on this surface.
+  query_too_broad: boolean;
+}
+
+export interface ImportsEnvelope extends ReferenceEnvelopeBase {
+  query: string;
+  kind: "imports";
+  direction: string;
+  repo: string | null;
+  // False is a structured "no such repo" miss; always true when no repo scope was requested.
+  repo_known: boolean;
+  target: string | null;
+  branch: string | null;
+  query_too_broad: boolean;
+  // PRE-DB validation states -- mutually exclusive with each other and with a results payload,
+  // each with a remedy `reason` (see app.service.list_imports_payload).
+  unsupported_direction?: string;
+  missing_repo?: boolean;
+  missing_target?: boolean;
+  reason?: string;
+}
+
+export function findReferences(
+  symbol: string,
+  opts: { branch?: string | null } = {}
+): Promise<ReferencesEnvelope> {
+  const params = new URLSearchParams({ symbol });
+  if (opts.branch) params.set("branch", opts.branch);
+  return getJson<ReferencesEnvelope>(`/api/references?${params.toString()}`);
+}
+
+export function listImports(opts: {
+  repo?: string | null;
+  target?: string | null;
+  direction?: string;
+  branch?: string | null;
+}): Promise<ImportsEnvelope> {
+  const params = new URLSearchParams();
+  if (opts.repo) params.set("repo", opts.repo);
+  if (opts.target) params.set("target", opts.target);
+  if (opts.direction) params.set("direction", opts.direction);
+  if (opts.branch) params.set("branch", opts.branch);
+  return getJson<ImportsEnvelope>(`/api/imports?${params.toString()}`);
+}

@@ -36,7 +36,8 @@ export function ReposPage(): JSX.Element {
         {state.repos.map((repo) => (
           <tr key={repo.name}>
             <td>
-              <a href={`/?q=${encodeURIComponent(`repo:${repo.name} `)}`}>{repo.name}</a>
+              <a href={`/?q=${encodeURIComponent(`repo:${repo.name} `)}`}>{repo.name}</a>{" "}
+              <a href={`/imports?repo=${encodeURIComponent(repo.name)}&direction=imports`}>imports</a>
             </td>
             <td>{repo.default_branch ?? "—"}</td>
             <td>{repo.last_indexed_commit ? repo.last_indexed_commit.slice(0, 12) : "—"}</td>

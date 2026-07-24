@@ -55,4 +55,53 @@ describe("parseLocation", () => {
     const route = await parseLocationFor("/file?repo=acme%2Fwidgets&path=a.py#L7");
     expect(route).toMatchObject({ page: "file", line: 7, endLine: null });
   });
+
+  it("parses /references?symbol=X&branch=Y", async () => {
+    const route = await parseLocationFor("/references?symbol=process&branch=feature%2Fx");
+    expect(route).toEqual({
+      page: "graph",
+      mode: "references",
+      symbol: "process",
+      branch: "feature/x",
+    });
+  });
+
+  it("parses /references with no branch as branch: null", async () => {
+    const route = await parseLocationFor("/references?symbol=process");
+    expect(route).toMatchObject({ page: "graph", mode: "references", branch: null });
+  });
+
+  it("parses /imports?repo=R&direction=imports", async () => {
+    const route = await parseLocationFor("/imports?repo=acme%2Fwidgets&direction=imports");
+    expect(route).toEqual({
+      page: "graph",
+      mode: "imports",
+      repo: "acme/widgets",
+      target: "",
+      direction: "imports",
+      branch: null,
+    });
+  });
+
+  it("parses /imports?target=T&direction=imported_by", async () => {
+    const route = await parseLocationFor("/imports?target=os.path&direction=imported_by");
+    expect(route).toEqual({
+      page: "graph",
+      mode: "imports",
+      repo: "",
+      target: "os.path",
+      direction: "imported_by",
+      branch: null,
+    });
+  });
+
+  it("parses /imports?direction=bogus verbatim, no validation/coercion", async () => {
+    const route = await parseLocationFor("/imports?direction=bogus");
+    expect(route).toMatchObject({ page: "graph", mode: "imports", direction: "bogus" });
+  });
+
+  it("defaults /imports direction to \"imports\" when omitted", async () => {
+    const route = await parseLocationFor("/imports?repo=acme%2Fwidgets");
+    expect(route).toMatchObject({ page: "graph", mode: "imports", direction: "imports" });
+  });
 });
