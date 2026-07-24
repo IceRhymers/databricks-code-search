@@ -32,6 +32,7 @@ _FIELD_TO_KIND: dict[str | None, TokenKind] = {
     "lang": TokenKind.LANG,
     "sym": TokenKind.SYMBOL,
     "branch": TokenKind.BRANCH,
+    "commit": TokenKind.COMMIT,
     "case": TokenKind.CASE,
     None: TokenKind.SUBSTRING,
 }
