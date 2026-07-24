@@ -250,15 +250,58 @@ event loop.
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `search_code` | `query`, `limit=200`, `branch=None`, `commit=None` | file-grouped line matches with byte ranges |
-| `semantic_search` | `query`, `limit=50`, `branch=None` | ranked chunks with `rrf_score` |
-| `list_repos` | — | indexed repos with per-branch last-indexed metadata |
-| `get_file` | `repo`, `path`, `branch=None` | full file content, or `found: false` |
-| `find_references` | `symbol`, `limit=200`, `branch=None` | ranked candidate reference (call) sites with enclosing symbols |
-| `list_imports` | `repo=None`, `target=None`, `direction=imports`, `branch=None`, `limit=200` | import edge sites; `repo` required for `imports`, `target` required for `imported_by` |
+| `search_code` | `query`, `limit=200`, `branch=None`, `commit=None`, `cursor=None`, `max_bytes=None` | file-grouped line matches with byte ranges |
+| `semantic_search` | `query`, `limit=50`, `branch=None`, `max_bytes=None` | ranked chunks with `rrf_score` |
+| `list_repos` | `max_bytes=None` | indexed repos with per-branch last-indexed metadata |
+| `get_file` | `repo`, `path`, `branch=None`, `start_line=1`, `max_bytes=None` | a page of file content, or `found: false` |
+| `find_references` | `symbol`, `limit=200`, `branch=None`, `max_bytes=None` | ranked candidate reference (call) sites with enclosing symbols |
+| `list_imports` | `repo=None`, `target=None`, `direction=imports`, `branch=None`, `limit=200`, `max_bytes=None` | import edge sites; `repo` required for `imports`, `target` required for `imported_by` |
 
 Every tool returns a JSON string. `limit` is clamped server-side: a non-positive value
 falls back to 200, and anything above 1000 is capped there.
+
+### Response size limits
+
+Every MCP tool response is capped at a byte-denominated budget — `CODE_SEARCH_MCP_MAX_RESPONSE_BYTES`,
+default `100000` bytes (~25k tokens at a ~4 bytes/token heuristic; no tokenizer dependency —
+the budget is enforced against the exact serialized JSON string sent over the wire). Every
+tool also accepts a per-request `max_bytes`, which only clamps the server ceiling **down**,
+never up. This is enforced entirely on the MCP surface (`app/main.py`); the web UI's REST API
+and the underlying payload builders are unaffected.
+
+An over-budget response is never a failed tool call: it is truncated to fit, tail-trimmed in
+each tool's dominant list (or, for `get_file`, cut to the largest whole-line prefix that fits),
+and flagged `truncated: true` / `truncation_reason: "token_budget"` (extending the existing
+`byte_cap`/`row_cap`/`match_budget` reasons). `search_code` and `get_file` carry resume
+handles so a byte-budget trim is still traversable:
+
+- **`search_code`** now accepts `cursor` and always runs in pagination mode — page 1 omits
+  `cursor` (or passes `null`), and every response carries `next_cursor` (`str | null`); pass
+  the previous response's `next_cursor` back as `cursor` to resume. When byte-budget
+  truncation drops tail files, `next_cursor` is synthesized to resume exactly after the last
+  file kept, so a full traversal recovers every **content** match losslessly. A `sym:` query's
+  definitions fold in on page 1 only, so a symbol match that lands in a byte-budget-truncated
+  tail is lost from that traversal (flagged `truncated`, not silently dropped) — a continuation
+  page never re-runs the symbol leg. A garbled/tampered `cursor` string never raises: it comes
+  back as `{"cursor_invalid": true, "reason": "..."}` with the normal empty envelope.
+- **`get_file`** now accepts `start_line` (1-based; values below 1 clamp to 1) and every
+  response carries `next_start_line` (the next page's `start_line`, or `null` when the file's
+  tail already fit). Content is split on `"\n"` — the same rule `search_code`'s match line
+  numbers use — so paging from `start_line=1` and rejoining each page's `content` with `"\n"`
+  reconstructs the file byte-exactly (CRLF and no-trailing-newline files included). A single
+  line whose JSON-encoded size alone exceeds the budget is still returned alone, flagged, with
+  that one response exceeding the budget — always making forward progress outranks strict
+  enforcement for that degenerate (e.g. minified one-line file) case.
+
+`list_repos`, `find_references`, `list_imports`, and `semantic_search` have no cursor
+plumbing, so their truncation (tail-trimmed `repos`/`sites`/`results`) is lossy: re-run with a
+smaller `limit` or a narrower query to see what was cut.
+
+**Behavior change:** because `search_code` now always runs in pagination mode, a plain grep
+row-cap fill reports `truncated: false` plus a non-null `next_cursor` (there is a next page,
+not an error) instead of the previous `truncated: true` / `truncation_reason: "row_cap"`.
+`truncated: true` / `truncation_reason: "token_budget"` is the new byte-budget signal, and a
+match-budget trip still reports `truncation_reason: "match_budget"` as before.
 
 `branch` behaves differently per tool because `search_code` takes zoekt grammar and
 `semantic_search` takes natural language: on `search_code` it is sugar for appending
@@ -272,13 +315,15 @@ repo with no `default_branch` recorded).
 
 Recoverable conditions come back as payload fields —
 `query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`, `regex_invalid`,
-`no_content_atom`, `zero_width_only_atoms`, `commit_not_indexed` — rather than errors, so
-an agent can react without a failed tool call. `regex_invalid` is distinct from
-`regex_incompatible`: the latter means Python `regex` (not Postgres) rejected an otherwise-valid
-pattern and only degrades highlighting; `regex_invalid` means Postgres rejected the pattern
-outright and the query did not run. Pagination rides the same envelope as
+`no_content_atom`, `zero_width_only_atoms`, `commit_not_indexed`, `cursor_invalid` — rather
+than errors, so an agent can react without a failed tool call. `regex_invalid` is distinct
+from `regex_incompatible`: the latter means Python `regex` (not Postgres) rejected an
+otherwise-valid pattern and only degrades highlighting; `regex_invalid` means Postgres
+rejected the pattern outright and the query did not run. Pagination rides the same envelope as
 `next_cursor`, and the semantic tool adds its own status fields (`semantic_enabled`,
-`semantic_schema_missing`).
+`semantic_schema_missing`). See [Response size limits](#response-size-limits) for the
+byte-budget truncation signal (`truncation_reason: "token_budget"`) and the resume handles
+(`next_cursor`/`next_start_line`) that ship with it.
 
 `semantic_search` is natural-language hybrid search (vector ANN + BM25 fused by reciprocal
 rank). It is **on by default** — the `chunks` schema rides the core migration chain and
