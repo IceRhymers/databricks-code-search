@@ -19,7 +19,7 @@ npm run build      # tsc -b && vite build -> dist/
 `dist/` is committed to the repo (see the root `.gitignore` negation) because DABs source sync
 respects `.gitignore`, and CI does not run a Node build step for v1 — `webui/main.py` serves
 this directory directly via `SPAStaticFiles`. **Rebuild and commit `dist/` whenever `src/`
-changes**; there is no build-time check that they're in sync.
+changes**; CI's `webui` job enforces dist freshness via `make webui-verify-dist`.
 
 ## Test
 

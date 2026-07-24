@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migration set-secrets deploy deploy-prod smoke index destroy diagrams webui-wheel webui-build webui-test
+.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migration set-secrets deploy deploy-prod smoke index destroy diagrams webui-wheel webui-build webui-test webui-verify-dist
 
 # Secret scope/key for `set-secrets`. These MUST match the bundle variables
 # `github_token_secret_scope` / `github_token_secret_key` in databricks.yml
@@ -108,6 +108,18 @@ webui-build: ## Build the webui frontend (npm ci + vite build) into webui/fronte
 
 webui-test: ## Run the webui frontend test suite (vitest; gated in CI's webui job, needs npm ci first)
 	cd webui/frontend && npm test
+
+webui-verify-dist: ## Rebuild the frontend and fail if the committed dist/ is stale (CI freshness gate; issue #80)
+	cd webui/frontend && npm ci && npm run build
+	# Must run from the repo root: the git pathspec below is repo-root-relative. The `cd` on the
+	# build line above does not leak here — each recipe line runs in its own shell.
+	@status=$$(git status --porcelain -- webui/frontend/dist); \
+	if [ -n "$$status" ]; then \
+		echo "ERROR: webui/frontend/dist/ is stale relative to src/ — run 'make webui-build' and commit the result."; \
+		echo "$$status"; \
+		git --no-pager diff --stat -- webui/frontend/dist; \
+		exit 1; \
+	fi
 
 destroy: ## Tear down the whole bundle for TARGET (typed-confirm; irreversible Lakebase data loss)
 	bash scripts/deploy.sh destroy $(TARGET)

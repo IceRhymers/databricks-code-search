@@ -48,6 +48,8 @@ jobs:
         working-directory: webui/frontend
       - name: Frontend tests
         run: make webui-test
+      - name: Dist freshness (issue #80)
+        run: make webui-verify-dist
 
   # Integration coverage lives in ci-lakebase.yml: this project is Lakebase-only, and
   # the integration suite runs against an ephemeral Lakebase branch (real lakebase_ann /
