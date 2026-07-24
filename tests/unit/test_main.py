@@ -992,8 +992,11 @@ async def test_search_code_tool_appends_branch_atom_to_query(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    def _fake_payload(engine: Any, cfg: Settings, query: str, limit: int) -> dict[str, Any]:
+    def _fake_payload(
+        engine: Any, cfg: Settings, query: str, limit: int, cursor: str | None = None
+    ) -> dict[str, Any]:
         captured["query"] = query
+        captured["cursor"] = cursor
         return {"query": query}
 
     monkeypatch.setattr(main, "_search_code_payload", _fake_payload)
@@ -1002,6 +1005,8 @@ async def test_search_code_tool_appends_branch_atom_to_query(
     await main.search_code("foo", ctx, branch="release/1.0")  # type: ignore[arg-type]
 
     assert captured["query"] == 'foo branch:"release/1.0"'
+    # search_code always runs in pagination mode: page 1 passes cursor=None explicitly.
+    assert captured["cursor"] is None
 
 
 @pytest.mark.unit
@@ -1011,7 +1016,9 @@ async def test_search_code_tool_leaves_query_untouched_without_branch(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    def _fake_payload(engine: Any, cfg: Settings, query: str, limit: int) -> dict[str, Any]:
+    def _fake_payload(
+        engine: Any, cfg: Settings, query: str, limit: int, cursor: str | None = None
+    ) -> dict[str, Any]:
         captured["query"] = query
         return {"query": query}
 
@@ -1267,6 +1274,21 @@ async def test_dispatch_logs_signals_and_saturation(caplog: pytest.LogCaptureFix
     assert "tool=search_code" in line
     assert "query_too_broad" in line
     assert "limiter_borrowed=" in line  # pool/limiter saturation signal is wired
+    # AC5 / Step 4: pre- and post-shaping response byte sizes ship in the same log line.
+    assert "response_bytes_pre=" in line
+    assert "response_bytes=" in line
+
+
+@pytest.mark.observability
+@pytest.mark.asyncio
+async def test_signals_log_includes_duration_ns_before_projection() -> None:
+    # duration_ns is read into _signals() BEFORE project_for_mcp drops it from the wire
+    # payload -- so log-line observability survives even though MCP callers never see the
+    # field itself.
+    payload = {"duration_ns": 123456, "files": []}
+    body, log_fields = main._shape_response("search_code", payload, 100_000, None)
+    assert log_fields["signals"]["duration_ns"] == 123456
+    assert '"duration_ns"' not in body
 
 
 @pytest.mark.observability
