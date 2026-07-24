@@ -992,8 +992,11 @@ async def test_search_code_tool_appends_branch_atom_to_query(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    def _fake_payload(engine: Any, cfg: Settings, query: str, limit: int) -> dict[str, Any]:
+    def _fake_payload(
+        engine: Any, cfg: Settings, query: str, limit: int, cursor: str | None = None
+    ) -> dict[str, Any]:
         captured["query"] = query
+        captured["cursor"] = cursor
         return {"query": query}
 
     monkeypatch.setattr(main, "_search_code_payload", _fake_payload)
@@ -1002,6 +1005,8 @@ async def test_search_code_tool_appends_branch_atom_to_query(
     await main.search_code("foo", ctx, branch="release/1.0")  # type: ignore[arg-type]
 
     assert captured["query"] == 'foo branch:"release/1.0"'
+    # search_code always runs in pagination mode: page 1 passes cursor=None explicitly.
+    assert captured["cursor"] is None
 
 
 @pytest.mark.unit
@@ -1011,7 +1016,9 @@ async def test_search_code_tool_leaves_query_untouched_without_branch(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    def _fake_payload(engine: Any, cfg: Settings, query: str, limit: int) -> dict[str, Any]:
+    def _fake_payload(
+        engine: Any, cfg: Settings, query: str, limit: int, cursor: str | None = None
+    ) -> dict[str, Any]:
         captured["query"] = query
         return {"query": query}
 
@@ -1160,6 +1167,40 @@ async def test_list_imports_tool_threads_imported_by_direction(
     assert captured["repo"] is None
 
 
+# ------------------------------------------------------------- max_bytes threading (AC6)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_all_six_tools_thread_max_bytes_to_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, int | None] = {}
+
+    async def _fake_dispatch(
+        name: str, build: Any, *, max_bytes: int | None = None, **_kw: Any
+    ) -> str:
+        captured[name] = max_bytes
+        return "{}"
+
+    monkeypatch.setattr(main, "_dispatch", _fake_dispatch)
+    ctx = _FakeLifespanContext(_FakeEngine([]), _cfg())
+
+    await main.search_code("foo", ctx, max_bytes=111)  # type: ignore[arg-type]
+    await main.semantic_search("foo", ctx, max_bytes=222)  # type: ignore[arg-type]
+    await main.list_repos(ctx, max_bytes=333)  # type: ignore[arg-type]
+    await main.get_file("acme/widgets", "f.py", ctx, max_bytes=444)  # type: ignore[arg-type]
+    await main.find_references("Handler", ctx, max_bytes=555)  # type: ignore[arg-type]
+    await main.list_imports(ctx, repo="acme/widgets", max_bytes=666)  # type: ignore[arg-type]
+
+    assert captured == {
+        "search_code": 111,
+        "semantic_search": 222,
+        "list_repos": 333,
+        "get_file": 444,
+        "find_references": 555,
+        "list_imports": 666,
+    }
+
+
 # ------------------------------------------------- search_code: divergent content_sha merge
 
 
@@ -1267,6 +1308,10 @@ async def test_dispatch_logs_signals_and_saturation(caplog: pytest.LogCaptureFix
     assert "tool=search_code" in line
     assert "query_too_broad" in line
     assert "limiter_borrowed=" in line  # pool/limiter saturation signal is wired
+    # Pre- and post-shaping response byte sizes ship in the same log line (see
+    # tests/unit/test_mcp_shaping.py for the duration_ns-survives-projection pin).
+    assert "response_bytes_pre=" in line
+    assert "response_bytes=" in line
 
 
 @pytest.mark.observability
@@ -1289,6 +1334,17 @@ def test_match_budget_ms_defaults_to_2000_and_is_env_overridable(
 
     monkeypatch.setenv("CODE_SEARCH_MATCH_BUDGET_MS", "500")
     assert Settings(lakebase_endpoint=None).match_budget_ms == 500
+
+
+@pytest.mark.unit
+def test_mcp_max_response_bytes_defaults_to_100000_and_is_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODE_SEARCH_MCP_MAX_RESPONSE_BYTES", raising=False)
+    assert Settings(lakebase_endpoint=None).mcp_max_response_bytes == 100_000
+
+    monkeypatch.setenv("CODE_SEARCH_MCP_MAX_RESPONSE_BYTES", "5000")
+    assert Settings(lakebase_endpoint=None).mcp_max_response_bytes == 5000
 
 
 @pytest.mark.observability
