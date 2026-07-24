@@ -9,13 +9,16 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+import time
 
 import pytest
+import regex
 
 from app.query.parser import parse, resolve_case
 from app.search import grep as grep_module
 from app.search.grep import (
     LineMatch,
+    MatchBudgetExceeded,
     _build_matchers,
     _no_content_atom,
     _zero_width_only_atoms,
@@ -422,3 +425,54 @@ def test_flags_are_mutually_exclusive(query: str) -> None:
     # needs `bool(patterns)`. The envelope only ever clears flags, so this holds there too.
     no_content, zero_width = _flags(query)
     assert not (no_content and zero_width)
+
+
+# ------------------------------------------------------------------ match budget (#38)
+#
+# extract_line_matches gains an optional `deadline` (a time.monotonic() absolute timestamp).
+# None (the default) is the unbudgeted path existing callers rely on; a set deadline bounds
+# Python-side CPU via the `regex` module's timeout=, raising MatchBudgetExceeded on a trip.
+#
+# The pathological exemplar below was reverified empirically against the installed `regex`
+# version (2026.7.19): `(?:(?:a{1,10}){1,10}){1,10}b` over a run of `a`s with no `b` trips
+# the timeout in well under a second at a small budget. A naive `(a+)+b` gets optimized away
+# by the engine and does NOT trip -- do not substitute it.
+
+_CATASTROPHIC_PATTERN = r"(?:(?:a{1,10}){1,10}){1,10}b"
+
+
+@pytest.mark.unit
+def test_catastrophic_regex_finditer_is_interrupted_by_deadline() -> None:
+    pattern = regex.compile(_CATASTROPHIC_PATTERN)
+    content = "a" * 50  # no trailing "b": forces the engine into catastrophic backtracking
+    deadline = time.monotonic() + 0.05
+    started = time.monotonic()
+    with pytest.raises(MatchBudgetExceeded):
+        extract_line_matches(content, [pattern], deadline=deadline)
+    # One-sided only: the trip must be bounded well under an unbudgeted run (which would take
+    # many seconds / effectively hang). No lower bound -- timing races must never make this flaky.
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.unit
+def test_deadline_in_past_raises_before_scanning() -> None:
+    # A deadline already in the past raises immediately, before any matching happens.
+    pattern = regex.compile("foo")
+    deadline = time.monotonic() - 1
+    with pytest.raises(MatchBudgetExceeded):
+        extract_line_matches("foo bar foo", [pattern], deadline=deadline)
+
+
+@pytest.mark.unit
+def test_deadline_none_preserves_unbudgeted_behavior() -> None:
+    # Passing deadline=None (and omitting it entirely) behaves exactly as the pre-existing
+    # unbudgeted path: same matches, same byte ranges as test_substring_single_match_*.
+    patterns, _ = _patterns("foo")
+    content = "first line\nsecond foo here"
+    explicit_none = extract_line_matches(content, patterns, deadline=None)
+    omitted = extract_line_matches(content, patterns)
+    assert explicit_none == omitted
+    (m,) = explicit_none
+    assert m.line_number == 2
+    assert m.line_text == "second foo here"
+    assert m.byte_ranges == ((7, 10),)

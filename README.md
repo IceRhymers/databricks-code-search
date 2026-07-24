@@ -223,10 +223,11 @@ Two different engines run in sequence, and neither is zoekt's RE2:
 1. Postgres POSIX ARE (`~` / `~*`) selects which files match. An invalid pattern (any
    polarity) surfaces as the recoverable `regex_invalid` payload field carrying the
    Postgres message, not a parse error and not a failed tool call.
-2. Python `re` rescans those files to produce the highlighted line matches.
+2. Python `regex` (a `re`-compatible superset, still not RE2) rescans those files to produce
+   the highlighted line matches.
 
 The practical consequences: `^` and `$` are line anchors and `.` never crosses lines;
-a Postgres-valid pattern that Python `re` rejects contributes no highlights *for that atom*
+a Postgres-valid pattern that Python `regex` rejects contributes no highlights *for that atom*
 and sets `regex_incompatible`, so a single-atom query of that shape returns nothing while
 other atoms in the same query still match; and case folding can disagree on non-ASCII pairs
 (`ß`/`SS`, Turkish dotless `ı`). ASCII is unaffected.
@@ -237,9 +238,13 @@ pattern like `/^/`, returns nothing even though the SQL predicate matched. `sym:
 exception: `search_code` runs a separate symbol leg, so `sym:Handler` returns definitions
 (carrying `symbols` and a `line`, but empty `text`) rather than falling into this hole.
 
-One more V1 limitation worth knowing before pointing agents at it: a
-catastrophic-backtracking regex on a single under-cap file runs unbounded in Python and can
-stall the server. `statement_timeout` bounds the database, not the rescan.
+Python-side matching is bounded by a per-request **match budget** (default 2000ms,
+configurable via `CODE_SEARCH_MATCH_BUDGET_MS`) so a catastrophic-backtracking regex on a
+single under-cap file cannot pin a worker: when the budget trips, scanning stops and the
+result comes back with `truncated=True` and `truncation_reason="match_budget"`. This
+complements `statement_timeout` (which bounds the database, not the rescan). The `regex`
+module releases the GIL while matching, so a budgeted pathological scan does not block the
+event loop.
 
 ## MCP tools
 

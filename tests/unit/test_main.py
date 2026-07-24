@@ -1278,6 +1278,30 @@ def test_signals_log_includes_both_flags() -> None:
     assert signals["zero_width_only_atoms"] is False
 
 
+@pytest.mark.unit
+def test_match_budget_ms_defaults_to_2000_and_is_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Default matches DEFAULT_MATCH_BUDGET_MS in app/search/grep.py; the CODE_SEARCH_ prefix
+    # gives an automatic env override, exactly like statement_timeout_ms / max_content_bytes.
+    monkeypatch.delenv("CODE_SEARCH_MATCH_BUDGET_MS", raising=False)
+    assert Settings(lakebase_endpoint=None).match_budget_ms == 2000
+
+    monkeypatch.setenv("CODE_SEARCH_MATCH_BUDGET_MS", "500")
+    assert Settings(lakebase_endpoint=None).match_budget_ms == 500
+
+
+@pytest.mark.observability
+def test_signals_log_includes_truncation_reason() -> None:
+    # Which cap/budget tripped -- byte_cap/row_cap/match_budget -- must be recoverable from the
+    # log line, not just the bare `truncated` bool.
+    signals = main._signals({"truncated": True, "truncation_reason": "match_budget"})
+    assert signals["truncated"] is True
+    assert signals["truncation_reason"] == "match_budget"
+    # None-safe on payloads that never carry it (e.g. list_repos).
+    assert main._signals({})["truncation_reason"] is None
+
+
 @pytest.mark.observability
 def test_signals_log_includes_regex_invalid() -> None:
     # Without this, a Postgres-rejected regex is log-indistinguishable from a genuine
