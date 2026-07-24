@@ -25,7 +25,7 @@ Vite + React 18 + TypeScript SPA for the code-search web UI. Talks to the FastAP
 ## For AI Agents
 
 ### Working In This Directory
-- **`dist/` is committed build output — never hand-edit it.** After any `src/` (or config) change, run `make webui-build` (`npm ci && npm run build`) and commit the resulting `dist/` diff. There is no build-time check that `dist/` and `src/` are in sync; a stale `dist/` ships silently.
+- **`dist/` is committed build output — never hand-edit it.** After any `src/` (or config) change, run `make webui-build` (`npm ci && npm run build`) and commit the resulting `dist/` diff. CI's `webui` job enforces freshness via `make webui-verify-dist` — a stale `dist/` fails the build.
 - The build must stay self-contained and same-origin: no absolute API base URLs (the client uses relative `/api/...` paths), no new runtime CDN/network dependencies.
 - Keep the dependency budget: prefer hand-rolled solutions (`router.ts`, `theme.ts`) over adding a router/state/fetch library. Shiki must stay on the fine-grained `shiki/core` API with static per-language imports — importing top-level `shiki` pulls the full ~80-language bundle because Vite cannot tree-shake a runtime `bundledLanguages[key]` lookup.
 - Deep links work because the backend falls back to `index.html` for non-`/api` 404s; new client routes need a matching case in `src/router.ts`, nothing server-side.

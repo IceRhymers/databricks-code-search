@@ -603,6 +603,7 @@ For the webui frontend specifically (requires Node):
 ```bash
 make webui-build           # npm ci + vite build -> webui/frontend/dist/ (commit the result)
 make webui-test            # vitest; advisory, not a repo gate
+make webui-verify-dist     # rebuild + fail if committed dist/ is stale (CI freshness gate; issue #80)
 ```
 
 This project is **Lakebase-only**: there is no local/CI Postgres image. The integration
