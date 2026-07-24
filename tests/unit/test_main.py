@@ -1167,6 +1167,40 @@ async def test_list_imports_tool_threads_imported_by_direction(
     assert captured["repo"] is None
 
 
+# ------------------------------------------------------------- max_bytes threading (AC6)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_all_six_tools_thread_max_bytes_to_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, int | None] = {}
+
+    async def _fake_dispatch(
+        name: str, build: Any, *, max_bytes: int | None = None, **_kw: Any
+    ) -> str:
+        captured[name] = max_bytes
+        return "{}"
+
+    monkeypatch.setattr(main, "_dispatch", _fake_dispatch)
+    ctx = _FakeLifespanContext(_FakeEngine([]), _cfg())
+
+    await main.search_code("foo", ctx, max_bytes=111)  # type: ignore[arg-type]
+    await main.semantic_search("foo", ctx, max_bytes=222)  # type: ignore[arg-type]
+    await main.list_repos(ctx, max_bytes=333)  # type: ignore[arg-type]
+    await main.get_file("acme/widgets", "f.py", ctx, max_bytes=444)  # type: ignore[arg-type]
+    await main.find_references("Handler", ctx, max_bytes=555)  # type: ignore[arg-type]
+    await main.list_imports(ctx, repo="acme/widgets", max_bytes=666)  # type: ignore[arg-type]
+
+    assert captured == {
+        "search_code": 111,
+        "semantic_search": 222,
+        "list_repos": 333,
+        "get_file": 444,
+        "find_references": 555,
+        "list_imports": 666,
+    }
+
+
 # ------------------------------------------------- search_code: divergent content_sha merge
 
 
