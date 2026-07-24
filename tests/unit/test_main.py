@@ -1308,21 +1308,10 @@ async def test_dispatch_logs_signals_and_saturation(caplog: pytest.LogCaptureFix
     assert "tool=search_code" in line
     assert "query_too_broad" in line
     assert "limiter_borrowed=" in line  # pool/limiter saturation signal is wired
-    # AC5 / Step 4: pre- and post-shaping response byte sizes ship in the same log line.
+    # Pre- and post-shaping response byte sizes ship in the same log line (see
+    # tests/unit/test_mcp_shaping.py for the duration_ns-survives-projection pin).
     assert "response_bytes_pre=" in line
     assert "response_bytes=" in line
-
-
-@pytest.mark.observability
-@pytest.mark.asyncio
-async def test_signals_log_includes_duration_ns_before_projection() -> None:
-    # duration_ns is read into _signals() BEFORE project_for_mcp drops it from the wire
-    # payload -- so log-line observability survives even though MCP callers never see the
-    # field itself.
-    payload = {"duration_ns": 123456, "files": []}
-    body, log_fields = main._shape_response("search_code", payload, 100_000, None)
-    assert log_fields["signals"]["duration_ns"] == 123456
-    assert '"duration_ns"' not in body
 
 
 @pytest.mark.observability

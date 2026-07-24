@@ -172,7 +172,9 @@ def _effective_budget(max_bytes: int | None, cfg: Settings) -> int:
     """Resolve the byte budget for one call: `max_bytes` clamps the env default DOWN, never up.
 
     `None` or a non-positive value means "no per-request override" -> the env-configured
-    ceiling. Otherwise clamped to `[_MIN_MAX_BYTES, cfg.mcp_max_response_bytes]` (AC6).
+    ceiling. Otherwise clamped to `[_MIN_MAX_BYTES, cfg.mcp_max_response_bytes]` -- a request
+    can shrink the ceiling but never raise it above the server-configured maximum, and never
+    below the floor.
     """
     if max_bytes is None or max_bytes <= 0:
         return cfg.mcp_max_response_bytes
@@ -288,7 +290,7 @@ def _recompute_semantic_results(payload: dict[str, Any]) -> None:
 
 def _resolve_repo_id(engine: Engine, cfg: Settings, name: str) -> int | None:
     """One bounded ``repos.name -> id`` SELECT, fired only when byte-budget truncation of
-    ``search_code`` needs to synthesize a resume cursor (D3) -- the built payload resolves
+    ``search_code`` needs to synthesize a resume cursor -- the built payload resolves
     ``repo_id`` to a name and drops the id, so the MCP layer must resolve it back.
 
     A no-row result (reachable: the builder itself falls back to ``str(repo_id)`` when a repo
@@ -313,7 +315,9 @@ def _make_search_code_truncator(
     engine: Engine, cfg: Settings
 ) -> Callable[[dict[str, Any], int, list[tuple[str, int]] | None], None]:
     """Build the ``search_code`` truncator: a closure over ``engine``/``cfg`` so an actual
-    byte-budget trim can synthesize ``next_cursor`` (D3).
+    byte-budget trim can synthesize ``next_cursor`` by resolving the last kept file's repo
+    name back to an id (the built payload only carries the name, not the id ``grep``'s cursor
+    needs).
 
     Pure tail-trim of ``files`` in the payload's existing ``(repo_id, path, content_sha)`` sort
     order (never reordered to protect symbol-bearing files) -- the kept files are always a
@@ -323,6 +327,13 @@ def _make_search_code_truncator(
     ``[(content_sha, span_count), ...]`` captured by ``_shape_response`` BEFORE
     ``project_for_mcp`` strips ``content_sha``/``byte_ranges`` from ``payload["files"]`` --
     trimming here is positional against that snapshot, not content-aware.
+
+    Progress guarantee: whenever the untruncated payload had at least one file, at least one
+    file is ALWAYS kept, even if that single file's own serialized size alone exceeds
+    ``budget`` -- mirroring ``_shape_get_file_response``'s single-oversized-line edge. Without
+    this floor, a single huge file (e.g. one file with thousands of matches) would fit zero
+    items, yielding ``files: []`` with no ``next_cursor`` to resume from: an unrecoverable dead
+    end that contradicts the "always advance" contract this tool promises callers.
     """
 
     def _truncate(
@@ -346,27 +357,31 @@ def _make_search_code_truncator(
         envelope_overhead = len(json.dumps(payload)) - sum(len(json.dumps(f)) + 2 for f in files)
         budget_for_items = max(0, budget - envelope_overhead)
         keep = _fit_list(files, budget_for_items)
+        if keep == 0:
+            keep = 1  # progress guarantee -- see docstring; this page may exceed budget
         _apply(keep)
         payload["truncated"] = True
         if payload.get("truncation_reason") is None:
             payload["truncation_reason"] = "token_budget"
 
-        while keep > 0 and len(json.dumps(payload)) > budget:
-            keep //= 2
+        # Safety net (mirrors _make_tail_trim_truncator's): re-verify against the real wire
+        # string and shrink further if the "+2" separator estimate under-counted. Floored at 1,
+        # never 0, so the progress guarantee above can never be undone here.
+        while keep > 1 and len(json.dumps(payload)) > budget:
+            keep = max(1, keep // 2)
             _apply(keep)
 
+        last_file = payload["files"][keep - 1]
+        last_sha = snapshot[keep - 1][0] if keep - 1 < len(snapshot) else None
+        repo_name = last_file.get("repo")
+        path = last_file.get("file")
         next_cursor: str | None = None
-        if keep > 0:
-            last_file = payload["files"][keep - 1]
-            last_sha = snapshot[keep - 1][0] if keep - 1 < len(snapshot) else None
-            repo_name = last_file.get("repo")
-            path = last_file.get("file")
-            if repo_name is not None and path is not None and last_sha:
-                repo_id = _resolve_repo_id(engine, cfg, repo_name)
-                if repo_id is not None:
-                    next_cursor = service.encode_cursor(
-                        FileCursor(repo_id=repo_id, path=path, content_sha=last_sha)
-                    )
+        if repo_name is not None and path is not None and last_sha:
+            repo_id = _resolve_repo_id(engine, cfg, repo_name)
+            if repo_id is not None:
+                next_cursor = service.encode_cursor(
+                    FileCursor(repo_id=repo_id, path=path, content_sha=last_sha)
+                )
         payload["next_cursor"] = next_cursor
 
     return _truncate
@@ -396,7 +411,8 @@ def _shape_response(
     (pre- and post-projection serialized sizes, for ``_dispatch``'s telemetry line) and the
     pre-projection ``signals`` dict (so ``duration_ns`` observability survives projection
     dropping the field). Never raises: an irreducible over-budget envelope (a giant echoed
-    scalar with nothing left to trim) is returned flagged rather than erroring (Principle 4).
+    scalar with nothing left to trim) is returned flagged rather than raising -- forward
+    progress for the caller always wins over strict budget enforcement.
     """
     pre_bytes = len(json.dumps(payload))
     signals = _signals(payload)
@@ -460,7 +476,7 @@ def _shape_get_file_response(
 ) -> tuple[str, dict[str, Any]]:
     """Slice ``payload["content"]`` to a ``start_line``-anchored page fitting ``budget``.
 
-    Per D2: splits with ``content.split("\\n")`` -- the SAME rule ``grep.py:436`` uses for
+    Splits with ``content.split("\\n")`` -- the SAME rule ``grep.py:436`` uses for
     ``search_code`` line numbers, so ``get_file`` pages stay congruent with search match lines
     on every input, including form feeds and ``U+2028``/``U+2029`` (which ``str.splitlines()``
     would wrongly treat as line breaks for this purpose). Reassembly re-appends ``"\\n"`` to
@@ -470,9 +486,9 @@ def _shape_get_file_response(
 
     A miss (``found: false``) never truncates: ``start_line`` echoes, ``next_start_line`` is
     ``null``, ``truncated`` is ``False``. On a hit, at least one line is always returned even if
-    it alone exceeds ``budget`` (Principle 4's progress guarantee outranks strict enforcement
-    for that documented, degenerate edge -- a single line larger than the whole budget);
-    ``next_start_line`` still advances past it.
+    it alone exceeds ``budget`` -- always making forward progress for the caller outranks strict
+    budget enforcement for that documented, degenerate edge (a single line larger than the whole
+    budget); ``next_start_line`` still advances past it.
     """
     pre_bytes = len(json.dumps(payload))
     signals = _signals(payload)
@@ -732,7 +748,11 @@ async def search_code(
     ``truncation_reason: "token_budget"`` with a synthesized ``next_cursor`` so a caller can
     keep paging through the CONTENT matches losslessly; a ``sym:`` query's page-1-only symbol
     definitions that land in a truncated tail are lost from that traversal (flagged, not
-    silently dropped) since the symbol leg never re-runs on a continuation page.
+    silently dropped) since the symbol leg never re-runs on a continuation page. At least one
+    file is always kept and a ``next_cursor`` always synthesized when there was at least one
+    file to begin with -- a single file whose own serialized size alone exceeds ``max_bytes``
+    (e.g. one file with thousands of matches) is still returned alone, with that one response
+    exceeding the budget, rather than coming back as an empty, unresumable dead end.
     """
     lc = ctx.request_context.lifespan_context
     engine, cfg = lc["engine"], lc["config"]

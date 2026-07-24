@@ -279,7 +279,11 @@ handles so a byte-budget trim is still traversable:
   `cursor` (or passes `null`), and every response carries `next_cursor` (`str | null`); pass
   the previous response's `next_cursor` back as `cursor` to resume. When byte-budget
   truncation drops tail files, `next_cursor` is synthesized to resume exactly after the last
-  file kept, so a full traversal recovers every **content** match losslessly. A `sym:` query's
+  file kept, so a full traversal recovers every **content** match losslessly. At least one
+  file is always kept and a `next_cursor` always synthesized as long as there was at least one
+  file to begin with — a single file whose own serialized size alone exceeds `max_bytes` (e.g.
+  one file with thousands of matches) is still returned alone, with that one response exceeding
+  the budget, rather than coming back as an empty, unresumable dead end. A `sym:` query's
   definitions fold in on page 1 only, so a symbol match that lands in a byte-budget-truncated
   tail is lost from that traversal (flagged `truncated`, not silently dropped) — a continuation
   page never re-runs the symbol leg. A garbled/tampered `cursor` string never raises: it comes

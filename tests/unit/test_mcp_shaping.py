@@ -648,6 +648,64 @@ async def test_search_code_cursor_traversal_equals_uncapped(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_search_code_single_oversized_file_progress_guarantee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for the blocking defect found in review: a single file whose OWN serialized
+    # size already exceeds the budget must still come back as exactly that one file (never an
+    # empty, unresumable `files: []` with `next_cursor: null`), flagged truncated, with a
+    # next_cursor that lets a caller advance past it -- mirroring get_file's single-oversized-
+    # line edge. Under the OLD code, _fit_list returned keep=0 here, `next_cursor` stayed None,
+    # and the response was a silent, permanent dead end.
+    huge_file = FileMatches(
+        repo_id=7,
+        path="file0_huge.py",
+        lang="python",
+        content_sha="sha-huge",
+        branches=("main",),
+        line_matches=tuple(
+            LineMatch(i, f"needle match number {i} " + "x" * 40, ((0, 6),)) for i in range(1, 501)
+        ),
+    )
+    small_files = [
+        FileMatches(
+            repo_id=7,
+            path=f"file{i}_small.py",
+            lang="python",
+            content_sha=f"sha-small-{i}",
+            branches=("main",),
+            line_matches=(LineMatch(1, f"needle in small file {i}", ((0, 6),)),),
+        )
+        for i in range(1, 3)
+    ]
+    all_files = [huge_file, *small_files]
+    monkeypatch.setattr(service, "grep_search", _make_grep_stub(all_files))
+    monkeypatch.setattr(service, "symbol_search", lambda *a, **k: _no_sym())
+    engine = _FakeSearchEngine({7: "acme/widgets"})
+    ctx = _FakeLifespanContext(engine, _cfg())
+
+    # A budget far smaller than the huge file's own serialized size (the file's ~500 matches
+    # alone serialize to well over 10x this) but the file still must come back, not be dropped.
+    out1 = await main.search_code("needle", ctx, max_bytes=2000)  # type: ignore[arg-type]
+    page1 = json.loads(out1)
+
+    assert page1["truncated"] is True
+    assert page1["truncation_reason"] == "token_budget"
+    assert [f["file"] for f in page1["files"]] == ["file0_huge.py"]  # exactly 1 file kept
+    assert len(out1) > 2000  # the documented edge: this one response exceeds the budget
+    cursor = page1["next_cursor"]
+    assert cursor is not None, "progress guarantee: a resume cursor must still be synthesized"
+
+    # Traversal past the oversized file must work: the remaining (small) files come back.
+    out2 = await main.search_code(  # type: ignore[arg-type]
+        "needle", ctx, cursor=cursor, max_bytes=100_000
+    )
+    page2 = json.loads(out2)
+    assert {f["file"] for f in page2["files"]} == {"file1_small.py", "file2_small.py"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_search_code_cursor_no_row_degrades_without_cursor_or_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
