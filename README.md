@@ -274,7 +274,7 @@ Recoverable conditions come back as payload fields —
 `query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`, `regex_invalid`,
 `no_content_atom`, `zero_width_only_atoms`, `commit_not_indexed` — rather than errors, so
 an agent can react without a failed tool call. `regex_invalid` is distinct from
-`regex_incompatible`: the latter means Python `re` (not Postgres) rejected an otherwise-valid
+`regex_incompatible`: the latter means Python `regex` (not Postgres) rejected an otherwise-valid
 pattern and only degrades highlighting; `regex_invalid` means Postgres rejected the pattern
 outright and the query did not run. Pagination rides the same envelope as
 `next_cursor`, and the semantic tool adds its own status fields (`semantic_enabled`,
