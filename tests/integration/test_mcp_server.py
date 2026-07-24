@@ -75,6 +75,123 @@ def _restore_pgoptions(prev: str | None) -> None:
     _reset_engine()
 
 
+def seed_reference_corpus(conn: Any, acme_id: int) -> None:
+    """Reference-edge corpus for find_references / list_imports (D5), inserted into an existing
+    ``acme/widgets`` repo. Connection-parameterized (no fixture lifecycle of its own) so
+    ``tests/integration/test_webui_graph_parity.py`` can reuse the exact same corpus over its
+    own throwaway schema (issue #88 AC2). Extracted verbatim from :func:`seeded_schema` -- a
+    pure, behavior-preserving move; ``test_reference_tools_streamable_http`` and the other
+    ``seeded_schema``-dependent cases below re-run unchanged against it.
+
+    Binding content rule: every file's path AND content avoid "foo" and "Handler" (content
+    idiom ``"# <path>\\n"``), all ``lang="python"``, no new repos, nothing on ``feature/x``
+    contains "Handler" -- so none of the pre-existing pinned grep/sym/list_repos assertions
+    move.
+    """
+
+    def _ref_file(path: str, branch: str) -> int:
+        body = f"# {path}\n"
+        return conn.execute(
+            insert(File)
+            .values(
+                repo_id=acme_id,
+                path=path,
+                lang="python",
+                content=body,
+                content_sha=content_sha(body),
+                branches=[branch],
+            )
+            .returning(File.id)
+        ).scalar_one()
+
+    # Two ambiguous "process" definitions on main -> every call site resolves 2 candidates.
+    service_py = _ref_file("src/service.py", "main")
+    conn.execute(
+        insert(Symbol).values(
+            file_id=service_py, repo_id=acme_id, name="process", kind="function", start_line=10
+        )
+    )
+    worker_py = _ref_file("src/worker.py", "main")
+    conn.execute(
+        insert(Symbol).values(
+            file_id=worker_py, repo_id=acme_id, name="process", kind="function", start_line=4
+        )
+    )
+
+    # Call sites on main: one to the ambiguous "process", one to an undefined "missing_fn".
+    caller_py = _ref_file("src/caller.py", "main")
+    conn.execute(
+        insert(ReferenceEdge).values(
+            file_id=caller_py,
+            repo_id=acme_id,
+            edge_kind="call",
+            target_name="process",
+            line=5,
+            enclosing_name="run",
+            enclosing_kind="function",
+        )
+    )
+    conn.execute(
+        insert(ReferenceEdge).values(
+            file_id=caller_py,
+            repo_id=acme_id,
+            edge_kind="call",
+            target_name="missing_fn",
+            line=6,
+            enclosing_name="run",
+            enclosing_kind="function",
+        )
+    )
+
+    # AC3 composition site: a test file whose enclosing symbol names the covering test.
+    test_py = _ref_file("tests/test_service.py", "main")
+    conn.execute(
+        insert(ReferenceEdge).values(
+            file_id=test_py,
+            repo_id=acme_id,
+            edge_kind="call",
+            target_name="process",
+            line=8,
+            enclosing_name="test_process",
+            enclosing_kind="function",
+        )
+    )
+
+    # Import sites on main (external, module-scope): enclosing NULL, expected "unresolved".
+    importer_py = _ref_file("src/importer.py", "main")
+    conn.execute(
+        insert(ReferenceEdge).values(
+            file_id=importer_py,
+            repo_id=acme_id,
+            edge_kind="import",
+            target_name="os.path",
+            line=1,
+        )
+    )
+    conn.execute(
+        insert(ReferenceEdge).values(
+            file_id=importer_py,
+            repo_id=acme_id,
+            edge_kind="import",
+            target_name="collections.abc",
+            line=2,
+        )
+    )
+
+    # Branch parity: a call to "process" on feature/x, where NO "process" def exists ->
+    # candidate-side branch scoping makes it resolve "unresolved".
+    feature_caller = _ref_file("src/feature_caller.py", "feature/x")
+    conn.execute(
+        insert(ReferenceEdge).values(
+            file_id=feature_caller,
+            repo_id=acme_id,
+            edge_kind="call",
+            target_name="process",
+            line=3,
+        )
+    )
+
+
 @pytest.fixture
 def seeded_schema() -> Iterator[str]:
     """Throwaway schema + durable-core DDL + the deterministic grep corpus, PGOPTIONS-visible.
@@ -174,111 +291,7 @@ def seeded_schema() -> Iterator[str]:
         )
         conn.execute(insert(RepoBranch).values(repo_id=gamma_id, branch="HEAD"))
 
-        # Reference-edge corpus for find_references / list_imports (D5). Binding content rule:
-        # every new file's path AND content avoid "foo" and "Handler" (content idiom
-        # "# <path>\n"), all lang="python", no new repos, nothing on feature/x contains
-        # "Handler" -- so none of the pre-existing pinned grep/sym/list_repos assertions move.
-        def _ref_file(path: str, branch: str) -> int:
-            body = f"# {path}\n"
-            return conn.execute(
-                insert(File)
-                .values(
-                    repo_id=acme_id,
-                    path=path,
-                    lang="python",
-                    content=body,
-                    content_sha=content_sha(body),
-                    branches=[branch],
-                )
-                .returning(File.id)
-            ).scalar_one()
-
-        # Two ambiguous "process" definitions on main -> every call site resolves 2 candidates.
-        service_py = _ref_file("src/service.py", "main")
-        conn.execute(
-            insert(Symbol).values(
-                file_id=service_py, repo_id=acme_id, name="process", kind="function", start_line=10
-            )
-        )
-        worker_py = _ref_file("src/worker.py", "main")
-        conn.execute(
-            insert(Symbol).values(
-                file_id=worker_py, repo_id=acme_id, name="process", kind="function", start_line=4
-            )
-        )
-
-        # Call sites on main: one to the ambiguous "process", one to an undefined "missing_fn".
-        caller_py = _ref_file("src/caller.py", "main")
-        conn.execute(
-            insert(ReferenceEdge).values(
-                file_id=caller_py,
-                repo_id=acme_id,
-                edge_kind="call",
-                target_name="process",
-                line=5,
-                enclosing_name="run",
-                enclosing_kind="function",
-            )
-        )
-        conn.execute(
-            insert(ReferenceEdge).values(
-                file_id=caller_py,
-                repo_id=acme_id,
-                edge_kind="call",
-                target_name="missing_fn",
-                line=6,
-                enclosing_name="run",
-                enclosing_kind="function",
-            )
-        )
-
-        # AC3 composition site: a test file whose enclosing symbol names the covering test.
-        test_py = _ref_file("tests/test_service.py", "main")
-        conn.execute(
-            insert(ReferenceEdge).values(
-                file_id=test_py,
-                repo_id=acme_id,
-                edge_kind="call",
-                target_name="process",
-                line=8,
-                enclosing_name="test_process",
-                enclosing_kind="function",
-            )
-        )
-
-        # Import sites on main (external, module-scope): enclosing NULL, expected "unresolved".
-        importer_py = _ref_file("src/importer.py", "main")
-        conn.execute(
-            insert(ReferenceEdge).values(
-                file_id=importer_py,
-                repo_id=acme_id,
-                edge_kind="import",
-                target_name="os.path",
-                line=1,
-            )
-        )
-        conn.execute(
-            insert(ReferenceEdge).values(
-                file_id=importer_py,
-                repo_id=acme_id,
-                edge_kind="import",
-                target_name="collections.abc",
-                line=2,
-            )
-        )
-
-        # Branch parity: a call to "process" on feature/x, where NO "process" def exists ->
-        # candidate-side branch scoping makes it resolve "unresolved".
-        feature_caller = _ref_file("src/feature_caller.py", "feature/x")
-        conn.execute(
-            insert(ReferenceEdge).values(
-                file_id=feature_caller,
-                repo_id=acme_id,
-                edge_kind="call",
-                target_name="process",
-                line=3,
-            )
-        )
+        seed_reference_corpus(conn, acme_id)
         conn.commit()
 
         # Point the server engine at this schema BEFORE it is built, and reset the singleton.
