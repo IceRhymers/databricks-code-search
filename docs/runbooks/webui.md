@@ -149,6 +149,83 @@ change, and a full re-index of every semantically-enabled project, so it is out 
 and tracked as a follow-up issue (index-time `start_line`/`end_line` for exact semantic
 anchors).
 
+## Graph tools — references & imports (issue #88)
+
+The webui exposes the same knowledge-graph reference edges the MCP `find_references`/
+`list_imports` tools serve, via two routes on the same FastAPI app, and an always-visible
+**Graph** nav tab (`GraphPage.tsx`) covering both. Like the Semantic routes above, both are
+thin passthrough wrappers over `app.service` payload builders -- they never reimplement graph
+logic, and MCP responses are unaffected. **Candidate-set semantics throughout**: a site is a
+place that names something; its `candidates` are the `symbols` definitions that name could
+plausibly mean, ranked (`same_repo`/`same_file`/`kind_match`), never collapsed to a single
+binding.
+
+### `GET /api/references`
+
+Params: `symbol` (required, non-empty), `limit` (default `200` -- parity with the MCP
+`find_references` tool's own default, not `/api/search`'s `0 -> row_limit` convention),
+`branch` (optional, scopes both the call site's file and each candidate's file).
+
+`symbol` requiring a non-empty value (422 on missing/empty) is a **webui-layer HTTP input
+guard, not shared builder semantics** -- the MCP tool has no such gate and would run the
+builder to an empty/unresolved payload instead. This is the one place the two surfaces
+deliberately diverge; everything else below is byte-identical passthrough.
+
+The response is the builder's payload passed through unchanged (`clamp_limit` still applies
+to `limit`); `query_too_broad` (the folded `QueryTooBroadError`) and every resolution state
+(`unique`/`ambiguous`/`unresolved`, truncation) are 200 bodies -- recoverable conditions are
+payload fields, never HTTP errors, mirroring the MCP tool's dispatch contract and the
+Semantic routes' precedent above.
+
+### `GET /api/imports`
+
+Params: `repo`, `target` (both optional at this HTTP layer -- see below), `direction`
+(default `"imports"`, passed through **verbatim**, unvalidated), `limit` (default `200`),
+`branch` (optional).
+
+`repo`/`target` are optional here on purpose: which one is required depends on `direction`,
+and that is the **builder's** job to decide -- an unknown `direction` (`unsupported_direction`
++ `reason`), `imports` with no `repo` (`missing_repo` + `reason`), or `imported_by` with no
+`target` (`missing_target` + `reason`) all come back as structured **200** bodies, never a
+422. Import edges target the full dotted path as written, so most sites are external/stdlib
+and resolve `"unresolved"` -- expected, not an error. `repo_known: false` is a structured
+"no such repo" miss, distinct from a known repo with zero import sites.
+
+### Error-status mapping (both routes)
+
+Identical to `/api/semantic`'s pattern, minus the 502 leg (this is a DB-only path, no
+external embedding call): **400** `{"error": "invalid parameter"}` for a NUL byte in a
+parameter reaching a bound SQL parameter (`sqlalchemy.exc.DataError`); **422** for
+`/api/references`'s missing `symbol` only (`/api/imports` never 422s -- see above); anything
+else DB-only and unexpected is a plain 500. Every recoverable condition -- ambiguity,
+unresolved sites, truncation, `query_too_broad`, and all three `/api/imports` validation
+states -- is a 200 body; this route never inspects the payload to decide status.
+
+### The Graph tab
+
+One `GraphPage.tsx` component covers both `/references` and `/imports` (mode from the
+pathname), sharing a `SiteList.tsx` candidate-set renderer -- both routes' sites use the
+identical `_site_payload` shape. Unlike the Semantic tab, the Graph nav link is **always
+visible**: there is no feature flag for reference edges (`reference_edges` ships under the
+same read-only SELECT grant as everything else), and an empty corpus just yields an
+empty-but-valid payload, nothing to fail-closed on. `App.tsx` mounts `GraphPage` with
+`key={route.mode}`, so navigating between References and Imports fully remounts the page --
+symbol/repo/target/direction input state and the mount-time auto-run guard never bleed across
+modes. Entry points ship from two places: a `references` link next to each symbol match in
+lexical search results (`ResultsList.tsx`), and an `imports` link on each repo row
+(`ReposPage.tsx`). Deep link shapes: `/references?symbol=X&branch=Y`,
+`/imports?repo=R&direction=imports&branch=Y`, `/imports?target=T&direction=imported_by`.
+Site and candidate rows deep-link into the file viewer via the same `/file?repo=&path=&
+branch=#L{line}` idiom results/chunk links already use.
+
+**Parity guarantee (AC2).** `app/main.py`'s `find_references`/`list_imports` MCP tools are
+pure `clamp_limit` -> `json.dumps(builder(...))` wrappers around the exact same
+`app.service.find_references_payload`/`list_imports_payload` these two routes call --
+`tests/integration/test_webui_graph_parity.py` proves the webui route's JSON is
+byte-identical to a direct builder call at the same clamped limit, over the same seeded
+corpus `tests/integration/test_mcp_server.py` uses for its own MCP e2e pin, so the two
+surfaces are provably in lockstep.
+
 ## Read-only role
 
 The webui app's service principal is granted the same least-privilege read-only role as the

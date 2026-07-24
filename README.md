@@ -319,6 +319,19 @@ open the app URL in a browser. See
 rebuilding the frontend (`make webui-build`), and the wheel-packaging mechanism that lets
 webui import `app.*` without duplicating it.
 
+The **Graph** tab exposes the same knowledge-graph reference edges as the MCP
+`find_references`/`list_imports` tools, via `GET /api/references` and `GET /api/imports` —
+thin passthroughs over the SAME `app/service.py` builders the MCP tools wrap (no duplicated
+graph logic; see [`docs/runbooks/webui.md`](docs/runbooks/webui.md) for the parity contract),
+presented as ranked candidate sets rather than raw rows. The edge model behind both surfaces:
+raw `call`/`import` edges are recorded at index time without resolving them, and each query
+resolves a name against `symbols` on the fly (query-time candidate-set resolution, not a
+build-time link step) — because this is grep-not-LSP name matching, a name can't always be
+collapsed to one binding, so results come back as ranked candidate sets (`unique`/`ambiguous`/
+`unresolved`) instead of a single "go to definition" answer. See
+[`docs/runbooks/reference-edges.md`](docs/runbooks/reference-edges.md) for the edge schema and
+resolver details.
+
 ## Deploy
 
 `make deploy` (see [Quick start](#quick-start)) runs `scripts/deploy.sh full`, which

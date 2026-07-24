@@ -57,11 +57,13 @@ make the cascade correct, because both `repos -> reference_edges` and
 - Duplicate sites (the same target called twice on one line) are two rows by design; there
   is no uniqueness constraint, and the query-time resolver (#86) ranks candidates.
 
-**Operational consequence of the `INDEX_SEMANTICS_VERSION` bump (2 -> 3, #84):** every
-already-indexed branch's stored `(head_sha, index_semantics_version)` stamp now mismatches
+**Operational consequence of the `INDEX_SEMANTICS_VERSION` bump history:** `2 -> 3` (#84)
+added Python `reference_edges`; `3 -> 4` (#85) extended typed reference edges to
+JS/TS/TSX/Go/Java/Rust. The constant is now **4** (`app/db/models.py`). Each bump makes
+every already-indexed branch's stored `(head_sha, index_semantics_version)` stamp mismatch
 the running code's version, so the *next* run of every branch is a full re-index (not a
-skip) purely to backfill `reference_edges` — expected, one-time, and already how the `2`
-bump behaved for `chunks`.
+skip) purely to backfill the new edges — expected, one-time, and already how the `2` bump
+behaved for `chunks`.
 
 ## 2. Indexes
 
