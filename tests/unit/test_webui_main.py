@@ -21,6 +21,7 @@ from sqlalchemy.exc import DataError
 
 from app import service
 from app.config import Settings
+from app.search.errors import RegexInvalidError
 from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
 from webui.main import api_imports, api_references, app, get_engine, get_settings
 
@@ -271,6 +272,25 @@ def test_api_search_nul_byte_in_cursor_path_is_400(
 
     assert resp.status_code == 400
     assert resp.json()["detail"]["error"] == "invalid parameter"
+
+
+@pytest.mark.unit
+def test_api_search_invalid_regex_is_400_with_postgres_message(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unlike the NUL-byte case above, an invalid regex never reaches this route as a raw
+    # exception -- service.search_code_payload maps it internally to the regex_invalid field
+    # (see app/search/errors.py's RegexInvalidError), so the route inspects the payload rather
+    # than catching an exception (D5).
+    def _raise(*_a: object, **_k: object) -> GrepResult:
+        raise RegexInvalidError("invalid regular expression: brackets [] not balanced")
+
+    monkeypatch.setattr(service, "grep_search", _raise)
+
+    resp = client.get("/api/search", params={"q": "/[/"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "invalid regular expression: brackets [] not balanced"
 
 
 # ----------------------------------------------------------------------------------- /api/file
@@ -596,6 +616,30 @@ def test_api_semantic_data_error_is_400(
 
     assert resp.status_code == 400
     assert resp.json()["detail"]["error"] == "invalid parameter"
+
+
+@pytest.mark.unit
+def test_api_semantic_regex_invalid_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unlike DataError above, regex_invalid never escapes semantic_search_payload as a raw
+    # exception -- it is a payload field (D6), so the route must inspect the payload (assign-
+    # then-inspect, per Critic note 3) rather than catching an exception.
+    payload = {
+        "query": "repo:[",
+        "semantic_enabled": True,
+        "results": [],
+        "count": 0,
+        "regex_invalid": "invalid regular expression: brackets [] not balanced",
+        "reason": "repo:/file: filter values are matched as POSIX regexes by Postgres; fix "
+        "the pattern",
+    }
+    monkeypatch.setattr(service, "semantic_search_payload", lambda *a, **k: payload)
+
+    resp = client.get("/api/semantic", params={"q": "repo:["})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "invalid regular expression: brackets [] not balanced"
 
 
 @pytest.mark.unit

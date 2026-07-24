@@ -20,13 +20,12 @@ from typing import NamedTuple
 
 import pytest
 from sqlalchemy import Connection, insert, text
-from sqlalchemy.exc import DataError
 
 from app.db.client import create_db_engine
 from app.db.models import Base, File, Repo
 from app.query.compiler import compile_query
 from app.query.parser import parse, resolve_case
-from app.search.errors import QueryTooBroadError
+from app.search.errors import QueryTooBroadError, RegexInvalidError
 from app.search.grep import FileCursor, GrepResult, grep_search
 from indexer.hashing import content_sha
 
@@ -257,21 +256,32 @@ def test_healthy_query_does_not_raise_query_too_broad(seeded: Seeded) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(
-    raises=DataError,
-    strict=False,
-    reason="Follow-up issue #75 (filed while scoping #70's polarity-awareness work). A "
-    "Postgres-invalid POSIX regex (e.g. `[`) reaches the DB raw regardless of polarity -- "
-    "the compiler never validates a Regex atom's pattern, negated or not -- and Postgres's "
-    "InvalidRegularExpression is a Data Exception, which SQLAlchemy surfaces as "
-    "sqlalchemy.exc.DataError: a sibling class reraise_or_query_too_broad's "
-    "`except OperationalError` does not catch, so it propagates uncaught as an unhandled "
-    "fault instead of a recoverable payload field (see app/search/grep.py's NOT-RE2 "
-    "caveat). Asserts the DESIRED future behavior (no uncaught exception) so a fix makes "
-    "this XPASS (non-gating here) rather than silently rotting as a stale pin.",
-)
-def test_negated_broken_regex_reaching_postgres_is_an_unhandled_fault(seeded: Seeded) -> None:
-    grep_search(seeded.conn, "-/[/ foo")
+def test_negated_broken_regex_reaching_postgres_raises_regex_invalid_error(
+    seeded: Seeded,
+) -> None:
+    # Polarity-independent (issue #75): a Postgres-invalid POSIX regex reaches the DB raw
+    # regardless of polarity -- the compiler never validates a Regex atom's pattern, negated
+    # or not -- and Postgres's InvalidRegularExpression is mapped by
+    # app.search.errors.reraise_or_recoverable to a typed RegexInvalidError, never an
+    # uncaught DataError (see app/search/grep.py's caveat bullet).
+    with pytest.raises(RegexInvalidError, match="invalid regular expression"):
+        grep_search(seeded.conn, "-/[/ foo")
+
+
+@pytest.mark.integration
+def test_broken_regex_reaching_postgres_raises_regex_invalid_error(seeded: Seeded) -> None:
+    with pytest.raises(RegexInvalidError, match="invalid regular expression"):
+        grep_search(seeded.conn, "/[/ foo")
+
+
+@pytest.mark.integration
+def test_broken_repo_filter_regex_reaching_postgres_raises_regex_invalid_error(
+    seeded: Seeded,
+) -> None:
+    # The repo: filter site (compiler.py's `repo:` lowering) compiles to a `~*` predicate too,
+    # so an invalid pattern there is the same fault class as a bare Regex atom.
+    with pytest.raises(RegexInvalidError, match="invalid regular expression"):
+        grep_search(seeded.conn, "repo:[ foo")
 
 
 # ----------------------------------------------------------------- 7. byte cap -> truncated

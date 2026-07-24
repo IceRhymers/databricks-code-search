@@ -169,6 +169,12 @@ async def api_search(
     content. That NUL then reaches a bound SQL parameter in the resumed candidate scan, where
     Postgres itself rejects it (``sqlalchemy.exc.DataError``: "PostgreSQL text fields cannot
     contain NUL (0x00) bytes"), 500ing an attacker-controlled input instead of 400ing it.
+
+    A Postgres-invalid regex pattern (``/regex/``, ``repo:``, ``file:``, or ``sym:`` -- e.g.
+    ``/[/``) is a DIFFERENT case: it never reaches this route as a raw exception at all --
+    :func:`service.search_code_payload` maps it internally to the ``regex_invalid`` field (see
+    ``app/search/errors.py``'s ``RegexInvalidError``), so the check below inspects the payload
+    exactly like the ``query_parse_error`` check, rather than an ``except`` clause.
     """
     clamped = service.clamp_limit(limit, cfg)
     try:
@@ -179,6 +185,8 @@ async def api_search(
         raise HTTPException(status_code=400, detail={"error": str(error)}) from error
     except DataError as error:
         raise HTTPException(status_code=400, detail={"error": "invalid parameter"}) from error
+    if payload["regex_invalid"] is not None:
+        raise HTTPException(status_code=400, detail={"error": payload["regex_invalid"]})
     if payload["query_parse_error"] is not None:
         raise HTTPException(status_code=400, detail={"error": payload["query_parse_error"]})
     return payload
@@ -257,18 +265,25 @@ async def api_semantic(
     ``reason`` naming the remedy), or a query with nothing left to embed after filters are
     excised (``nothing_to_embed`` + ``reason``) -- all pass through unchanged as 200 bodies with
     ``results: []``/``count: 0``: recoverable conditions are payload fields, never HTTP errors
-    (mirrors ``app/main.py``'s dispatch contract). Only malformed input and backend faults
-    become HTTP errors: a NUL byte in ``q``/``branch`` reaching a bound SQL parameter raises
-    ``DataError`` -> 400 (same rationale as the existing routes); anything else (e.g. the
-    embedding endpoint's SDK/auth/network failures, which are arbitrary exception types) is
-    logged with a full traceback server-side and mapped to a generic 502 so a raw error body
-    never echoes endpoint/host detail (mirrors ``ready()``'s no-leak policy).
+    (mirrors ``app/main.py``'s dispatch contract) -- EXCEPT ``regex_invalid``: a Postgres-invalid
+    ``repo:``/``file:`` filter pattern (e.g. ``repo:[``) is mapped to a 400 with the Postgres
+    message, mirroring ``/api/search``'s ``regex_invalid`` check (D5) -- the filter values are
+    matched as Postgres regexes even though the surrounding query is natural-language prose,
+    so a rejected pattern is malformed input, not a ranking outcome. Every other malformed
+    input and backend fault becomes an HTTP error too: a NUL byte in ``q``/``branch`` reaching a
+    bound SQL parameter raises ``DataError`` -> 400 (same rationale as the existing routes);
+    anything else (e.g. the embedding endpoint's SDK/auth/network failures, which are arbitrary
+    exception types) is logged with a full traceback server-side and mapped to a generic 502 so
+    a raw error body never echoes endpoint/host detail (mirrors ``ready()``'s no-leak policy).
     """
     clamped = service.clamp_limit(limit, cfg)
     try:
-        return await _run_blocking(
+        payload = await _run_blocking(
             lambda: service.semantic_search_payload(engine, cfg, q, clamped, branch)
         )
+        if payload.get("regex_invalid") is not None:
+            raise HTTPException(status_code=400, detail={"error": payload["regex_invalid"]})
+        return payload
     except DataError as error:
         raise HTTPException(status_code=400, detail={"error": "invalid parameter"}) from error
     except Exception as error:

@@ -23,10 +23,10 @@ deliberate divergences from that reference are load-bearing:
    shutdown via ``atexit``; the per-session lifespan only *references* it and never disposes.
 
 Recoverable conditions (``truncated``, ``query_too_broad``, ``query_parse_error``,
-``regex_incompatible``, ``no_content_atom``, ``zero_width_only_atoms``) are structured payload
-fields, never exceptions; only genuinely unexpected faults reach the ``_dispatch``
-choke-point, which logs a full traceback and re-raises (never swallows). Output shapes are
-pinned to the zoekt parity assertions in ``tests/unit/test_main.py``.
+``regex_incompatible``, ``regex_invalid``, ``no_content_atom``, ``zero_width_only_atoms``) are
+structured payload fields, never exceptions; only genuinely unexpected faults reach the
+``_dispatch`` choke-point, which logs a full traceback and re-raises (never swallows). Output
+shapes are pinned to the zoekt parity assertions in ``tests/unit/test_main.py``.
 """
 
 from __future__ import annotations
@@ -105,6 +105,9 @@ def _signals(payload: dict[str, Any]) -> dict[str, Any]:
         "truncated": payload.get("truncated"),
         "query_too_broad": payload.get("query_too_broad"),
         "query_parse_error": payload.get("query_parse_error"),
+        # Without this, a Postgres-rejected regex is log-indistinguishable from a genuine
+        # zero-result query.
+        "regex_invalid": payload.get("regex_invalid"),
         # Query-shape signals: a filter-only or all-zero-width query returns zero files
         # legitimately, so without these a shape problem is indistinguishable in the logs
         # from a genuine no-match.
@@ -243,15 +246,19 @@ async def search_code(
     ``branch``/``commit`` are convenience params equivalent to appending ``branch:"<value>"`` /
     ``commit:<value>`` to ``query``. ``limit`` caps the number of files scanned (clamped to a
     server maximum). Recoverable conditions surface as fields (``query_parse_error``,
-    ``query_too_broad``, ``truncated``, ``regex_incompatible``, ``no_content_atom``,
-    ``zero_width_only_atoms``). The last two explain an empty result that is NOT a true negative:
-    ``no_content_atom`` means the query carried no affirmative content atom to highlight --
-    either a filter-only query (e.g. ``lang:go`` alone) or one that is entirely negated (e.g.
-    ``-foo`` alone: an exclusion is never a highlight) -- and ``zero_width_only_atoms`` means
-    every atom it carried matches zero-width (e.g. ``/^/``). A query mixing content with an
-    exclusion (e.g. ``foo -bar``) highlights only the affirmative term; excluded terms never
-    appear as matches. ``no_content_atom`` does not distinguish "no atom at all" from "fully
-    negated" -- recover which one it was from the echoed ``query`` field, if it matters.
+    ``query_too_broad``, ``truncated``, ``regex_incompatible``, ``regex_invalid``,
+    ``no_content_atom``, ``zero_width_only_atoms``). The middle two explain an empty result
+    that is NOT a true negative: ``no_content_atom`` means the query carried no affirmative
+    content atom to highlight -- either a filter-only query (e.g. ``lang:go`` alone) or one
+    that is entirely negated (e.g. ``-foo`` alone: an exclusion is never a highlight) -- and
+    ``zero_width_only_atoms`` means every atom it carried matches zero-width (e.g. ``/^/``). A
+    query mixing content with an exclusion (e.g. ``foo -bar``) highlights only the affirmative
+    term; excluded terms never appear as matches. ``no_content_atom`` does not distinguish "no
+    atom at all" from "fully negated" -- recover which one it was from the echoed ``query``
+    field, if it matters. ``regex_invalid`` carries the Postgres error message when a
+    ``/regex/``, ``repo:``, ``file:``, or ``sym:`` pattern is not a valid Postgres POSIX ARE
+    (e.g. ``/[/``) -- distinct from ``regex_incompatible``, which means Python ``re`` (not
+    Postgres) rejected an otherwise-valid pattern and only degrades highlighting.
     """
     lc = ctx.request_context.lifespan_context
     engine, cfg = lc["engine"], lc["config"]
@@ -289,6 +296,11 @@ async def semantic_search(
     embedding or database work -- a negated query is never silently embedded with the ``-``
     stripped or reinterpreted). A query that is only filters, or empty/whitespace-only, leaves
     nothing to embed and returns ``nothing_to_embed: true`` with no embedding call made.
+
+    ``repo:``/``file:`` filter values ARE matched as Postgres regular expressions (unlike a
+    bare token, which is only rejected if written ``/like/this/``): a Postgres-invalid pattern
+    there (e.g. ``repo:[``) returns ``regex_invalid`` set to the Postgres error message, with a
+    remedy in ``reason`` -- fix the pattern rather than resubmitting the query verbatim.
 
     ``branch`` is sugar for a ``branch:`` atom -- conjunctive with any ``branch:`` atom already
     in ``query`` (mirrors ``search_code``'s ``branch`` param) -- restricting to files whose

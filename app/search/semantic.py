@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql.elements import TextClause
 
 from app.config import Settings
@@ -51,6 +52,7 @@ from app.query.semantic_filters import (
     UnsupportedSemanticAtomError,
     split_semantic_query,
 )
+from app.search.errors import RegexInvalidError, reraise_or_recoverable
 
 if TYPE_CHECKING:
     from app.embed import EmbedFn
@@ -379,6 +381,23 @@ def _semantic_unsupported_filter_payload(
     }
 
 
+def _semantic_regex_invalid_payload(query: str, error: RegexInvalidError) -> dict[str, Any]:
+    """A ``repo:``/``file:`` filter value Postgres rejects as an invalid POSIX ARE (e.g.
+    ``repo:[``). Filter atoms are matched as regexes even though the surrounding query is
+    natural-language prose, so this is malformed input, mirroring
+    :func:`_semantic_unsupported_filter_payload`'s conditional-key + remedy-bearing-``reason``
+    shape."""
+    return {
+        "query": query,
+        "semantic_enabled": True,
+        "results": [],
+        "count": 0,
+        "regex_invalid": str(error),
+        "reason": "repo:/file: filter values are matched as POSIX regexes by Postgres; fix the "
+        "pattern",
+    }
+
+
 def _semantic_nothing_to_embed_payload(query: str, *, has_filters: bool) -> dict[str, Any]:
     """Empty residual: no embedding call is made. Wording branches on WHY it is empty --
     filters consumed everything vs. there was never any text -- so the caller sees why."""
@@ -417,7 +436,15 @@ def _semantic_search_payload(
     query). Only past all three does it probe the schema, lazily build the embedder, embed the
     RESIDUAL text (not the raw query) OUTSIDE the DB transaction (no network call inside
     ``conn.begin()``), then run the RRF query under a transaction-local ``statement_timeout``
-    and join the fused ids back to ``chunks -> files -> repos``.
+    and join the fused ids back to ``chunks -> files -> repos``. The RRF execute is wrapped in
+    ``except DBAPIError: reraise_or_recoverable(error)`` (issue #75): a Postgres-invalid
+    ``repo:``/``file:`` filter pattern (e.g. ``repo:[``) maps to :class:`RegexInvalidError` ->
+    the ``regex_invalid`` payload field (see :func:`_semantic_regex_invalid_payload`).
+    Acknowledged side effect: this site previously had no ``except`` clause at all, so a
+    ``statement_timeout`` cancellation here now surfaces as :class:`QueryTooBroadError` instead
+    of a raw ``OperationalError`` -- still uncaught by this function, so the outward behavior
+    (an unhandled MCP fault / webui 502) is unchanged; mapping semantic timeouts to a
+    recoverable field is out of #75's scope.
 
     ``branch`` (unified with in-query ``branch:`` atoms): sugar for a ``branch:`` atom,
     conjunctive with any already in ``query``. No value anywhere scopes each leg to its chunk's
@@ -472,10 +499,18 @@ def _semantic_search_payload(
     }
     params.update(filter_params(filters, branch))
 
-    with engine.connect() as conn:
-        with conn.begin():
-            conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(cfg.statement_timeout_ms)}")
-            rows = conn.execute(build_hybrid_rrf_sql(filters, branch), params).all()
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.exec_driver_sql(
+                    f"SET LOCAL statement_timeout = {int(cfg.statement_timeout_ms)}"
+                )
+                try:
+                    rows = conn.execute(build_hybrid_rrf_sql(filters, branch), params).all()
+                except DBAPIError as error:
+                    reraise_or_recoverable(error)
+    except RegexInvalidError as error:
+        return _semantic_regex_invalid_payload(query, error)
 
     results = [
         {

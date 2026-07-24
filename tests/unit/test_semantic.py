@@ -14,8 +14,10 @@ import re
 import sys
 from typing import Any
 
+import psycopg
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DataError
 
 from app.config import Settings
 from app.query.compiler import compile_query
@@ -357,6 +359,17 @@ class _FakeConn:
         return self._results.pop(0)
 
 
+class _RaisingResult:
+    """A canned ``execute()`` result whose ``.all()`` raises -- simulates a raw DBAPIError
+    surfacing from the RRF execute, e.g. an invalid regex or a statement_timeout cancellation."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def all(self) -> list[Any]:
+        raise self._error
+
+
 class _FakeEngine:
     def __init__(self, results: list[Any]) -> None:
         self._conn = _FakeConn(results)
@@ -480,6 +493,34 @@ def test_similarity_null_for_null_cosine_distance(monkeypatch: pytest.MonkeyPatc
 
     assert payload["results"][0]["similarity"] is None
     assert payload["results"][0]["rrf_score"] == 0.3
+
+
+@pytest.mark.unit
+def test_regex_invalid_repo_filter_maps_to_recoverable_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A Postgres-invalid repo:/file: filter pattern (e.g. repo:[) reaches the RRF execute as a
+    # DataError wrapping InvalidRegularExpression; reraise_or_recoverable maps it to
+    # RegexInvalidError, and _semantic_search_payload maps THAT to the regex_invalid payload
+    # field (D6) -- never an uncaught exception.
+    monkeypatch.setattr(semantic, "get_embedder", lambda cfg: lambda texts: [[0.1, 0.2]])
+    orig = psycopg.errors.InvalidRegularExpression(
+        "invalid regular expression: brackets [] not balanced"
+    )
+    engine = _FakeEngine(
+        [
+            _FakeResult(["chunks"]),
+            _RaisingResult(DataError("SELECT 1", {}, orig)),
+        ]
+    )
+
+    payload = semantic._semantic_search_payload(engine, _cfg(enabled=True), "repo:[ auth flow", 50)
+
+    assert payload["semantic_enabled"] is True
+    assert payload["results"] == []
+    assert payload["count"] == 0
+    assert payload["regex_invalid"] == "invalid regular expression: brackets [] not balanced"
+    assert "reason" in payload
 
 
 # ------------------------------------------------------------- filter-semantics: payload shaping

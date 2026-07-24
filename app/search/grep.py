@@ -69,13 +69,13 @@ Caveats (load-bearing, documented, never silently wrong):
   wraps the predicate in ``not_(...)``, it does not validate the pattern), so a
   Postgres-invalid POSIX ARE such as ``/[/`` reaches the database whether the atom is written
   as ``/[/`` or ``-/[/``. Postgres raises ``InvalidRegularExpression`` (SQLSTATE class 22, a
-  Data Exception), which SQLAlchemy surfaces as ``sqlalchemy.exc.DataError`` -- a different
-  class from the ``OperationalError`` :func:`app.search.errors.reraise_or_query_too_broad`
-  catches, so it never reaches that mapper at all and propagates straight out of
-  ``grep_search`` uncaught, exactly like any other unexpected fault (``app/main.py``'s
-  ``_dispatch`` logs the traceback and re-raises). This is polarity-independent and
-  pre-existing (true for ``/[/`` before negation shipped, and unchanged by it): grep only
-  ever skips a negated broken regex's Python-side highlight compilation (see
+  Data Exception), which SQLAlchemy surfaces as ``sqlalchemy.exc.DataError``. This module's
+  raw-execution sites catch the common :class:`~sqlalchemy.exc.DBAPIError` ancestor and route
+  it through :func:`app.search.errors.reraise_or_recoverable`, which maps it to a typed
+  :class:`~app.search.errors.RegexInvalidError` -- the service layer (``app/service.py``)
+  turns that into the ``regex_invalid`` payload field, never an uncaught fault. This is
+  polarity-independent (true for ``/[/`` whether the atom is written as ``/[/`` or ``-/[/``):
+  grep only ever skips a negated broken regex's Python-side highlight compilation (see
   :func:`_collect_matchers`); the SQL predicate is compiled server-side regardless.
 
 Byte offsets are UTF-8, line-local, half-open ``[start, end)``: for a :class:`LineMatch`,
@@ -91,7 +91,7 @@ from dataclasses import dataclass
 from typing import NamedTuple, assert_never
 
 from sqlalchemy import Connection, select, text, tuple_
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 
 from app.db.models import File
 from app.query.compiler import DEFAULT_ROW_LIMIT, compile_query
@@ -111,7 +111,7 @@ from app.query.parser import (
     parse,
     resolve_case,
 )
-from app.search.errors import reraise_or_query_too_broad
+from app.search.errors import reraise_or_recoverable
 
 # 8 MiB of content pulled/scanned per request (aggregate across files).
 DEFAULT_MAX_CONTENT_BYTES = 8 * 1024 * 1024
@@ -178,7 +178,8 @@ class FileMatches:
 @dataclass(frozen=True)
 class GrepResult:
     """A grep result. ``truncated`` (with ``truncation_reason``) flags a partial result;
-    a total failure raises :class:`QueryTooBroadError` instead of returning.
+    a total failure raises :class:`QueryTooBroadError` or
+    :class:`~app.search.errors.RegexInvalidError` instead of returning.
 
     ``no_content_atom`` and ``zero_width_only_atoms`` are raw structural facts about this leg
     only. grep reports; it does not know whether a second leg answered the query -- a
@@ -427,9 +428,10 @@ def grep_search(
 
     A per-request ``statement_timeout`` bounds DB time (a cancellation raises
     :class:`QueryTooBroadError`); ``max_content_bytes`` bounds app memory / aggregate bytes
-    scanned (a cap sets ``truncated`` + ``truncation_reason``). See the module docstring for
-    the NOT-RE2 and uncapped-Python-CPU caveats. Raises ``QueryParseError`` on a malformed
-    query (propagated from :func:`parse`).
+    scanned (a cap sets ``truncated`` + ``truncation_reason``). A Postgres-invalid regex
+    pattern (any polarity) raises :class:`~app.search.errors.RegexInvalidError`. See the
+    module docstring for the NOT-RE2 and uncapped-Python-CPU caveats. Raises
+    ``QueryParseError`` on a malformed query (propagated from :func:`parse`).
 
     ``cursor`` activates pagination mode when supplied at all, including ``None`` (page 1): a
     plain row-cap fill then reports ``truncated=False`` plus a non-null
@@ -469,8 +471,8 @@ def grep_search(
 
         try:
             rows = conn.execute(stmt).all()
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
 
         # `>=` deliberately over-warns on an exact fit (row_limit files that are exactly all
         # of them still report truncated -- an accepted, conservative false-positive).
@@ -542,8 +544,8 @@ def grep_search(
                             tuple(line_matches),
                         )
                     )
-        except OperationalError as error:
-            reraise_or_query_too_broad(error)
+        except DBAPIError as error:
+            reraise_or_recoverable(error)
         finally:
             result.close()
 

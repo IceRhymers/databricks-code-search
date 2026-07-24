@@ -22,7 +22,7 @@ from sqlalchemy import Connection, insert, text
 
 from app.db.client import create_db_engine
 from app.db.models import Base, File, Repo, Symbol
-from app.search.errors import QueryTooBroadError
+from app.search.errors import QueryTooBroadError, RegexInvalidError
 from app.search.symbols import SymbolResult, symbol_search
 from indexer.hashing import content_sha
 
@@ -294,6 +294,15 @@ def test_tiny_statement_timeout_raises_query_too_broad(seeded: Seeded) -> None:
     seeded.conn.commit()
     with pytest.raises(QueryTooBroadError):
         _search(seeded.conn, "sym:blobsym /zq/", statement_timeout_ms=1)
+
+
+@pytest.mark.integration
+def test_invalid_sym_pattern_raises_regex_invalid_error(seeded: Seeded) -> None:
+    # The compiler's sym: lowering compiles to the SAME `~`/`~*` predicate as a bare Regex
+    # atom (issue #75), so a Postgres-invalid pattern raises RegexInvalidError from the
+    # candidate-selection step, never an uncaught DataError.
+    with pytest.raises(RegexInvalidError, match="invalid regular expression"):
+        _search(seeded.conn, "sym:[")
 
 
 # ------------------------------------------------------------------- branch scoping (0003)

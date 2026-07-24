@@ -220,8 +220,9 @@ Unsupported syntax. Most of these raise; the first is silent and therefore more 
 
 Two different engines run in sequence, and neither is zoekt's RE2:
 
-1. Postgres POSIX ARE (`~` / `~*`) selects which files match. Invalid patterns surface as
-   a query-time database error, not a parse error.
+1. Postgres POSIX ARE (`~` / `~*`) selects which files match. An invalid pattern (any
+   polarity) surfaces as the recoverable `regex_invalid` payload field carrying the
+   Postgres message, not a parse error and not a failed tool call.
 2. Python `re` rescans those files to produce the highlighted line matches.
 
 The practical consequences: `^` and `$` are line anchors and `.` never crosses lines;
@@ -265,9 +266,12 @@ never the literal string `"HEAD"` unless that is genuinely the resolved branch (
 repo with no `default_branch` recorded).
 
 Recoverable conditions come back as payload fields —
-`query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`,
+`query_parse_error`, `query_too_broad`, `truncated`, `regex_incompatible`, `regex_invalid`,
 `no_content_atom`, `zero_width_only_atoms`, `commit_not_indexed` — rather than errors, so
-an agent can react without a failed tool call. Pagination rides the same envelope as
+an agent can react without a failed tool call. `regex_invalid` is distinct from
+`regex_incompatible`: the latter means Python `re` (not Postgres) rejected an otherwise-valid
+pattern and only degrades highlighting; `regex_invalid` means Postgres rejected the pattern
+outright and the query did not run. Pagination rides the same envelope as
 `next_cursor`, and the semantic tool adds its own status fields (`semantic_enabled`,
 `semantic_schema_missing`).
 
