@@ -29,6 +29,7 @@ function MatchLine({
           {match.symbols.map((sym, i) => (
             <span key={i}>
               <mark>{sym.name}</mark> <span className="lang">({sym.kind})</span>{" "}
+              <a href={`/references?symbol=${encodeURIComponent(sym.name)}`}>refs</a>{" "}
             </span>
           ))}
         </span>

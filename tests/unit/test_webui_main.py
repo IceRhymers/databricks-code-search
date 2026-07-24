@@ -12,6 +12,7 @@ its OWN module globals regardless of which app calls it.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import pytest
@@ -21,7 +22,7 @@ from sqlalchemy.exc import DataError
 from app import service
 from app.config import Settings
 from app.search.grep import FileCursor, FileMatches, GrepResult, LineMatch
-from webui.main import app, get_engine, get_settings
+from webui.main import api_imports, api_references, app, get_engine, get_settings
 
 _NUL_BYTE_ERROR = DataError(
     "SELECT 1", {}, ValueError("PostgreSQL text fields cannot contain NUL (0x00) bytes")
@@ -648,6 +649,318 @@ def test_api_semantic_status_true_when_enabled() -> None:
         app.dependency_overrides.clear()
     assert resp.status_code == 200
     assert resp.json() == {"semantic_enabled": True}
+
+
+# ---------------------------------------------------------------------------- /api/references
+
+
+@pytest.mark.unit
+def test_api_references_payload_passes_through_byte_identical(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "query": "process",
+        "kind": "references",
+        "symbol": "process",
+        "branch": None,
+        "query_too_broad": False,
+        "sites": [
+            {
+                "repo": "acme/widgets",
+                "file": "src/handler.go",
+                "line": 10,
+                "edge_kind": "call",
+                "target_name": "process",
+                "enclosing_symbol": {"name": "Handle", "kind": "function"},
+                "resolution": "ambiguous",
+                "candidate_count": 2,
+                "candidates_truncated": False,
+                "candidates": [
+                    {
+                        "repo": "acme/widgets",
+                        "file": "src/proc.go",
+                        "line": 4,
+                        "name": "process",
+                        "kind": "function",
+                        "same_repo": True,
+                        "same_file": False,
+                        "kind_match": True,
+                    },
+                    {
+                        "repo": "acme/other",
+                        "file": "lib/proc.go",
+                        "line": 9,
+                        "name": "process",
+                        "kind": "function",
+                        "same_repo": False,
+                        "same_file": False,
+                        "kind_match": True,
+                    },
+                ],
+            }
+        ],
+        "site_count": 1,
+        "resolution_summary": {"unique": 0, "ambiguous": 1, "unresolved": 0},
+        "truncated": False,
+        "truncation_reason": None,
+    }
+    monkeypatch.setattr(service, "find_references_payload", lambda *a, **k: payload)
+
+    resp = client.get("/api/references", params={"symbol": "process"})
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+
+
+@pytest.mark.unit
+def test_api_references_limit_default_and_clamp_and_branch_threading(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, int, str | None]] = []
+
+    def _fake(
+        _engine: Any, _cfg: Any, name: str, limit: int, branch: str | None = None
+    ) -> dict[str, Any]:
+        calls.append((name, limit, branch))
+        return {
+            "query": name,
+            "kind": "references",
+            "symbol": name,
+            "branch": branch,
+            "query_too_broad": False,
+            "sites": [],
+            "site_count": 0,
+            "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+            "truncated": False,
+            "truncation_reason": None,
+        }
+
+    monkeypatch.setattr(service, "find_references_payload", _fake)
+
+    client.get("/api/references", params={"symbol": "process"})
+    client.get("/api/references", params={"symbol": "process", "limit": 0})
+    client.get("/api/references", params={"symbol": "process", "limit": 5000})
+    client.get("/api/references", params={"symbol": "process", "branch": "feature/x"})
+
+    assert calls[0] == ("process", 200, None)
+    assert calls[1] == ("process", 200, None)  # 0 -> cfg.row_limit (200)
+    assert calls[2] == ("process", 1000, None)  # clamped to cfg.max_row_limit
+    assert calls[3] == ("process", 200, "feature/x")
+
+    # Silent drift between the route's and the MCP tool's `limit` default would break AC2
+    # (same defaulted call must return the same result set) without any test noticing --
+    # pin the default itself, not just its observed clamped value.
+    from app import main as mcp_main
+
+    route_default = inspect.signature(api_references).parameters["limit"].default
+    mcp_default = inspect.signature(mcp_main.find_references).parameters["limit"].default
+    assert route_default == mcp_default == 200
+
+
+@pytest.mark.unit
+def test_api_references_missing_symbol_is_422(client: TestClient) -> None:
+    resp = client.get("/api/references")
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.unit
+def test_api_references_nul_byte_is_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _raise(*_a: object, **_k: object) -> dict[str, Any]:
+        raise _NUL_BYTE_ERROR
+
+    monkeypatch.setattr(service, "find_references_payload", _raise)
+
+    resp = client.get("/api/references", params={"symbol": "foo\x00bar"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "invalid parameter"
+
+
+# -------------------------------------------------------------------------------- /api/imports
+
+
+@pytest.mark.unit
+def test_api_imports_payload_passes_through_byte_identical(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "query": "acme/widgets",
+        "kind": "imports",
+        "direction": "imports",
+        "repo": "acme/widgets",
+        "repo_known": True,
+        "target": None,
+        "branch": None,
+        "query_too_broad": False,
+        "sites": [
+            {
+                "repo": "acme/widgets",
+                "file": "src/handler.py",
+                "line": 1,
+                "edge_kind": "import",
+                "target_name": "os.path",
+                "enclosing_symbol": None,
+                "resolution": "unresolved",
+                "candidate_count": 0,
+                "candidates_truncated": False,
+                "candidates": [],
+            }
+        ],
+        "site_count": 1,
+        "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 1},
+        "truncated": False,
+        "truncation_reason": None,
+    }
+    monkeypatch.setattr(service, "list_imports_payload", lambda *a, **k: payload)
+
+    resp = client.get("/api/imports", params={"repo": "acme/widgets"})
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+
+
+@pytest.mark.unit
+def test_api_imports_validation_payloads_pass_through_as_200(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Proves D2's "no payload inspection" for /api/imports: every PRE-DB structured validation
+    # payload (app.service._list_imports_error_payload) round-trips as a 200 body, byte-identical,
+    # never re-shaped or gated by this route.
+    unsupported_direction_payload = {
+        "query": "",
+        "kind": "imports",
+        "direction": "sideways",
+        "repo": None,
+        "repo_known": True,
+        "target": None,
+        "branch": None,
+        "query_too_broad": False,
+        "sites": [],
+        "site_count": 0,
+        "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+        "truncated": False,
+        "truncation_reason": None,
+        "unsupported_direction": "sideways",
+        "reason": "direction must be one of 'imports' or 'imported_by'",
+    }
+    missing_repo_payload = {
+        "query": "",
+        "kind": "imports",
+        "direction": "imports",
+        "repo": None,
+        "repo_known": True,
+        "target": None,
+        "branch": None,
+        "query_too_broad": False,
+        "sites": [],
+        "site_count": 0,
+        "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+        "truncated": False,
+        "truncation_reason": None,
+        "missing_repo": True,
+        "reason": "direction='imports' requires a repo to enumerate; pass repo=",
+    }
+    missing_target_payload = {
+        "query": "",
+        "kind": "imports",
+        "direction": "imported_by",
+        "repo": None,
+        "repo_known": True,
+        "target": None,
+        "branch": None,
+        "query_too_broad": False,
+        "sites": [],
+        "site_count": 0,
+        "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+        "truncated": False,
+        "truncation_reason": None,
+        "missing_target": True,
+        "reason": "direction='imported_by' requires a target dotted path; pass target=",
+    }
+
+    for payload in (unsupported_direction_payload, missing_repo_payload, missing_target_payload):
+        monkeypatch.setattr(service, "list_imports_payload", lambda *a, _p=payload, **k: _p)
+
+        resp = client.get("/api/imports", params={"direction": payload["direction"]})
+
+        assert resp.status_code == 200
+        assert resp.json() == payload
+
+
+@pytest.mark.unit
+def test_api_imports_limit_default_clamp_and_arg_threading(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str | None, int, str | None, str | None, str]] = []
+
+    def _fake(
+        _engine: Any,
+        _cfg: Any,
+        repo: str | None,
+        limit: int,
+        branch: str | None = None,
+        *,
+        target: str | None = None,
+        direction: str = "imports",
+    ) -> dict[str, Any]:
+        calls.append((repo, limit, branch, target, direction))
+        return {
+            "query": repo or target or "",
+            "kind": "imports",
+            "direction": direction,
+            "repo": repo,
+            "repo_known": True,
+            "target": target,
+            "branch": branch,
+            "query_too_broad": False,
+            "sites": [],
+            "site_count": 0,
+            "resolution_summary": {"unique": 0, "ambiguous": 0, "unresolved": 0},
+            "truncated": False,
+            "truncation_reason": None,
+        }
+
+    monkeypatch.setattr(service, "list_imports_payload", _fake)
+
+    client.get("/api/imports", params={"repo": "acme/widgets"})
+    client.get("/api/imports", params={"repo": "acme/widgets", "limit": 0})
+    client.get("/api/imports", params={"repo": "acme/widgets", "limit": 5000})
+    client.get(
+        "/api/imports",
+        params={
+            "target": "os.path",
+            "direction": "imported_by",
+            "repo": "acme/widgets",
+            "branch": "feature/x",
+        },
+    )
+
+    assert calls[0] == ("acme/widgets", 200, None, None, "imports")
+    assert calls[1] == ("acme/widgets", 200, None, None, "imports")  # 0 -> cfg.row_limit (200)
+    assert calls[2] == ("acme/widgets", 1000, None, None, "imports")  # clamped
+    assert calls[3] == ("acme/widgets", 200, "feature/x", "os.path", "imported_by")
+
+    from app import main as mcp_main
+
+    route_default = inspect.signature(api_imports).parameters["limit"].default
+    mcp_default = inspect.signature(mcp_main.list_imports).parameters["limit"].default
+    assert route_default == mcp_default == 200
+
+
+@pytest.mark.unit
+def test_api_imports_nul_byte_is_400(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_k: object) -> dict[str, Any]:
+        raise _NUL_BYTE_ERROR
+
+    monkeypatch.setattr(service, "list_imports_payload", _raise)
+
+    resp = client.get("/api/imports", params={"repo": "foo\x00bar"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["error"] == "invalid parameter"
 
 
 # --------------------------------------------------------------------- security headers

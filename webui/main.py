@@ -280,6 +280,67 @@ async def api_semantic(
         ) from error
 
 
+async def api_references(
+    engine: EngineDep,
+    cfg: SettingsDep,
+    symbol: Annotated[str, Query(min_length=1)],
+    limit: Annotated[int, Query()] = 200,
+    branch: Annotated[str | None, Query()] = None,
+) -> dict[str, Any]:
+    """Candidate-set call sites of ``symbol`` corpus-wide -- pure passthrough to
+    :func:`app.service.find_references_payload`, the SAME builder the MCP ``find_references``
+    tool wraps (byte-identical payload at the same clamped ``limit``, see
+    ``docs/runbooks/webui.md``).
+
+    ``symbol`` requiring a non-empty value (422 on missing/empty) is a webui-layer HTTP input
+    guard, NOT shared builder semantics -- the MCP tool has no such gate and would run the
+    builder to an empty/unresolved payload instead. ``limit`` defaults to 200, matching the MCP
+    tool's default (not ``/api/search``'s ``0 -> row_limit`` convention). Recoverable conditions
+    (``query_too_broad``, ambiguous/unresolved sites, truncation) all pass through unchanged as
+    200 bodies -- this route never inspects the payload.
+    """
+    clamped = service.clamp_limit(limit, cfg)
+    try:
+        return await _run_blocking(
+            lambda: service.find_references_payload(engine, cfg, symbol, clamped, branch)
+        )
+    except DataError as error:
+        raise HTTPException(status_code=400, detail={"error": "invalid parameter"}) from error
+
+
+async def api_imports(
+    engine: EngineDep,
+    cfg: SettingsDep,
+    repo: Annotated[str | None, Query()] = None,
+    target: Annotated[str | None, Query()] = None,
+    direction: Annotated[str, Query()] = "imports",
+    limit: Annotated[int, Query()] = 200,
+    branch: Annotated[str | None, Query()] = None,
+) -> dict[str, Any]:
+    """Candidate-set ``import`` edge sites in one of two directions -- pure passthrough to
+    :func:`app.service.list_imports_payload`, the SAME builder the MCP ``list_imports`` tool
+    wraps (byte-identical payload at the same clamped ``limit``, see
+    ``docs/runbooks/webui.md``).
+
+    ``repo``/``target`` are optional at this HTTP layer: which one is required depends on
+    ``direction`` and is the builder's job to decide, returning a structured 200
+    (``missing_repo``/``missing_target``) rather than a 422 -- never gate on them here. An
+    unknown ``direction`` is passed through verbatim and returns the builder's structured
+    ``unsupported_direction`` 200. ``limit`` defaults to 200, matching the MCP tool's default.
+    This route never inspects the payload; all recoverable conditions pass through as 200
+    bodies.
+    """
+    clamped = service.clamp_limit(limit, cfg)
+    try:
+        return await _run_blocking(
+            lambda: service.list_imports_payload(
+                engine, cfg, repo, clamped, branch, target=target, direction=direction
+            )
+        )
+    except DataError as error:
+        raise HTTPException(status_code=400, detail={"error": "invalid parameter"}) from error
+
+
 # ----------------------------------------------------------------------- security headers
 
 
@@ -315,6 +376,8 @@ def create_app() -> FastAPI:
     app.get("/api/repos")(api_repos)
     app.get("/api/semantic/status")(api_semantic_status)
     app.get("/api/semantic")(api_semantic)
+    app.get("/api/references")(api_references)
+    app.get("/api/imports")(api_imports)
 
     if _FRONTEND_DIST.is_dir():
         app.mount("/", SPAStaticFiles(directory=_FRONTEND_DIST, html=True), name="spa")
