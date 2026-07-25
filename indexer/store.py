@@ -176,6 +176,12 @@ def index_repo(
 
        * **unchanged** (the pair is already on a row carrying this branch): no
          statement at all.
+       * **membership-only** (the pair is stored for this repo but on a row this
+         branch does not carry, AND statement 4 proves every branch of this repo
+         is at the current semantics version): no symbol/edge work; the whole
+         class is unioned in by ONE batched ``UPDATE ... RETURNING`` after the
+         loop, which also supplies the ``file_id`` for its ``chunk_writer`` call
+         (see :func:`_union_membership`).
        * **changed/new** (everything else): an array-union upsert on
          ``uq_files_repo_path_sha`` -- a file whose content already exists under
          another branch gets THIS branch unioned into its ``branches`` array (one
@@ -220,6 +226,10 @@ def index_repo(
       COMPLETED run, and that run ran at ``baseline_version ==
       INDEX_SEMANTICS_VERSION``. In it the row was either written full-path (so
       it is current), or skipped as unchanged (current, by induction).
+    * ... or acquired membership-only, which
+      :func:`_repo_is_wholly_at_current_version` only permits when every branch
+      of the repo is at the current version (so every surviving row of the repo
+      was last written at it).
     * Base case: the first run after ANY version transition has
       ``baseline_version != INDEX_SEMANTICS_VERSION``, so it is full-path for
       every parsed file. A zero-parse run cannot manufacture a spurious base
@@ -278,13 +288,22 @@ def index_repo(
         )
         baseline_commit, baseline_version = conn.execute(branch_stmt).one()
 
-        # Statements 3a/3b, issued only behind the delta gate. Everything the
+        # Statements 3a/3b/4, issued only behind the delta gate. Everything the
         # classification below needs is now in hand; nothing else is read.
         delta_on = baseline_version == INDEX_SEMANTICS_VERSION
         carried: set[tuple[str, str]] = set()
         present: set[tuple[str, str]] = set()
+        membership_ok = False
         if delta_on:
             carried, present = read_repo_content_shas(conn, repo_id=repo_id, branch=branch)
+            membership_ok = _repo_is_wholly_at_current_version(conn, repo_id=repo_id)
+
+        # (pf, content_sha) for each membership-only file, held until the batched
+        # UPDATE below can hand back their file ids. A bounded exception to the
+        # "items stream through the transaction" rule: membership-only is the
+        # rare class (a branch ACQUIRING content another branch already stored),
+        # not the steady state, and chunk_writer's seam takes the ParsedFile.
+        membership: list[tuple[ParsedFile, str]] = []
 
         for pf, ex in items:
             sha = content_sha(pf.content)
@@ -299,6 +318,14 @@ def index_repo(
                 # Unchanged: this exact content is already stored on a row this
                 # branch already carries. No file upsert, no symbol/edge
                 # delete-reinsert, no chunk_writer call.
+                continue
+
+            if membership_ok and (pf.path, sha) in present:
+                # Membership-only: the row exists (written by another branch) but
+                # does not carry this branch yet. Statement 4 has proven every
+                # branch of this repo is at the current semantics version, so its
+                # symbols/edges are current and only the array union is owed.
+                membership.append((pf, sha))
                 continue
 
             file_stmt = (
@@ -380,6 +407,18 @@ def index_repo(
             if chunk_writer is not None:
                 chunk_writer(conn, repo_id, file_id, pf)
 
+        # ONE statement for the whole membership-only class, skipped entirely
+        # when that class is empty (rather than issued as a no-op) so the
+        # statement inventory stays stable and greppable.
+        if membership:
+            _union_membership(
+                conn,
+                repo_id=repo_id,
+                branch=branch,
+                membership=membership,
+                chunk_writer=chunk_writer,
+            )
+
         # Timed into indexer.job's ambient per-branch PhaseTimer, if one is
         # installed -- a no-op otherwise, so a direct index_repo call (tests,
         # scripts) is unaffected. Deliberately NOT a return value: IndexCounts is
@@ -410,6 +449,92 @@ def index_repo(
         )
 
     return IndexCounts(files=file_count, symbols=symbol_count, swept=swept, edges=edge_count)
+
+
+def _repo_is_wholly_at_current_version(conn: Connection, *, repo_id: int) -> bool:
+    """Statement 4: is EVERY ``repo_branches`` row for this repo at the current version?
+
+    The provenance gate the membership-only class depends on, and the hole
+    ``(path, content_sha)`` alone does not close. Counter-example it exists for:
+    branch ``b`` is stamped at the current version (delta on); sibling branch
+    ``a`` was written at an OLDER version and has not re-indexed since. ``b``'s
+    HEAD moves and acquires a file whose exact ``(path, content)`` already exists
+    as ``a``'s stale-version row. Taking the membership-only path would skip the
+    symbol/edge rewrite, so ``b`` would serve old-extractor symbols under a
+    current-version stamp -- silently, and exactly the failure
+    ``INDEX_SEMANTICS_VERSION`` exists to prevent.
+
+    Given this gate, every surviving ``files`` row of the repo was last written
+    at the current version: every row carries at least one branch (both sweep
+    sites delete rows at ``cardinality(branches) = 0``), and every branch string
+    on a ``branches`` array has a ``repo_branches`` row (``index_repo`` writes
+    statement 2 before any file row for that branch, and
+    ``reconcile_retired_branches`` deletes both in one transaction). Both
+    directions are load-bearing and both are pinned by tests.
+    """
+    return bool(
+        conn.execute(
+            text(
+                "SELECT NOT EXISTS (SELECT 1 FROM repo_branches "
+                "WHERE repo_id = :repo_id "
+                "AND index_semantics_version IS DISTINCT FROM :version)"
+            ),
+            {"repo_id": repo_id, "version": INDEX_SEMANTICS_VERSION},
+        ).scalar_one()
+    )
+
+
+def _union_membership(
+    conn: Connection,
+    *,
+    repo_id: int,
+    branch: str,
+    membership: list[tuple[ParsedFile, str]],
+    chunk_writer: ChunkWriter | None,
+) -> None:
+    """Union ``branch`` into every membership-only row in ONE statement, then write their chunks.
+
+    ``array_agg(DISTINCT ...)`` rather than ``||`` alone so the stored array
+    stays sorted-distinct, matching ``index_repo``'s per-file upsert idiom --
+    existing assertions compare ``branches`` by value.
+
+    ``RETURNING id, path, content_sha`` supplies each row's ``file_id`` without a
+    second lookup, which is what makes the ``chunk_writer`` call below possible.
+    **Membership-only DOES write chunks** even though it writes no symbols or
+    edges: the acquired row may legitimately have zero chunk rows (the branch
+    that first wrote it ran semantic-off, or its precompute failed), and skipping
+    the write would make that gap permanent for the acquiring branch where the
+    full path would have filled it. The vectors are already in hand -- ``job.py``
+    embeds every file the advisory read did not call unchanged.
+    """
+    paths = [pf.path for pf, _sha in membership]
+    shas = [sha for _pf, sha in membership]
+    rows = conn.execute(
+        text(
+            "UPDATE files SET branches = (SELECT array_agg(DISTINCT e) FROM "
+            "unnest(files.branches || CAST(:branch_arr AS text[])) e) "
+            "WHERE repo_id = :repo_id "
+            "AND EXISTS (SELECT 1 FROM unnest(CAST(:paths AS text[]), CAST(:shas AS text[])) "
+            "AS t(p, s) WHERE t.p = files.path AND t.s = files.content_sha) "
+            "RETURNING id, path, content_sha"
+        ),
+        {"repo_id": repo_id, "branch_arr": [branch], "paths": paths, "shas": shas},
+    ).all()
+
+    if chunk_writer is None:
+        return
+    file_ids = {(row.path, row.content_sha): row.id for row in rows}
+    for pf, sha in membership:
+        file_id = file_ids.get((pf.path, sha))
+        if file_id is None:
+            # Unreachable while the single-writer invariant holds: the row was in
+            # statement 3b's projection moments ago, inside this transaction.
+            logger.warning(
+                "membership-only row for %s vanished before its union; skipping its chunk write",
+                pf.path,
+            )
+            continue
+        chunk_writer(conn, repo_id, file_id, pf)
 
 
 def _sweep_membership(

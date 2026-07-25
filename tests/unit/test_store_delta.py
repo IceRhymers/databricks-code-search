@@ -251,6 +251,7 @@ def test_delta_on_all_unchanged_writes_nothing() -> None:
         "repo-branches-insert",
         "read-carried",
         "read-present",
+        "provenance-gate",
         "sweep-update",
         "sweep-delete",
         "stamp",
@@ -295,6 +296,127 @@ def test_changed_content_at_a_known_path_takes_the_full_path() -> None:
     assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=1)
 
 
+# --- Membership-only: one batched union, a chunk write, no symbol/edge work ---
+
+
+@pytest.mark.unit
+def test_membership_only_issues_one_batched_union_and_no_symbol_work() -> None:
+    """T3 (AC3): a file stored for this repo but not carried by this branch takes
+    the membership path -- ONE batched UPDATE for the whole class, one
+    chunk_writer call per file, and no symbols/reference_edges statements."""
+    calls: list[tuple[int, str]] = []
+    items = [_item("a.py", "x = 1\n"), _item("b.py", "y = 2\n")]
+    conn = _FakeConn(
+        baseline=("sha_old", INDEX_SEMANTICS_VERSION),
+        carried=set(),
+        present={_key("a.py", "x = 1\n"), _key("b.py", "y = 2\n")},
+    )
+    counts = _index(conn, items, chunk_writer=lambda _c, _r, fid, pf: calls.append((fid, pf.path)))
+
+    assert conn.kinds.count("membership-union") == 1
+    assert "file-upsert" not in conn.kinds
+    assert "symbols-delete" not in conn.kinds
+    assert "edges-delete" not in conn.kinds
+    # The file_id each chunk write used came from the UPDATE's RETURNING, not a
+    # second lookup.
+    assert calls == [(1, "a.py"), (2, "b.py")]
+    assert conn.membership_params["paths"] == ["a.py", "b.py"]
+    assert conn.membership_params["branch_arr"] == ["main"]
+    # symbols/edges legitimately fall to zero: no rows were inserted.
+    assert counts == IndexCounts(files=2, symbols=0, swept=0, edges=0)
+
+
+@pytest.mark.unit
+def test_membership_only_is_refused_when_a_sibling_branch_is_stale() -> None:
+    """T4 (AC6): statement 4 false -- some branch of this repo sits at another
+    semantics version -- forces every would-be membership file down the full
+    path, so it can never inherit stale-version symbols/edges."""
+    items = [_item("a.py", "x = 1\n")]
+    conn = _FakeConn(
+        baseline=("sha_old", INDEX_SEMANTICS_VERSION),
+        carried=set(),
+        present={_key("a.py", "x = 1\n")},
+        provenance=False,
+    )
+    counts = _index(conn, items)
+
+    assert "provenance-gate" in conn.kinds
+    assert "membership-union" not in conn.kinds
+    assert conn.kinds.count("file-upsert") == 1
+    assert conn.kinds.count("symbols-delete") == 1
+    assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
+
+
+@pytest.mark.unit
+def test_mixed_classification_statement_inventory() -> None:
+    """T5 (AC2): 1 unchanged, 1 membership-only, 1 changed, 1 new -> the exact
+    inventory, with the batched union issued once, AFTER the per-file loop."""
+    unchanged = _item("keep.py", "k = 1\n")
+    member = _item("shared.py", "s = 1\n")
+    changed = _item("moved.py", "m = 2\n")
+    added = _item("new.py", "n = 1\n")
+    conn = _FakeConn(
+        baseline=("sha_old", INDEX_SEMANTICS_VERSION),
+        carried={_key("keep.py", "k = 1\n"), _key("moved.py", "m = 1\n")},
+        present={
+            _key("keep.py", "k = 1\n"),
+            _key("moved.py", "m = 1\n"),
+            _key("shared.py", "s = 1\n"),
+        },
+    )
+    counts = _index(conn, [unchanged, member, changed, added])
+
+    assert conn.kinds == [
+        "repos-insert",
+        "repo-branches-insert",
+        "read-carried",
+        "read-present",
+        "provenance-gate",
+        # moved.py -- changed content at a known path
+        "file-upsert",
+        "symbols-delete",
+        "symbols-insert",
+        "edges-delete",
+        # new.py -- never seen
+        "file-upsert",
+        "symbols-delete",
+        "symbols-insert",
+        "edges-delete",
+        # shared.py -- the whole membership class, batched, after the loop
+        "membership-union",
+        "sweep-update",
+        "sweep-delete",
+        "stamp",
+    ]
+    assert conn.membership_params["paths"] == ["shared.py"]
+    assert counts == IndexCounts(files=4, symbols=2, swept=0, edges=0)
+
+
+@pytest.mark.unit
+def test_empty_membership_class_issues_no_union_statement() -> None:
+    """T5, the stability half: an empty membership set is SKIPPED, never issued
+    as a no-op UPDATE -- which is what keeps the inventories above stable."""
+    conn = _FakeConn(
+        baseline=("sha_old", INDEX_SEMANTICS_VERSION),
+        carried={_key("a.py", "x = 1\n")},
+        present={_key("a.py", "x = 1\n")},
+    )
+    _index(conn, [_item("a.py", "x = 1\n")])
+    assert "membership-union" not in conn.kinds
+
+
+@pytest.mark.unit
+def test_membership_without_a_chunk_writer_issues_only_the_union() -> None:
+    """The semantic-off path: the union still runs, nothing else does."""
+    conn = _FakeConn(
+        baseline=("sha_old", INDEX_SEMANTICS_VERSION),
+        carried=set(),
+        present={_key("a.py", "x = 1\n")},
+    )
+    _index(conn, [_item("a.py", "x = 1\n")], chunk_writer=None)
+    assert conn.kinds.count("membership-union") == 1
+
+
 # --- Transaction shape and the untouched guards ------------------------------
 
 
@@ -313,6 +435,7 @@ def test_transaction_shape_is_pinned() -> None:
     assert conn.kinds[1] == "repo-branches-insert"
     assert conn.kinds[2] == "read-carried"
     assert conn.kinds[3] == "read-present"
+    assert conn.kinds[4] == "provenance-gate"
     assert conn.kinds[-1] == "stamp"
 
 
