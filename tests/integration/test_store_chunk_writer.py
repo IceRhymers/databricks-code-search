@@ -27,7 +27,7 @@ PR body, per the plan for issue #104, §2.6a / §3.2.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import pytest
 from sqlalchemy import Connection, text
@@ -35,7 +35,7 @@ from sqlalchemy import Connection, text
 from app.config import SEMANTIC_EMBEDDING_DIM
 from app.db.client import create_db_engine
 from app.db.models import Base
-from indexer.chunk_store import write_chunks
+from indexer.chunk_store import write_chunks_batch
 from indexer.languages import ExtractedSymbol, FileExtraction, IndexCounts, ParsedFile
 from indexer.store import index_repo
 
@@ -88,10 +88,20 @@ def _pf(path: str, content: str) -> ParsedFile:
 _STUB_VECTOR = [0.1] * SEMANTIC_EMBEDDING_DIM
 
 
-def _stub_chunk_writer(conn: Connection, repo_id: int, file_id: int, pf: ParsedFile) -> None:
+def _stub_chunk_writer(
+    conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
+) -> None:
     # A fixed, precomputed 1-chunk-per-file "embedding" -- proves the seam without
-    # needing a real embedder (chunk_writer never calls one).
-    write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
+    # needing a real embedder (chunk_writer never calls one). One write_chunks_batch
+    # call for the whole batch, matching indexer/job.py's real closure and #105's
+    # reshaped per-BATCH seam (tests/integration/test_chunk_batching.py exercises
+    # write_chunks_batch directly; this module still can't run locally --
+    # lakebase_vector, see the module docstring -- so this only fixes what a
+    # future Lakebase run would exercise, it does not itself verify anything here).
+    write_chunks_batch(
+        conn,
+        rows=[(file_id, [(0, pf.content, 1, 2, _STUB_VECTOR)]) for file_id, pf in pairs],
+    )
 
 
 def _count(conn: Connection, table: str, where: str = "") -> int:
@@ -234,10 +244,11 @@ def test_unchanged_file_never_calls_chunk_writer_and_preserves_chunk_ids(
     calls: list[str] = []
 
     def _tracking_chunk_writer(
-        conn: Connection, repo_id: int, file_id: int, pf: ParsedFile
+        conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
     ) -> None:
-        calls.append(pf.path)
-        _stub_chunk_writer(conn, repo_id, file_id, pf)
+        for file_id, pf in pairs:
+            calls.append(pf.path)
+            _stub_chunk_writer(conn, repo_id, [(file_id, pf)])
 
     index_repo(
         conn,

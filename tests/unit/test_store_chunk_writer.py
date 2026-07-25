@@ -5,13 +5,14 @@ test -- index_repo's core upsert/sweep/rollback behavior already has DB-backed
 coverage in tests/integration/test_store.py. This only proves the NEW surface:
 (a) chunk_writer defaults to None, which is byte-identical to the core path
 before chunk writing was added, and (b) when given, it is called once per
-file, inside the same conn.begin(), with (repo_id, file_id, pf).
+BATCH of files, inside the same conn.begin(), with (repo_id, pairs) -- pairs a
+sequence of (file_id, pf).
 """
 
 from __future__ import annotations
 
 import contextlib
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 from sqlalchemy import Delete, Insert, Update
@@ -20,10 +21,26 @@ from indexer.languages import ExtractedSymbol, FileExtraction, IndexCounts, Pars
 from indexer.store import StaleIndexError, index_repo
 
 
+class _IdRow(NamedTuple):
+    """The batched ``files`` upsert's ``RETURNING id, path, content_sha`` shape."""
+
+    id: int
+    path: str
+    content_sha: str
+
+
 class _FakeResult:
-    def __init__(self, *, scalar: Any = None, rowcount: int = 0, row: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        scalar: Any = None,
+        rowcount: int = 0,
+        row: Any = None,
+        rows: list[Any] | None = None,
+    ) -> None:
         self._scalar = scalar
         self._row = row
+        self._rows = rows or []
         self.rowcount = rowcount
 
     def scalar_one(self) -> Any:
@@ -31,6 +48,9 @@ class _FakeResult:
 
     def one(self) -> Any:
         return self._row
+
+    def all(self) -> list[Any]:
+        return self._rows
 
 
 class _FakeConn:
@@ -40,7 +60,10 @@ class _FakeConn:
     statement 2 (repo_branches) is the new per-branch CAS baseline; the
     membership sweep is raw ``text()`` SQL (an UPDATE then a DELETE against
     ``files``, matched by substring since a ``TextClause`` has no ``.table``);
-    the final CAS stamp UPDATE targets ``repo_branches``, not ``repos``.
+    the final CAS stamp UPDATE targets ``repo_branches``, not ``repos``. Since
+    #105 the ``files`` upsert is a multi-row ``RETURNING id, path,
+    content_sha``, answered via ``.all()`` and keyed by the batch's own row
+    values -- not a single ``scalar_one()`` id.
     """
 
     def __init__(self, *, stamp_rowcount: int = 1) -> None:
@@ -66,9 +89,12 @@ class _FakeConn:
             # (last_indexed_commit, index_semantics_version) -- new-branch shape.
             return _FakeResult(row=(None, None))
         if isinstance(stmt, Insert) and table == "files":
-            file_id = self._next_file_id
-            self._next_file_id += 1
-            return _FakeResult(scalar=file_id)
+            rows = []
+            for row in stmt._multi_values[0]:
+                file_id = self._next_file_id
+                self._next_file_id += 1
+                rows.append(_IdRow(file_id, row["path"], row["content_sha"]))
+            return _FakeResult(rows=rows)
         if isinstance(stmt, Insert) and table == "symbols":
             return _FakeResult()
         if isinstance(stmt, Delete) and table == "symbols":
@@ -106,11 +132,12 @@ def test_chunk_writer_defaults_to_none_and_behavior_is_unchanged() -> None:
 
 
 @pytest.mark.unit
-def test_chunk_writer_is_called_once_per_file_with_repo_id_and_file_id() -> None:
+def test_chunk_writer_is_called_once_per_batch_with_repo_id_and_file_id() -> None:
     calls: list[tuple[int, int, str]] = []
 
-    def chunk_writer(conn: Any, repo_id: int, file_id: int, pf: ParsedFile) -> None:
-        calls.append((repo_id, file_id, pf.path))
+    def chunk_writer(conn: Any, repo_id: int, pairs: Any) -> None:
+        for file_id, pf in pairs:
+            calls.append((repo_id, file_id, pf.path))
 
     items = [
         (_pf("a.py", "x = 1\n"), FileExtraction(symbols=[], edges=[])),

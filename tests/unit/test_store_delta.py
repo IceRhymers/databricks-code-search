@@ -152,10 +152,13 @@ class _FakeConn:
             self.kinds.append("repo-branches-insert")
             return _FakeResult(row=self._baseline)
         if isinstance(stmt, Insert) and table == "files":
-            self.kinds.append("file-upsert")
-            file_id = self._next_file_id
-            self._next_file_id += 1
-            return _FakeResult(scalar=file_id)
+            self.kinds.append("files-upsert-batch")
+            rows = []
+            for row in stmt._multi_values[0]:
+                file_id = self._next_file_id
+                self._next_file_id += 1
+                rows.append(_IdRow(file_id, row["path"], row["content_sha"]))
+            return _FakeResult(rows=rows)
         if isinstance(stmt, Delete) and table == "symbols":
             self.kinds.append("symbols-delete")
             return _FakeResult()
@@ -230,7 +233,7 @@ def test_version_mismatch_never_issues_the_projection_reads(
     assert "read-carried" not in conn.kinds
     assert "read-present" not in conn.kinds
     assert "provenance-gate" not in conn.kinds
-    assert "file-upsert" in conn.kinds
+    assert "files-upsert-batch" in conn.kinds
     assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
 
 
@@ -275,7 +278,7 @@ def test_all_unchanged_run_calls_no_chunk_writer() -> None:
     _index(
         conn,
         items,
-        chunk_writer=lambda _c, _r, _f, pf: calls.append(pf.path),
+        chunk_writer=lambda _c, _r, pairs: calls.extend(pf.path for _fid, pf in pairs),
     )
     assert calls == []
 
@@ -291,7 +294,7 @@ def test_changed_content_at_a_known_path_takes_the_full_path() -> None:
     )
     counts = _index(conn, [_item("a.py", "x = 999\n", edges=True)])
 
-    assert conn.kinds.count("file-upsert") == 1
+    assert conn.kinds.count("files-upsert-batch") == 1
     assert conn.kinds.count("symbols-delete") == 1
     assert conn.kinds.count("edges-delete") == 1
     assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=1)
@@ -303,24 +306,31 @@ def test_changed_content_at_a_known_path_takes_the_full_path() -> None:
 @pytest.mark.unit
 def test_membership_only_issues_one_batched_union_and_no_symbol_work() -> None:
     """T3 (AC3): a file stored for this repo but not carried by this branch takes
-    the membership path -- ONE batched UPDATE for the whole class, one
-    chunk_writer call per file, and no symbols/reference_edges statements."""
-    calls: list[tuple[int, str]] = []
+    the membership path -- ONE batched UPDATE for the whole class, ONE
+    chunk_writer call carrying every file's (file_id, pf) pair, and no
+    symbols/reference_edges statements."""
+    chunk_writer_calls: list[list[tuple[int, str]]] = []
     items = [_item("a.py", "x = 1\n"), _item("b.py", "y = 2\n")]
     conn = _FakeConn(
         baseline=("sha_old", INDEX_SEMANTICS_VERSION),
         carried=set(),
         present={_key("a.py", "x = 1\n"), _key("b.py", "y = 2\n")},
     )
-    counts = _index(conn, items, chunk_writer=lambda _c, _r, fid, pf: calls.append((fid, pf.path)))
+    counts = _index(
+        conn,
+        items,
+        chunk_writer=lambda _c, _r, pairs: chunk_writer_calls.append(
+            [(fid, pf.path) for fid, pf in pairs]
+        ),
+    )
 
     assert conn.kinds.count("membership-union") == 1
-    assert "file-upsert" not in conn.kinds
+    assert "files-upsert-batch" not in conn.kinds
     assert "symbols-delete" not in conn.kinds
     assert "edges-delete" not in conn.kinds
-    # The file_id each chunk write used came from the UPDATE's RETURNING, not a
-    # second lookup.
-    assert calls == [(1, "a.py"), (2, "b.py")]
+    # ONE chunk_writer call for the whole membership class, and the file_id each
+    # pair carries came from the UPDATE's RETURNING, not a second lookup.
+    assert chunk_writer_calls == [[(1, "a.py"), (2, "b.py")]]
     assert conn.membership_params["paths"] == ["a.py", "b.py"]
     assert conn.membership_params["branch_arr"] == ["main"]
     # symbols/edges legitimately fall to zero: no rows were inserted.
@@ -343,7 +353,7 @@ def test_membership_only_is_refused_when_a_sibling_branch_is_stale() -> None:
 
     assert "provenance-gate" in conn.kinds
     assert "membership-union" not in conn.kinds
-    assert conn.kinds.count("file-upsert") == 1
+    assert conn.kinds.count("files-upsert-batch") == 1
     assert conn.kinds.count("symbols-delete") == 1
     assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
 
@@ -351,7 +361,9 @@ def test_membership_only_is_refused_when_a_sibling_branch_is_stale() -> None:
 @pytest.mark.unit
 def test_mixed_classification_statement_inventory() -> None:
     """T5 (AC2): 1 unchanged, 1 membership-only, 1 changed, 1 new -> the exact
-    inventory, with the batched union issued once, AFTER the per-file loop."""
+    inventory. moved.py and new.py are both changed/new, so they flush TOGETHER
+    in one batch (one files-upsert-batch, one symbols delete+insert, one edges
+    delete) after the loop; the membership union follows, batched separately."""
     unchanged = _item("keep.py", "k = 1\n")
     member = _item("shared.py", "s = 1\n")
     changed = _item("moved.py", "m = 2\n")
@@ -373,13 +385,8 @@ def test_mixed_classification_statement_inventory() -> None:
         "read-carried",
         "read-present",
         "provenance-gate",
-        # moved.py -- changed content at a known path
-        "file-upsert",
-        "symbols-delete",
-        "symbols-insert",
-        "edges-delete",
-        # new.py -- never seen
-        "file-upsert",
+        # moved.py + new.py -- one batch, flushed after the loop
+        "files-upsert-batch",
         "symbols-delete",
         "symbols-insert",
         "edges-delete",
