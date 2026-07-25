@@ -245,14 +245,17 @@ class RepoConfig(BaseModel):
 
     ``index_concurrency`` is how many repos the indexing job works on at once.
     **The default of 4 is a disk bound, not a CPU one.** Each in-flight worker
-    holds ``MAX_TARBALL_BYTES`` (500 MB) *and* ``MAX_EXTRACTED_BYTES`` (2 GB)
-    alive simultaneously -- the downloaded tarball stays inside the worker's
-    ``TemporaryDirectory`` while the extraction runs beside it, so peak usage is
-    2.5 GB per worker: 10 GB at the default 4, 20 GB at the ceiling of 8.
+    holds ``MAX_TARBALL_BYTES`` (500 MB) inside its ``TemporaryDirectory``, and
+    that is the whole of its on-disk footprint: since #106 the archive is
+    streamed once in memory by ``indexer.ingest.iter_tar_source_files`` and never
+    extracted, so ``MAX_EXTRACTED_BYTES`` (2 GB, now in ``indexer.ingest``) caps
+    WORK rather than storage and does not add to this. Peak usage is 0.5 GB per
+    worker: 2 GB at the default 4, 4 GB at the ceiling of 8. (#106 lowered those
+    numbers 5x but deliberately left the default alone; #109 re-derives it.)
 
     **Returns at the ceiling are sublinear.** Symbol extraction does not
     parallelise (measured at 0.95x on 4 threads), so Amdahl's law caps the
-    speedup well below 8x while the disk cost stays a hard linear 20 GB. Raise
+    speedup well below 8x while the disk cost stays a hard linear 4 GB. Raise
     it only knowing that trade.
 
     When semantic indexing is on, the effective worker count is clamped to 2 by

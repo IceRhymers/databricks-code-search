@@ -1,7 +1,7 @@
 """Ambient per-phase wall-clock accounting for one branch's indexing pipeline.
 
-``indexer.job`` measures most of a branch's phases (resolve / download / extract /
-parse / embed / db) inline, but ``sweep`` runs deep inside
+``indexer.job`` measures most of a branch's phases (resolve / download / parse /
+embed / db) inline, but ``sweep`` runs deep inside
 :func:`indexer.store.index_repo`, behind the injected ``index_fn`` seam and a
 frozen ``IndexCounts`` return type. Threading a timer through that seam would
 force every existing ``index_fn`` fake to grow a parameter, turning a log-only

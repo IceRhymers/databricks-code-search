@@ -25,6 +25,7 @@ import sys
 import tarfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
@@ -119,10 +120,15 @@ class _GitHub:
         files: dict[str, bytes] | None = None,
         branches: dict[str, list[str]] | None = None,
         branches_fail: set[str] | None = None,
+        tarball_bytes: bytes | None = None,
     ) -> None:
         self.enumerations = enumerations or {}
         self.missing = missing or set()
         self.files = files
+        # Verbatim archive bytes for the /tarball endpoint, bypassing `_tarball`.
+        # The only way to serve a MALFORMED archive, which is what proves where
+        # streaming validation now happens (D8).
+        self.tarball_bytes = tarball_bytes
         # full_name -> branch names, for the /branches endpoint. A repo not
         # listed here answers with an empty branch list.
         self.branches = branches or {}
@@ -167,6 +173,8 @@ class _GitHub:
                 names = self.branches.get(f"{org}/{repo}", [])
                 return httpx.Response(200, json=[{"name": n} for n in names])
             if parts[3] == "tarball":
+                if self.tarball_bytes is not None:
+                    return httpx.Response(200, content=self.tarball_bytes)
                 return httpx.Response(200, content=_tarball(f"{org}-{repo}-shashas", self.files))
         return httpx.Response(404)
 
@@ -2613,6 +2621,146 @@ def test_reconcile_unit_level_partial_progress_on_mid_sequence_failure() -> None
     assert progress.purged_repos == []
 
 
+# --- streaming tarball ingestion (#106) -------------------------------------
+
+
+def _two_top_level_dirs_tarball() -> bytes:
+    """A real gzip tarball that ``indexer.ingest`` must REJECT.
+
+    GitHub tarballs carry exactly one top-level ``org-repo-<sha7>/`` directory;
+    two is the cheapest malformed shape that is still a structurally valid
+    archive, so the failure comes from ingestion rather than from gzip.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name in ("one/a.py", "two/b.py"):
+            info = tarfile.TarInfo(name)
+            info.size = len(b"x = 1\n")
+            tf.addfile(info, io.BytesIO(b"x = 1\n"))
+    return buf.getvalue()
+
+
+class _ConnectCountingEngine(_FakeEngine):
+    """``_FakeEngine`` that counts ``connect()`` calls.
+
+    ``run()`` takes exactly one connection outside the workers (the pre-fan-out
+    stamp read; the reconciliation checkpoint is gated off by any failure), so on
+    a one-repo failing run the count is 1 plus whatever the branch itself took.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.connects = 0
+
+    def connect(self) -> _FakeConn:
+        self.connects += 1
+        return super().connect()
+
+
+@pytest.mark.unit
+def test_no_file_is_written_beside_the_tarball(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC2: the worker's temp dir holds the compressed tarball and nothing else.
+
+    Asserted from inside ``index_fn`` -- i.e. while the branch is mid-flight and
+    an extracted tree would still exist -- not after the ``TemporaryDirectory``
+    has already torn itself down. The spy is on ``indexer.job.download_tarball``:
+    ``job.py`` binds that name into its own namespace at import, so patching
+    ``indexer.fetch.download_tarball`` would miss.
+    """
+    import indexer.job as job
+
+    real_download_tarball = job.download_tarball
+    dests: list[Path] = []
+
+    def _download_tarball(*args: Any, **kwargs: Any) -> Any:
+        out = real_download_tarball(*args, **kwargs)
+        dests.append(out.parent)
+        return out
+
+    monkeypatch.setattr(job, "download_tarball", _download_tarball)
+
+    snapshots: list[list[str]] = []
+
+    def _index(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        consumed = list(items)
+        snapshots.append(sorted(p.name for p in dests[-1].iterdir()))
+        return IndexCounts(files=len(consumed), symbols=0, swept=0, edges=0)
+
+    assert _run(_config(repos=["acme/widgets"]), _index) == 0
+    assert snapshots == [["source.tar.gz"]]
+
+
+@pytest.mark.unit
+def test_malformed_archive_fails_the_branch_from_inside_the_transaction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """D8, semantic-OFF path: archive validation moved inside the open transaction.
+
+    ``extract_tarball`` raised before ``engine.connect()``. The lazy generator is
+    now consumed inside ``index_repo``'s ``conn.begin()``, so a malformed archive
+    costs one pooled connection and a rolled-back transaction. Accepted because
+    the branch-level OUTCOME is unchanged -- ``status="failed"``, exit code 1, no
+    ``phase timing`` line -- and the blast radius is one worker's own connection
+    (``pool_size == workers``, ``max_overflow=0``).
+    """
+    github = _GitHub(tarball_bytes=_two_top_level_dirs_tarball())
+    engine = _ConnectCountingEngine()
+    idx = _RecordingIndex()
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            idx,
+            cfg=Settings(semantic_enabled=False),
+            github=github,
+            engine=engine,
+        )
+
+    assert code == 1
+    assert idx.counts == []  # the transaction never completed
+    assert engine.connects == 2  # the pre-fan-out stamp read, plus this branch's
+    assert any("failed to index acme/widgets@main" in r.getMessage() for r in caplog.records)
+    assert _timing_messages(caplog) == []  # a failed branch emits no timing line
+
+
+@pytest.mark.unit
+def test_malformed_archive_on_the_semantic_path_raises_before_any_connection() -> None:
+    """D8's twin: the PRODUCTION path still fails with zero connections held.
+
+    On the semantic path ``job.py`` materializes the file list eagerly, so the
+    archive is fully streamed and fully validated before #104's advisory
+    ``shas_fn`` connection is opened and before ``index_repo``'s. The stamp below
+    matches ``INDEX_SEMANTICS_VERSION`` with a stale SHA, which is exactly the
+    shape that OPENS the delta gate -- so ``shas_fn`` would be called if the raise
+    were even one step later.
+    """
+    github = _GitHub(tarball_bytes=_two_top_level_dirs_tarball())
+    engine = _ConnectCountingEngine(
+        stamps={("acme/widgets", "main"): ("stale_sha", INDEX_SEMANTICS_VERSION)}
+    )
+    idx = _RecordingIndex()
+    shas_calls: list[tuple[str, str]] = []
+
+    def _shas_fn(conn: Any, *, name: str, branch: str) -> tuple[set[Any], set[Any]]:
+        shas_calls.append((name, branch))
+        return set(), set()
+
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        idx,
+        cfg=Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100),
+        embed_fn=lambda texts: [[0.0] for _ in texts],
+        github=github,
+        engine=engine,
+        shas_fn=_shas_fn,
+    )
+
+    assert code == 1
+    assert idx.counts == []
+    assert shas_calls == []
+    assert engine.connects == 1  # the pre-fan-out stamp read alone
+
+
 # --- per-phase timing instrumentation (#103) --------------------------------
 # Every INDEXED branch emits one `phase timing` record accounting for its whole
 # wall clock. The numbers are asserted EXACTLY, never with sleeps: the tests
@@ -2634,7 +2782,7 @@ def test_reconcile_unit_level_partial_progress_on_mid_sequence_failure() -> None
 _TIMING_RE = re.compile(
     r"^phase timing (?P<repo>[^ @]+)@(?P<branch>\S+): "
     r"total=(\d+\.\d\d)s resolve=(\d+\.\d\d)s download=(\d+\.\d\d)s "
-    r"extract=(\d+\.\d\d)s parse=(\d+\.\d\d)s embed=(\d+\.\d\d)s "
+    r"parse=(\d+\.\d\d)s embed=(\d+\.\d\d)s "
     r"db=(\d+\.\d\d)s sweep=(\d+\.\d\d)s other=(\d+\.\d\d)s$"
 )
 
@@ -2679,7 +2827,7 @@ def _only_phases(caplog: pytest.LogCaptureFixture) -> dict[str, float]:
 
 @pytest.mark.unit
 def test_indexed_branch_logs_every_phase_field(caplog: pytest.LogCaptureFixture) -> None:
-    """T1: one record per indexed branch, with all nine fields in a fixed order."""
+    """T1: one record per indexed branch, with all eight fields in a fixed order."""
     idx = _RecordingIndex()
     with caplog.at_level(logging.INFO, logger="indexer.job"):
         code = _run(_config(repos=["acme/widgets"]), idx)
@@ -2695,7 +2843,6 @@ def test_indexed_branch_logs_every_phase_field(caplog: pytest.LogCaptureFixture)
         "total",
         "resolve",
         "download",
-        "extract",
         "parse",
         "embed",
         "db",
@@ -3165,25 +3312,25 @@ def test_semantic_eager_walk_is_charged_to_parse(
 ) -> None:
     """T18: on the semantic (production) path the file list is materialized up front,
     OUTSIDE the db window and outside _timed_items. Leaving that walk unwrapped would
-    dump the whole rglob + stat + read + decode cost into `other` -- the exact number
+    dump the whole stream + decompress + decode cost into `other` -- the exact number
     that routes work between the epic's parse/IO/db issues."""
     import indexer.job as job
 
     clock = _install_fake_clock(monkeypatch)
-    real_iter_source_files = job.iter_source_files
+    real_iter_tar_source_files = job.iter_tar_source_files
 
-    def _slow_walk(root: Any) -> Any:
-        # iter_source_files is a generator function: paying the cost at call
+    def _slow_walk(tar_path: Any) -> Any:
+        # iter_tar_source_files is a generator function: paying the cost at call
         # time (before the first `next()`) would let this fake pass even if
         # the real wrap only timed the call and not the iteration -- the
         # exact mis-scoped-wrap bug this test exists to catch. Pay per
-        # yielded file instead, matching where the real cost (rglob walk,
-        # stat, read, decode) is actually incurred.
-        for pf in real_iter_source_files(root):
+        # yielded file instead, matching where the real cost (tar stream,
+        # decompress, decode) is actually incurred.
+        for pf in real_iter_tar_source_files(tar_path):
             clock.advance(3.0)  # 2 files in _DEFAULT_FILES -> 6.0s total
             yield pf
 
-    monkeypatch.setattr(job, "iter_source_files", _slow_walk)
+    monkeypatch.setattr(job, "iter_tar_source_files", _slow_walk)
 
     cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
     with caplog.at_level(logging.INFO, logger="indexer.job"):
@@ -3238,7 +3385,7 @@ def test_other_is_the_exact_unattributed_residual(
     `other` is *defined* as `total - sum(phases)`, so asserting
     `total == sum(phases) + other` is a tautology that holds for any values and can
     never detect a mis-measured phase. This test instead drives a distinct known
-    amount through every one of the seven phases and requires `other == 0.00s`,
+    amount through every one of the six phases and requires `other == 0.00s`,
     then re-runs with one deliberately UNINSTRUMENTED advance and requires `other`
     to equal exactly that amount.
     """
@@ -3247,8 +3394,7 @@ def test_other_is_the_exact_unattributed_residual(
     clock = _install_fake_clock(monkeypatch)
     real_resolve_branch_head = job.resolve_branch_head
     real_download_tarball = job.download_tarball
-    real_extract_tarball = job.extract_tarball
-    real_iter_source_files = job.iter_source_files
+    real_iter_tar_source_files = job.iter_tar_source_files
     real_assert_disk_headroom = job.assert_disk_headroom
 
     def _resolve_branch_head(*args: Any, **kwargs: Any) -> str:
@@ -3259,15 +3405,11 @@ def test_other_is_the_exact_unattributed_residual(
         clock.advance(2.0)
         return real_download_tarball(*args, **kwargs)
 
-    def _extract_tarball(*args: Any, **kwargs: Any) -> Any:
-        clock.advance(4.0)
-        return real_extract_tarball(*args, **kwargs)
-
-    def _iter_source_files(root: Any) -> Any:
-        # Pay per yielded file, not at call time -- iter_source_files is a
+    def _iter_tar_source_files(tar_path: Any) -> Any:
+        # Pay per yielded file, not at call time -- iter_tar_source_files is a
         # generator function, so a call-time advance would pass even for a
         # wrap that only times the call and not the iteration.
-        for pf in real_iter_source_files(root):
+        for pf in real_iter_tar_source_files(tar_path):
             clock.advance(4.0)  # 2 files in _DEFAULT_FILES -> 8.0s total
             yield pf
 
@@ -3286,8 +3428,7 @@ def test_other_is_the_exact_unattributed_residual(
 
     monkeypatch.setattr(job, "resolve_branch_head", _resolve_branch_head)
     monkeypatch.setattr(job, "download_tarball", _download_tarball)
-    monkeypatch.setattr(job, "extract_tarball", _extract_tarball)
-    monkeypatch.setattr(job, "iter_source_files", _iter_source_files)
+    monkeypatch.setattr(job, "iter_tar_source_files", _iter_tar_source_files)
 
     cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
     # "main" is stamped current so it is SKIPPED, leaving exactly one indexed
@@ -3305,10 +3446,9 @@ def test_other_is_the_exact_unattributed_residual(
 
     phases = _only_phases(caplog)
     assert phases == {
-        "total": 127.0,
+        "total": 123.0,
         "resolve": 1.0,
         "download": 2.0,
-        "extract": 4.0,
         "parse": 8.0,
         "embed": 16.0,
         "db": 32.0,
@@ -3330,10 +3470,9 @@ def test_other_is_the_exact_unattributed_residual(
 
     phases = _only_phases(caplog)
     assert phases == {
-        "total": 136.0,
+        "total": 132.0,
         "resolve": 1.0,
         "download": 2.0,
-        "extract": 4.0,
         "parse": 8.0,
         "embed": 16.0,
         "db": 32.0,

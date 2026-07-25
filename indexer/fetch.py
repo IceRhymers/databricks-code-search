@@ -2,7 +2,7 @@
 
 The caller sets the ``Authorization`` header on the :class:`httpx.Client`; this
 module never reads secrets itself. ``download_tarball`` is always called with the
-immutable resolved ``sha`` (not a branch name) so the extracted tree's SHA can
+immutable resolved ``sha`` (not a branch name) so the indexed tree's SHA can
 never drift from the ``head_sha`` stamped into ``files.commit``.
 """
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,16 +25,18 @@ _GITHUB_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-# Defense-in-depth caps for the untrusted tarball on an ephemeral serverless disk:
-# bound the compressed download and the uncompressed extraction independently so a
-# gzip bomb or an oversized tracked blob can't exhaust local storage.
+# Defense-in-depth cap for the untrusted tarball on an ephemeral serverless disk:
+# bound the compressed download so an oversized repo can't exhaust local storage.
+# The companion cap on decompressed content lives in `indexer.ingest` as
+# MAX_EXTRACTED_BYTES -- since #106 nothing is ever extracted to disk, so that one
+# bounds WORK (a gzip bomb streamed through memory), not storage.
 MAX_TARBALL_BYTES = 500_000_000
-MAX_EXTRACTED_BYTES = 2_000_000_000
 
-# One worker's worst-case peak. The two caps SUM rather than max(): the compressed
-# tarball stays on disk inside the worker's TemporaryDirectory while the extracted
-# tree grows beside it, so both are alive simultaneously.
-REQUIRED_FREE_BYTES = MAX_TARBALL_BYTES + MAX_EXTRACTED_BYTES
+# One worker's worst-case peak, and it is now just the download: the compressed
+# tarball is the only artifact written to disk, and it is streamed straight out of
+# the worker's TemporaryDirectory into `indexer.ingest.iter_tar_source_files`
+# without ever being expanded beside it.
+REQUIRED_FREE_BYTES = MAX_TARBALL_BYTES
 
 _PER_PAGE = 100
 
@@ -225,10 +226,13 @@ def assert_disk_headroom(path: Path, *, repo: str) -> None:
     """Raise ``OSError`` unless ``path``'s filesystem can hold one worker's peak.
 
     Called immediately before the download, on the directory actually being
-    written to, so the measurement is of the right filesystem. The error names
-    the repo AND the config key to lower, because the alternative -- an opaque
-    ENOSPC from somewhere inside tarfile -- says nothing about which of N
-    concurrent workers overcommitted the disk or what to do about it.
+    written to, so the measurement is of the right filesystem. That peak is the
+    compressed tarball and nothing else: since #106 the archive is streamed
+    in-memory by :func:`indexer.ingest.iter_tar_source_files` and is never
+    extracted. The error names the repo AND the config key to lower, because the
+    alternative -- an opaque ENOSPC from somewhere inside tarfile -- says nothing
+    about which of N concurrent workers overcommitted the disk or what to do
+    about it.
 
     The caller is expected to let this fail ONE repo, not the run: with a
     too-high ``index_concurrency`` the run then degrades to indexing whatever
@@ -238,8 +242,8 @@ def assert_disk_headroom(path: Path, *, repo: str) -> None:
     if free < REQUIRED_FREE_BYTES:
         raise OSError(
             f"insufficient local disk for {repo}: {free} bytes free at {path}, need "
-            f"{REQUIRED_FREE_BYTES} (a {MAX_TARBALL_BYTES}-byte tarball plus a "
-            f"{MAX_EXTRACTED_BYTES}-byte extraction, both alive at once); "
+            f"{REQUIRED_FREE_BYTES} (the compressed tarball is the only artifact "
+            "written to disk; it is never extracted); "
             "lower index_concurrency in config.yaml"
         )
 
@@ -269,33 +273,3 @@ def download_tarball(client: httpx.Client, org: str, repo: str, ref: str, dest: 
                     )
                 fh.write(chunk)
     return out
-
-
-def extract_tarball(tar_path: Path, dest: Path) -> Path:
-    """Safely extract ``tar_path`` into ``dest`` and return its single top-level dir.
-
-    ``filter="data"`` (Python 3.12) neutralizes path traversal / absolute paths /
-    device files. GitHub tarballs contain exactly one top-level ``org-repo-<sha7>/``
-    directory.
-    """
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(tar_path, mode="r:*") as tf:
-        members = tf.getmembers()
-        # Reject a decompression bomb before writing any of it to disk.
-        extracted = sum(m.size for m in members if m.isreg())
-        if extracted > MAX_EXTRACTED_BYTES:
-            raise ValueError(
-                f"tarball extracts to {extracted} bytes, exceeding {MAX_EXTRACTED_BYTES}"
-            )
-        tf.extractall(dest, filter="data")
-
-    top_level = {
-        member.name.split("/", 1)[0]
-        for member in members
-        if member.name and not member.name.startswith("/")
-    }
-    if len(top_level) != 1:
-        raise ValueError(
-            f"expected exactly one top-level dir in tarball, found {sorted(top_level)}"
-        )
-    return dest / next(iter(top_level))
