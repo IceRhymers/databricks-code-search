@@ -157,7 +157,7 @@ promise that the field set never changes across releases.)
 | `download` | archive I/O bound | — (the decompression it used to be paired with is now fused into `parse`, #106) |
 | `parse` | GIL-bound tree-sitter extraction — **plus, since #106, the archive's gzip decompression, tar-stream read and UTF-8 decode**, which used to be the separate `extract=` field | #108 (process-pool extraction) addresses the tree-sitter half only |
 | `embed` | serial AI Gateway round trips | #107 (concurrent embedding) |
-| `db` | per-file round trips | #105 (batched writes) |
+| `db` | round trips for the batch's changed/new files, plus one Postgres-side sequential scan per file for its symbol delete (see §2.3) | #105 (batched writes) — landed; §2.3 |
 | any of the above, on **unchanged** content | redundant work | #104 (file-level delta indexing) |
 
 `#104` narrows the **db** and **embed** costs to a branch's actual delta, not
@@ -241,6 +241,55 @@ churns every run (nothing to fix) or has drifted out of delta eligibility —
 check its `repo_branches.index_semantics_version` against the current
 `INDEX_SEMANTICS_VERSION` and whether a sibling branch is stale (§4's
 provenance gate).
+
+### 2.3 Batched writes (#105)
+
+`index_repo`'s changed/new file loop no longer issues 5–7 statements per file
+(a file upsert, a symbol delete-then-conditional-insert, an edge
+delete-then-conditional-insert, and an optional chunk write). It accumulates
+files into a batch and flushes once the batch reaches whichever bound trips
+first — `_BATCH_MAX_FILES` (500 files) or `_BATCH_MAX_CONTENT_BYTES` (8 MiB of
+`pf.size`) — plus once more after the loop for whatever remains. Each flush
+issues ONE multi-row `files` upsert, ONE `DELETE ... WHERE file_id = ANY(...)`
+each for `symbols`/`reference_edges` over the whole batch, a param-budgeted
+bulk insert for each, and ONE `chunk_writer` call for the batch. The
+membership-only class (already a single `UPDATE ... RETURNING` per branch)
+gained nothing new to batch — its own chunk write collapsed from one call per
+file to one call for the whole class as part of the same change. This is
+invisible in the corpus: a batched write and a per-file write produce a
+byte-identical `files`/`symbols`/`reference_edges` corpus (verified across
+`_BATCH_MAX_FILES` ∈ {1, 2, 7, 500} and against the pre-#105 implementation
+directly) — there is no new log line, and no existing line's format changed.
+
+**`db=` on the `phase timing` line is the observable.** Round trips per
+changed/new file drop from 3–7 to a fraction of one; on a branch that is
+mostly re-writing content (a first index, or the first full re-index after an
+`INDEX_SEMANTICS_VERSION` bump), that collapses most of `db=`'s protocol-chatter
+component. It does **not** collapse `db=` to zero: one component of `db=` is
+CPU/IO-bound, not round-trip-bound, and batching does not touch it — `symbols`
+carries no index on `file_id` (`app/db/models.py`; `reference_edges` has
+`ix_reference_edges_file_id`, `symbols` has nothing), so `DELETE FROM symbols
+WHERE file_id = ANY(...)` is still a sequential scan of the whole `symbols`
+table per flush, just one scan per up-to-500 files instead of one per file.
+Adding that index is tracked separately (a migration, deliberately kept out of
+this change so it stays a zero-schema-change, `git revert`-safe deploy) and
+would make this component cheaper too, independent of batch size.
+
+**The win concentrates on a first index or a post-bump full reindex.** Once a
+branch is past its first run, file-level delta indexing (#104) already skips
+`db` work entirely for unchanged content — batching only ever helps the
+changed/new fraction that #104 leaves behind, so a branch with a small,
+steady delta was already cheap and will not visibly move on this line.
+
+**The batch bounds are source constants, not a config knob.** `_BATCH_MAX_FILES`
+and `_BATCH_MAX_CONTENT_BYTES` live in `indexer/store.py`, per this repo's
+"guardrail constants with config-level fixes, not override flags" convention
+(`indexer/AGENTS.md`). Raising `_BATCH_MAX_FILES` is a deploy, not a runtime
+toggle, and is bounded by libpq's Bind-message parameter ceiling
+(`_BATCH_MAX_FILES * _FILE_UPSERT_COLUMNS < 65535`, asserted at import time).
+`_BATCH_MAX_FILES = 1` degrades the write path back to per-file statement
+counts — useful for bisecting a suspected batching regression locally, but a
+source edit and redeploy, never a 2am incident-response lever.
 
 ---
 
