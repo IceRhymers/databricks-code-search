@@ -15,6 +15,7 @@ that move; they are not duplicated here.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import inspect
 import io
 import logging
@@ -2266,3 +2267,646 @@ def test_reconcile_unit_level_partial_progress_on_mid_sequence_failure() -> None
     assert progress.committed_any is True
     assert progress.purge_blocked is False
     assert progress.purged_repos == []
+
+
+# --- per-phase timing instrumentation (#103) --------------------------------
+# Every INDEXED branch emits one `phase timing` record accounting for its whole
+# wall clock. The numbers are asserted EXACTLY, never with sleeps: the tests
+# below patch `indexer.timing._CLOCK` (the single seam every asserted interval
+# reads, captured by PhaseTimer.__init__ inside the worker) with a counter that
+# only moves when a fake explicitly moves it. A sleep-based version of these
+# assertions would be flaky under CI load and could not pin a residual at all.
+#
+# `_CLOCK` is a module global, so a fake counter is shared process-wide while a
+# run fans out. Any fake-clock test driving more than one repo therefore pins
+# `index_concurrency=1`, which gives one worker thread and one deterministic
+# advance sequence.
+
+# Anchored and exhaustive on purpose: this single constant pins the field set,
+# the field ORDER, the `%.2f` shape, the mandatory single-space separator, and
+# the absence of anything else on the line (no config values, no counts, no
+# headers -- the redaction posture). `\d+\.\d\d` also rejects a negative value
+# outright, which is what makes the `max(0.0, ...)` clamps in job.py testable.
+_TIMING_RE = re.compile(
+    r"^phase timing (?P<repo>[^ @]+)@(?P<branch>\S+): "
+    r"total=(\d+\.\d\d)s resolve=(\d+\.\d\d)s download=(\d+\.\d\d)s "
+    r"extract=(\d+\.\d\d)s parse=(\d+\.\d\d)s embed=(\d+\.\d\d)s "
+    r"db=(\d+\.\d\d)s sweep=(\d+\.\d\d)s other=(\d+\.\d\d)s$"
+)
+
+
+class _FakeClock:
+    """A monotonic clock that advances only when a test advances it."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def _install_fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    """Patch the one clock seam every asserted duration reads."""
+    clock = _FakeClock()
+    monkeypatch.setattr("indexer.timing._CLOCK", clock)
+    return clock
+
+
+def _timing_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [m for r in caplog.records if (m := r.getMessage()).startswith("phase timing ")]
+
+
+def _phases(message: str) -> dict[str, float]:
+    """Parse one `phase timing` line into ``{field: seconds}``, pinning its shape first."""
+    assert _TIMING_RE.match(message), f"malformed timing line: {message!r}"
+    body = message.split(": ", 1)[1]
+    return {k: float(v.removesuffix("s")) for k, v in (f.split("=") for f in body.split(" "))}
+
+
+def _only_phases(caplog: pytest.LogCaptureFixture) -> dict[str, float]:
+    """The single expected timing line's fields."""
+    messages = _timing_messages(caplog)
+    assert len(messages) == 1, f"expected exactly one timing line, got {messages}"
+    return _phases(messages[0])
+
+
+@pytest.mark.unit
+def test_indexed_branch_logs_every_phase_field(caplog: pytest.LogCaptureFixture) -> None:
+    """T1: one record per indexed branch, with all nine fields in a fixed order."""
+    idx = _RecordingIndex()
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), idx)
+    assert code == 0
+
+    messages = _timing_messages(caplog)
+    assert len(messages) == 1
+    match = _TIMING_RE.match(messages[0])
+    assert match is not None, messages[0]
+    assert match.group("repo") == "acme/widgets"
+    assert match.group("branch") == "main"
+    assert list(_phases(messages[0])) == [
+        "total",
+        "resolve",
+        "download",
+        "extract",
+        "parse",
+        "embed",
+        "db",
+        "sweep",
+        "other",
+    ]
+
+
+@pytest.mark.unit
+def test_semantic_off_still_logs_embed_zero(caplog: pytest.LogCaptureFixture) -> None:
+    """T2 (AC2): the format string has no branches -- semantic off zeroes embed, it does
+    not drop the field. A conditional line would break every grep an operator writes."""
+    cfg_off = Settings(semantic_enabled=False)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        assert _run(_config(repos=["acme/widgets"]), _RecordingIndex(), cfg=cfg_off) == 0
+    off = _only_phases(caplog)
+    assert off["embed"] == 0.0
+
+    caplog.clear()
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            cfg=cfg,
+            embed_fn=lambda texts: [[0.0] for _ in texts],
+        )
+    assert code == 0
+    on = _only_phases(caplog)
+
+    # Byte-identical field set and order, semantic on or off.
+    assert list(on) == list(off)
+
+
+@pytest.mark.unit
+def test_semantic_on_attributes_embed_time(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T3: chunking + embedding is its own phase, and it is NOT double-counted into db."""
+    clock = _install_fake_clock(monkeypatch)
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        clock.advance(4.0)
+        return [[0.0] for _ in texts]
+
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _RecordingIndex(), cfg=cfg, embed_fn=_embed)
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert phases["embed"] == 4.0
+    assert phases["db"] == 0.0  # the embed happens BEFORE engine.connect(), not inside it
+    assert phases["total"] == 4.0
+    assert phases["other"] == 0.0
+
+
+@pytest.mark.unit
+def test_phase_timing_line_carries_the_repo_context(caplog: pytest.LogCaptureFixture) -> None:
+    """T4 (AC1): emitted from inside the worker, so `[%(repo)s]` resolves.
+
+    The drain loop's `indexed ...` line runs on the main thread, where the context
+    var is at its default and the record would render `[-]` -- which is exactly
+    why the timing line is NOT appended there.
+    """
+    import indexer.job as job
+
+    log_filter = job.RepoLogFilter()
+    caplog.handler.addFilter(log_filter)
+    try:
+        with caplog.at_level(logging.INFO, logger="indexer.job"):
+            code = _run(_config(repos=["acme/widgets"]), _RecordingIndex())
+    finally:
+        caplog.handler.removeFilter(log_filter)
+    assert code == 0
+
+    timing_records = [r for r in caplog.records if r.getMessage().startswith("phase timing ")]
+    assert len(timing_records) == 1
+    assert timing_records[0].repo == "acme/widgets"
+
+
+@pytest.mark.unit
+def test_parse_time_is_excluded_from_db_time(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T5: items are produced lazily INSIDE index_repo's transaction, so a naive
+    "time index_fn" would report parse and db fused. _timed_items charges only the
+    production of each item to parse, leaving the DML between them to db."""
+    import indexer.job as job
+
+    clock = _install_fake_clock(monkeypatch)
+    real_extract_file = job.extract_file
+
+    def _slow_extract(pf: ParsedFile) -> Any:
+        clock.advance(2.0)
+        return real_extract_file(pf)
+
+    monkeypatch.setattr(job, "extract_file", _slow_extract)
+
+    def _index(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        consumed = list(items)
+        clock.advance(9.0)
+        return IndexCounts(files=len(consumed), symbols=0, swept=0, edges=0)
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _index)
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert phases["parse"] == 4.0  # main.py + README.md, 2.0s each
+    assert phases["db"] == 9.0  # NOT 13.0
+    assert phases["total"] == 13.0
+    assert phases["other"] == 0.0
+
+
+@pytest.mark.unit
+def test_skipped_branch_logs_no_timing_line(caplog: pytest.LogCaptureFixture) -> None:
+    """T6: AC1 says "every indexed (not skipped) branch". A skipped branch has no
+    phases to report and must not pollute the dominant-phase grep with zeroes."""
+    engine = _FakeEngine(
+        stamps={("acme/widgets", "main"): ("sha_widgets", INDEX_SEMANTICS_VERSION)}
+    )
+    idx = _RecordingIndex()
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), idx, engine=engine)
+    assert code == 0
+    assert idx.calls == []
+    assert "skipped acme/widgets@main" in caplog.text
+    assert _timing_messages(caplog) == []
+
+
+@pytest.mark.unit
+def test_failed_branch_logs_no_timing_line(caplog: pytest.LogCaptureFixture) -> None:
+    """T7: partial timings for a branch that never finished would be misleading."""
+
+    def _boom(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        raise RuntimeError("boom")
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _boom)
+    assert code == 1
+    assert "failed to index acme/widgets@main" in caplog.text
+    assert _timing_messages(caplog) == []
+
+
+@pytest.mark.unit
+def test_conflicted_branch_logs_no_timing_line(caplog: pytest.LogCaptureFixture) -> None:
+    """T20: the StaleIndexError path is classified separately from T7's generic
+    failure, and it too rolled the branch back -- nothing was indexed, so nothing
+    is reported."""
+
+    def _stale(conn: Any, *, name: str, branch: str, items: Any, **_: Any) -> IndexCounts:
+        raise StaleIndexError(f"repo_branches row for {name}@{branch} changed")
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _stale)
+    assert code == 0  # a conflict self-heals and does not fail the run
+    assert "index conflict for acme/widgets@main" in caplog.text
+    assert _timing_messages(caplog) == []
+
+
+@pytest.mark.unit
+def test_repo_line_reports_resolve_and_branch_listing(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8: the two REPO-scoped costs belong to no branch's total.
+
+    Without `resolve=` the default branch's HEAD resolve would show as
+    `resolve=0.00s` on its phase line and look like a bug; without `list=` a
+    glob-configured monorepo's paginated branch listing would appear in no field
+    on no line at all.
+
+    Deliberately asserts NO relation between the `in ...s` elapsed and the
+    parenthesised values: the former keeps its own real `time.monotonic()`
+    reading, so under a fake clock it reads ~0.00s while the others do not.
+    """
+    import indexer.job as job
+
+    clock = _install_fake_clock(monkeypatch)
+    real_resolve_ref = job.resolve_ref
+    real_list_branches = job.list_branches
+
+    def _resolve_ref(*args: Any, **kwargs: Any) -> tuple[str, str]:
+        clock.advance(5.0)
+        return real_resolve_ref(*args, **kwargs)
+
+    def _list_branches(*args: Any, **kwargs: Any) -> list[str]:
+        clock.advance(3.0)
+        return real_list_branches(*args, **kwargs)
+
+    monkeypatch.setattr(job, "resolve_ref", _resolve_ref)
+    monkeypatch.setattr(job, "list_branches", _list_branches)
+
+    # No `branches:` globs -> the branches endpoint is never called at all.
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        assert _run(_config(repos=["acme/widgets"]), _RecordingIndex()) == 0
+    finished = re.search(
+        r"finished acme/widgets in ([0-9.]+)s \(resolve=([0-9.]+)s list=([0-9.]+)s\)", caplog.text
+    )
+    assert finished is not None, caplog.text
+    assert float(finished.group(2)) == 5.0
+    assert float(finished.group(3)) == 0.0
+    # The pre-existing unanchored assertion on this line still matches.
+    assert re.search(r"finished acme/widgets in ([0-9.]+)s", caplog.text) is not None
+
+    caplog.clear()
+    github = _GitHub(branches={"acme/widgets": ["main"]})
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"], branches=["*"], index_concurrency=1),
+            _RecordingIndex(),
+            github=github,
+        )
+    assert code == 0
+    globbed = re.search(
+        r"finished acme/widgets in ([0-9.]+)s \(resolve=([0-9.]+)s list=([0-9.]+)s\)", caplog.text
+    )
+    assert globbed is not None, caplog.text
+    assert float(globbed.group(2)) == 5.0
+    assert float(globbed.group(3)) == 3.0
+    # ...and none of it leaked into the branch's own total.
+    assert _only_phases(caplog)["total"] == 0.0
+
+
+@pytest.mark.unit
+def test_timings_do_not_leak_between_branches_of_one_repo(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T9: branch 2's numbers are its own, not cumulative.
+
+    The trap this guards is reusing `_index_one_branch`'s `started` parameter for
+    `total=`: that value is set once per REPO and passed unchanged to every
+    branch, so branch 2 would report branch 1's wall clock too and silently
+    inflate `other`. Also guards the ContextVar reset between branches.
+    """
+    import indexer.job as job
+
+    clock = _install_fake_clock(monkeypatch)
+    real_download = job.download_tarball
+
+    def _download(*args: Any, **kwargs: Any) -> Any:
+        clock.advance(5.0)
+        return real_download(*args, **kwargs)
+
+    monkeypatch.setattr(job, "download_tarball", _download)
+
+    github = _GitHub(branches={"acme/widgets": ["main", "feature"]})
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"], branches=["feature"], index_concurrency=1),
+            _RecordingIndex(),
+            github=github,
+        )
+    assert code == 0
+
+    messages = _timing_messages(caplog)
+    assert len(messages) == 2
+    branches = {_TIMING_RE.match(m).group("branch") for m in messages}  # type: ignore[union-attr]
+    assert branches == {"main", "feature"}
+    for message in messages:
+        phases = _phases(message)
+        assert phases["download"] == 5.0
+        assert phases["total"] == 5.0  # not 10.0 on the second branch
+        assert phases["other"] == 0.0
+
+
+@pytest.mark.unit
+def test_timings_do_not_leak_between_repos_on_a_reused_worker_thread(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T10: ThreadPoolExecutor reuses worker threads without resetting their
+    context. With one worker and two repos, repo 2 runs on the same thread that
+    just finished repo 1 -- a leaked timer would show up here as doubled numbers."""
+    import indexer.job as job
+
+    clock = _install_fake_clock(monkeypatch)
+    real_download = job.download_tarball
+
+    def _download(*args: Any, **kwargs: Any) -> Any:
+        clock.advance(3.0)
+        return real_download(*args, **kwargs)
+
+    monkeypatch.setattr(job, "download_tarball", _download)
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets", "acme/gadgets"], index_concurrency=1),
+            _RecordingIndex(),
+        )
+    assert code == 0
+
+    messages = _timing_messages(caplog)
+    assert len(messages) == 2
+    assert {_TIMING_RE.match(m).group("repo") for m in messages} == {  # type: ignore[union-attr]
+        "acme/widgets",
+        "acme/gadgets",
+    }
+    for message in messages:
+        phases = _phases(message)
+        assert phases["download"] == 3.0
+        assert phases["total"] == 3.0
+        assert phases["other"] == 0.0
+
+
+@pytest.mark.unit
+def test_index_counts_fields_are_unchanged() -> None:
+    """T11 (AC3): a tripwire that timing never leaks into the frozen return type.
+
+    `IndexCounts` is compared by value in existing assertions across the unit and
+    integration suites; a timing field would be nonzero by construction and break
+    every one of them. The sweep duration reaches job.py ambiently for exactly
+    this reason.
+    """
+    assert [f.name for f in dataclasses.fields(IndexCounts)] == [
+        "files",
+        "symbols",
+        "swept",
+        "edges",
+    ]
+
+
+@pytest.mark.unit
+def test_timing_line_contains_no_values_beyond_durations(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T12 (AC3 / redaction): the anchored regex matches the WHOLE message, so
+    nothing but the repo, the branch, and the nine durations can ever appear --
+    no config values, no counts, no headers -- and no field can go negative."""
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    config = _config(repos=["acme/widgets"], semantic_max_chunks_per_repo={"acme/widgets": 7})
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            config,
+            _RecordingIndex(),
+            cfg=cfg,
+            embed_fn=lambda texts: [[0.0] for _ in texts],
+        )
+    assert code == 0
+
+    messages = _timing_messages(caplog)
+    assert len(messages) == 1
+    assert _TIMING_RE.fullmatch(messages[0]) is not None, messages[0]
+
+
+@pytest.mark.unit
+def test_sweep_time_is_subtracted_from_db_time(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T16: the cross-module sweep hook, pinned without Postgres.
+
+    A fake `index_fn` runs on the worker thread inside the installed timer's
+    context, so its `record("sweep", ...)` reaches exactly the timer the real
+    `store.py` hook would. Without this test the subtraction term is zero in
+    every unit test and the arithmetic is unproven under `make test`.
+    """
+    import indexer.timing as timing
+
+    clock = _install_fake_clock(monkeypatch)
+
+    def _index(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        consumed = list(items)
+        clock.advance(2.0)  # the sweep really burned this time...
+        timing.record("sweep", 2.0)  # ...and store.py reports it ambiently
+        clock.advance(6.0)  # the rest of the transaction
+        return IndexCounts(files=len(consumed), symbols=0, swept=1, edges=0)
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _index)
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert phases["sweep"] == 2.0
+    assert phases["db"] == 6.0  # NOT 8.0
+    assert phases["total"] == 8.0
+    assert phases["other"] == 0.0
+
+
+@pytest.mark.unit
+def test_semantic_eager_walk_is_charged_to_parse(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T18: on the semantic (production) path the file list is materialized up front,
+    OUTSIDE the db window and outside _timed_items. Leaving that walk unwrapped would
+    dump the whole rglob + stat + read + decode cost into `other` -- the exact number
+    that routes work between the epic's parse/IO/db issues."""
+    import indexer.job as job
+
+    clock = _install_fake_clock(monkeypatch)
+    real_iter_source_files = job.iter_source_files
+
+    def _slow_walk(root: Any) -> Any:
+        # iter_source_files is a generator function: paying the cost at call
+        # time (before the first `next()`) would let this fake pass even if
+        # the real wrap only timed the call and not the iteration -- the
+        # exact mis-scoped-wrap bug this test exists to catch. Pay per
+        # yielded file instead, matching where the real cost (rglob walk,
+        # stat, read, decode) is actually incurred.
+        for pf in real_iter_source_files(root):
+            clock.advance(3.0)  # 2 files in _DEFAULT_FILES -> 6.0s total
+            yield pf
+
+    monkeypatch.setattr(job, "iter_source_files", _slow_walk)
+
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            cfg=cfg,
+            embed_fn=lambda texts: [[0.0] for _ in texts],
+        )
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert phases["parse"] == 6.0
+    assert phases["other"] == 0.0  # not swallowed by the residual
+    assert phases["db"] == 0.0  # and not misattributed to the transaction
+    assert phases["total"] == 6.0
+
+
+@pytest.mark.unit
+def test_embed_degrade_path_still_logs_a_timing_line(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T19: a downed embedder degrades to a core index -- and it burned real time
+    getting there, so `embed=` must still report it. That is why the embed wrap is
+    the one phase recorded in a `finally`."""
+    clock = _install_fake_clock(monkeypatch)
+
+    def _down(_texts: list[str]) -> list[list[float]]:
+        clock.advance(7.0)
+        raise RuntimeError("serving endpoint unavailable")
+
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), idx, cfg=cfg, embed_fn=_down)
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]  # the core index still ran
+    assert idx.chunk_writer is None  # ...without chunks
+
+    phases = _only_phases(caplog)
+    assert phases["embed"] == 7.0
+    assert phases["total"] == 7.0
+    assert phases["other"] == 0.0
+
+
+@pytest.mark.unit
+def test_other_is_the_exact_unattributed_residual(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17: pins the RESIDUAL, not the sum identity.
+
+    `other` is *defined* as `total - sum(phases)`, so asserting
+    `total == sum(phases) + other` is a tautology that holds for any values and can
+    never detect a mis-measured phase. This test instead drives a distinct known
+    amount through every one of the seven phases and requires `other == 0.00s`,
+    then re-runs with one deliberately UNINSTRUMENTED advance and requires `other`
+    to equal exactly that amount.
+    """
+    import indexer.job as job
+
+    clock = _install_fake_clock(monkeypatch)
+    real_resolve_branch_head = job.resolve_branch_head
+    real_download_tarball = job.download_tarball
+    real_extract_tarball = job.extract_tarball
+    real_iter_source_files = job.iter_source_files
+    real_assert_disk_headroom = job.assert_disk_headroom
+
+    def _resolve_branch_head(*args: Any, **kwargs: Any) -> str:
+        clock.advance(1.0)
+        return real_resolve_branch_head(*args, **kwargs)
+
+    def _download_tarball(*args: Any, **kwargs: Any) -> Any:
+        clock.advance(2.0)
+        return real_download_tarball(*args, **kwargs)
+
+    def _extract_tarball(*args: Any, **kwargs: Any) -> Any:
+        clock.advance(4.0)
+        return real_extract_tarball(*args, **kwargs)
+
+    def _iter_source_files(root: Any) -> Any:
+        # Pay per yielded file, not at call time -- iter_source_files is a
+        # generator function, so a call-time advance would pass even for a
+        # wrap that only times the call and not the iteration.
+        for pf in real_iter_source_files(root):
+            clock.advance(4.0)  # 2 files in _DEFAULT_FILES -> 8.0s total
+            yield pf
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        clock.advance(16.0)
+        return [[0.0] for _ in texts]
+
+    def _index(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        import indexer.timing as timing
+
+        consumed = list(items)
+        clock.advance(32.0)  # the transaction's own DML
+        clock.advance(64.0)  # the sweep, which store.py reports ambiently
+        timing.record("sweep", 64.0)
+        return IndexCounts(files=len(consumed), symbols=0, swept=0, edges=0)
+
+    monkeypatch.setattr(job, "resolve_branch_head", _resolve_branch_head)
+    monkeypatch.setattr(job, "download_tarball", _download_tarball)
+    monkeypatch.setattr(job, "extract_tarball", _extract_tarball)
+    monkeypatch.setattr(job, "iter_source_files", _iter_source_files)
+
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    # "main" is stamped current so it is SKIPPED, leaving exactly one indexed
+    # branch -- and a non-default one, which is the only way `resolve=` is
+    # non-zero (the default branch's HEAD came from the repo-level resolve_ref).
+    engine = _FakeEngine(
+        stamps={("acme/widgets", "main"): ("sha_widgets", INDEX_SEMANTICS_VERSION)}
+    )
+    github = _GitHub(branches={"acme/widgets": ["main", "feature"]})
+    config = _config(repos=["acme/widgets"], branches=["feature"], index_concurrency=1)
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(config, _index, cfg=cfg, embed_fn=_embed, github=github, engine=engine)
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert phases == {
+        "total": 127.0,
+        "resolve": 1.0,
+        "download": 2.0,
+        "extract": 4.0,
+        "parse": 8.0,
+        "embed": 16.0,
+        "db": 32.0,
+        "sweep": 64.0,
+        "other": 0.0,
+    }
+
+    # Second leg: advance the clock at a point NOTHING instruments (the pre-flight
+    # disk check). Every phase must be unchanged and `other` must be exactly it.
+    def _assert_disk_headroom(*args: Any, **kwargs: Any) -> None:
+        clock.advance(9.0)
+        real_assert_disk_headroom(*args, **kwargs)
+
+    monkeypatch.setattr(job, "assert_disk_headroom", _assert_disk_headroom)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(config, _index, cfg=cfg, embed_fn=_embed, github=github, engine=engine)
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert phases == {
+        "total": 136.0,
+        "resolve": 1.0,
+        "download": 2.0,
+        "extract": 4.0,
+        "parse": 8.0,
+        "embed": 16.0,
+        "db": 32.0,
+        "sweep": 64.0,
+        "other": 9.0,
+    }

@@ -29,6 +29,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db.models import INDEX_SEMANTICS_VERSION, File, ReferenceEdge, Repo, RepoBranch, Symbol
 from indexer.hashing import content_sha
 from indexer.languages import FileExtraction, IndexCounts, ParsedFile
+from indexer.timing import now, record
 
 logger = logging.getLogger("indexer.store")
 
@@ -242,6 +243,14 @@ def index_repo(
             if chunk_writer is not None:
                 chunk_writer(conn, repo_id, file_id, pf)
 
+        # Timed into indexer.job's ambient per-branch PhaseTimer, if one is
+        # installed -- a no-op otherwise, so a direct index_repo call (tests,
+        # scripts) is unaffected. Deliberately NOT a return value: IndexCounts is
+        # a frozen dataclass compared by value in existing assertions, and NOT a
+        # new index_repo parameter: that signature is an injected seam whose
+        # fakes would all have to grow one. No log record is emitted here; the
+        # number surfaces on job.py's single `phase timing` line.
+        sweep_started = now()
         swept = _sweep_membership(
             conn,
             name=name,
@@ -250,6 +259,7 @@ def index_repo(
             seen_paths=seen_paths,
             seen_shas=seen_shas,
         )
+        record("sweep", now() - sweep_started)
 
         _stamp_repo_branch(
             conn,
