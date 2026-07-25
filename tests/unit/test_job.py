@@ -2702,6 +2702,47 @@ def test_timer_reset_fires_on_every_branch_exit_path(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.unit
+def test_phase_timing_failure_does_not_fail_an_already_committed_branch(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bug in the phase-timing arithmetic/log call must degrade to a missing
+    log line, never to reclassifying an already-committed branch as `failed`.
+
+    By the point this block runs, `index_fn` has already returned `counts` --
+    this branch's transaction is committed. Flipping it to `failed` here would
+    report a real committed index as a failure, flip the run's exit code, and
+    gate off `_decide_reconciliation` (which requires zero failures), all for a
+    bug in pure measurement code. Forces the failure at the `logger.info` call
+    itself (the last statement in the guarded block) so a passing test proves
+    the whole block is covered, not just the arithmetic above it.
+    """
+    import indexer.job as job
+
+    real_info = job.logger.info
+
+    def _boom_on_phase_timing(msg: object, *args: Any, **kwargs: Any) -> None:
+        if isinstance(msg, str) and msg.startswith("phase timing "):
+            raise RuntimeError("boom")
+        real_info(msg, *args, **kwargs)
+
+    monkeypatch.setattr(job.logger, "info", _boom_on_phase_timing)
+
+    idx = _RecordingIndex()
+    with caplog.at_level(logging.WARNING, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), idx)
+
+    assert code == 0
+    assert idx.calls == ["acme/widgets"]
+    # No well-formed `phase timing ...: total=...` line was emitted (the raise
+    # happened inside the logger.info call itself) -- but the module's own
+    # "phase timing unavailable" fallback below shares the "phase timing "
+    # prefix, so check the anchored data-line shape rather than the prefix.
+    assert not any(_TIMING_RE.match(r.getMessage()) for r in caplog.records)
+    assert "failed to index" not in caplog.text
+    assert "phase timing unavailable for acme/widgets@main" in caplog.text
+
+
+@pytest.mark.unit
 def test_index_counts_fields_are_unchanged() -> None:
     """T11 (AC3): a tripwire that timing never leaks into the frozen return type.
 

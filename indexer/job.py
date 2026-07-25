@@ -1151,40 +1151,53 @@ def _index_one_branch(
         # possibly multi-GB extracted tree, which `other` must include) and from
         # inside the worker, where _index_one's _repo_ctx still resolves the
         # [%(repo)s] field. The drain loop on the main thread would render `[-]`.
-        db = max(
-            0.0,
-            db_wall - (timer.total("parse") - parse_before) - (timer.total("sweep") - sweep_before),
-        )
-        total = timer.clock() - branch_started
-        other = max(
-            0.0,
-            total
-            - timer.total("resolve")
-            - timer.total("download")
-            - timer.total("extract")
-            - timer.total("parse")
-            - timer.total("embed")
-            - db
-            - timer.total("sweep"),
-        )
-        # One format string, no branches: a phase that did not run prints 0.00s
-        # rather than vanishing, so the line stays greppable and field-stable
-        # whether or not semantic indexing is on.
-        logger.info(
-            "phase timing %s@%s: total=%.2fs resolve=%.2fs download=%.2fs extract=%.2fs "
-            "parse=%.2fs embed=%.2fs db=%.2fs sweep=%.2fs other=%.2fs",
-            name,
-            branch,
-            total,
-            timer.total("resolve"),
-            timer.total("download"),
-            timer.total("extract"),
-            timer.total("parse"),
-            timer.total("embed"),
-            db,
-            timer.total("sweep"),
-            other,
-        )
+        #
+        # `index_fn` above already committed this branch's transaction -- `counts`
+        # is proof of that. This block is measurement ONLY, so it gets its own
+        # try/except: per timing.py's own principle ("instrumentation must never
+        # be able to fail the work it measures"), a bug here must degrade to a
+        # missing log line, never to reclassifying an already-committed branch as
+        # `failed` (which would also flip the run's exit code and gate off the
+        # post-fan-out reconciliation checkpoint, which requires zero failures).
+        try:
+            db = max(
+                0.0,
+                db_wall
+                - (timer.total("parse") - parse_before)
+                - (timer.total("sweep") - sweep_before),
+            )
+            total = timer.clock() - branch_started
+            other = max(
+                0.0,
+                total
+                - timer.total("resolve")
+                - timer.total("download")
+                - timer.total("extract")
+                - timer.total("parse")
+                - timer.total("embed")
+                - db
+                - timer.total("sweep"),
+            )
+            # One format string, no branches: a phase that did not run prints 0.00s
+            # rather than vanishing, so the line stays greppable and field-stable
+            # whether or not semantic indexing is on.
+            logger.info(
+                "phase timing %s@%s: total=%.2fs resolve=%.2fs download=%.2fs extract=%.2fs "
+                "parse=%.2fs embed=%.2fs db=%.2fs sweep=%.2fs other=%.2fs",
+                name,
+                branch,
+                total,
+                timer.total("resolve"),
+                timer.total("download"),
+                timer.total("extract"),
+                timer.total("parse"),
+                timer.total("embed"),
+                db,
+                timer.total("sweep"),
+                other,
+            )
+        except Exception:
+            logger.warning("phase timing unavailable for %s@%s", name, branch, exc_info=True)
         return BranchOutcome(branch=branch, status="indexed", counts=counts)
     except StaleIndexError as exc:
         # The repo_branches row for THIS branch changed under this worker, so
