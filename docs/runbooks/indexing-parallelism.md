@@ -154,6 +154,16 @@ you write keeps working. Read the largest field; that is the branch's bottleneck
 | `db` | per-file round trips | #105 (batched writes) |
 | any of the above, on **unchanged** content | redundant work | #104 (file-level delta indexing) |
 
+`#104` narrows the **db** and **embed** costs to a branch's actual delta, not
+its size — but it does NOT touch `parse`: extraction still runs on every
+file every run (tree-sitter must produce a `FileExtraction` before
+`index_repo` can classify it), so an all-unchanged branch on a large repo
+still pays its full `download`+`extract`+`parse` cost. See `indexer.store`'s
+`delta write set …` line (below) to tell "this branch is genuinely mostly-new"
+from "this branch is mostly-unchanged but still parsing everything" — the
+latter is exactly the case `#108` (process-pool extraction) or a future
+extraction-skip step would address next.
+
 Four fields need interpretation before you act on them:
 
 - **`resolve=0.00s` on a default branch is expected, not a bug.** That branch's
@@ -183,6 +193,36 @@ Four fields need interpretation before you act on them:
   `rglob`, on the first item). That is long-standing behavior which this
   instrumentation merely makes visible for the first time — it is not a new
   regression.
+
+### 2.2 The delta write set line (#104)
+
+Every `index_repo` call also emits one `indexer.store` INFO line, immediately
+before the sweep, in **both** the gate-open and gate-closed cases — one format
+string, no conditional fields, so it stays greppable either way:
+
+```
+INFO indexer.store [acme/widgets]: acme/widgets@main: delta write set 412/30214 files (unchanged=29790 membership=12, semantics gate open)
+INFO indexer.store [acme/gadgets]: acme/gadgets@main: delta write set 812/812 files (unchanged=0 membership=0, semantics gate closed: stored v3 != v4)
+```
+
+`unchanged` files write nothing at all (no file upsert, no symbol/edge
+delete-reinsert, no chunk write) and are never re-embedded. `membership` files
+are already stored under another branch and only need their `branches` array
+unioned in, plus a chunk write if semantic is on (see §4's accepted
+regressions). The leading fraction is `(changed/new) / (total seen)`. The gate
+is per-BRANCH: it opens only once that branch's own `repo_branches` stamp is
+at the current `INDEX_SEMANTICS_VERSION` — a branch's first run, or any run
+after a semantics bump, always shows `semantics gate closed`.
+
+```
+grep 'delta write set' run.log         # one line per index_repo call
+```
+
+A branch stuck at a low `unchanged=` fraction run after run either genuinely
+churns every run (nothing to fix) or has drifted out of delta eligibility —
+check its `repo_branches.index_semantics_version` against the current
+`INDEX_SEMANTICS_VERSION` and whether a sibling branch is stale (§4's
+provenance gate).
 
 ---
 
@@ -265,16 +305,78 @@ There is deliberately **no `--force_reindex` flag.** Forcing a re-index means
 clearing the provenance stamp, after which the normal skip logic re-indexes the
 affected repos on the next scheduled or manual run.
 
+**The stamp the skip seam actually reads is `repo_branches`, not `repos`.**
+`indexer/job.py`'s `_read_stamps` selects
+`RepoBranch.last_indexed_commit, RepoBranch.index_semantics_version` — the
+`repos` table's `index_semantics_version` column is a deprecated legacy stamp
+that no decision anywhere reads (`app/db/models.py` documents it write-only).
+An `UPDATE repos SET index_semantics_version = NULL` is therefore a **no-op**
+against the skip seam: the branch will look untouched and re-index on its own
+next scheduled cycle, not immediately, and the operator following an older
+version of this runbook would see nothing happen.
+
 ```sql
 -- everything
-UPDATE repos SET index_semantics_version = NULL;
+UPDATE repo_branches SET index_semantics_version = NULL;
 
--- one repo
-UPDATE repos SET index_semantics_version = NULL WHERE name = 'acme/widgets';
+-- one repo, every branch
+UPDATE repo_branches SET index_semantics_version = NULL
+  WHERE repo_id = (SELECT id FROM repos WHERE name = 'acme/widgets');
+
+-- one repo, one branch
+UPDATE repo_branches SET index_semantics_version = NULL
+  WHERE repo_id = (SELECT id FROM repos WHERE name = 'acme/widgets')
+    AND branch = 'main';
 ```
 
 Then run the job (`make index TARGET=<target>` or `databricks bundle run
 code_search_index -t <target>`).
+
+### 4.1 File-level delta indexing (#104): what changes about this remedy
+
+Once a branch's `repo_branches.index_semantics_version` matches the current
+`INDEX_SEMANTICS_VERSION`, `index_repo` skips rewriting any file whose
+`(path, content_sha)` it already has stored for that branch — see
+`indexer.store`'s module docstring for the full classification and the
+correctness proof. Two consequences change what "clear the stamp" actually
+buys you:
+
+**A degraded branch no longer self-heals on its own.** Before #104, ANY
+re-index rewrote the whole branch, so a branch whose semantic precompute
+failed (a chunk-cap breach, an embedder outage) caught its chunks up
+automatically on the next successful run. Under delta indexing, only
+*changed* files get re-embedded — a branch that never changes again carries
+that gap **forever** unless you clear its stamp. `indexer.job` emits one
+run-completion WARNING naming every branch that finished this way:
+
+```
+WARNING indexer.job [-]: 2 branch(es) finished with degraded semantic coverage this run (chunk precompute failed; core index is current, chunks are not, and delta indexing will NOT catch them up on their own -- clear their repo_branches.index_semantics_version stamp to force a full re-embed, see docs/runbooks/indexing-parallelism.md §4): acme/big-repo@main, acme/other@release
+```
+
+Grep for it (`grep 'degraded semantic coverage' run.log`) and clear the named
+branches' stamps with the one-branch form above once the underlying cause
+(chunk cap, embedder outage) is resolved.
+
+**The provenance gate can force a full re-index you did not ask for.** A
+branch only takes the cheaper "membership-only" path (acquiring content a
+*sibling* branch already stored, e.g. two branches sharing most of a
+monorepo) when **every** `repo_branches` row for that repo is at the current
+semantics version. If you clear one branch's stamp and leave siblings
+untouched, that is fine — but a repo with one branch stuck at an old version
+for any other reason (a persistently failing branch) will force every OTHER
+branch of that repo through the full write path for any file it shares with
+the stuck one, even though those branches are otherwise fully caught up. The
+`delta write set …` line's `membership=` count going to zero across a whole
+repo, with `unchanged=` still high, is the symptom — check for a sibling
+branch stuck at a stale `index_semantics_version` before assuming something
+is broken.
+
+**`semantic_max_chunks_per_repo` is enforced per RUN, not per branch's whole
+corpus.** The cap is evaluated over whatever `_precompute_chunk_writer`
+embeds, which under delta indexing is only the changed/new/membership-only
+files. A branch can drift above the nominal cap between full reindexes (a
+semantics bump, or its first index) — re-enforced in full at each of those.
+Not a bug; see `app/config.py`'s `semantic_max_chunks_per_repo` comment.
 
 ### Who can run this — read before you need it
 
@@ -304,6 +406,21 @@ no in-repo record of it.
 If you change **what** gets extracted — `indexer/symbols.py`,
 `indexer/parse.py`, `indexer/languages.py` — you **must** bump
 `INDEX_SEMANTICS_VERSION` in `app/db/models.py`.
+
+**The same obligation now extends past the tripwire's watched files (#104).**
+`indexer/parse.py`'s chunker is already a watched path, so a change to
+`iter_chunks` still fires the tripwire. Swapping the embedding MODEL
+(`app/embed.py`) or changing `SEMANTIC_EMBEDDING_DIM` (`app/config.py`)
+without bumping `INDEX_SEMANTICS_VERSION` is NOT caught by the tripwire (both
+are deliberately unwatched — `app/embed.py` would otherwise fire on
+unrelated retry/batching edits and a noisy tripwire gets disabled) and now
+leaves every UNCHANGED file's vectors permanently stale under file-level
+delta indexing — before #104 the next HEAD move re-embedded everything
+anyway, so a missed bump here was self-limiting; it no longer is. This is not
+a new pattern: `INDEX_SEMANTICS_VERSION` version `2` was minted for exactly
+this reason (turning semantic search on by default so `chunks` backfills).
+Treat this as a reviewed convention, the same posture `indexer.store`'s
+module docstring takes for `lang`/`size` re-derivation.
 
 Without a bump, every already-indexed repo keeps serving output from the *old*
 extractor and never re-indexes, because its stored stamp still matches HEAD.
