@@ -69,6 +69,81 @@ class ReconcileCounts:
 # computed -- this seam never calls an embedder itself.
 ChunkWriter = Callable[[Connection, int, int, ParsedFile], None]
 
+# The two projection reads behind the file-level delta path. Returned as
+# ``(carried, present)`` -- see read_repo_content_shas.
+ContentShaSets = tuple[set[tuple[str, str]], set[tuple[str, str]]]
+
+
+def read_repo_content_shas(conn: Connection, *, repo_id: int, branch: str) -> ContentShaSets:
+    """Project one repo's stored ``(path, content_sha)`` pairs, twice.
+
+    Returns ``(carried, present)``:
+
+    * ``carried`` -- the pairs on rows whose ``branches`` array already contains
+      ``branch``. A parsed file in this set is UNCHANGED for this branch.
+    * ``present`` -- every pair stored for this repo, on any branch. A parsed
+      file in ``present - carried`` already exists as a row this branch does not
+      yet carry, i.e. the membership-only class.
+
+    **The projection is ``path, content_sha`` and nothing else, deliberately.**
+    Two expensive mistakes are available here and both must stay closed:
+
+    * selecting ``content`` pulls the entire corpus into the worker and defeats
+      the whole point of the delta path;
+    * selecting ``branches`` forces a heap fetch per row on a table whose rows
+      carry that content, so the second read stops being an Index Only Scan.
+
+    **They are also two separate statements on purpose.** Do NOT collapse them
+    into ``SELECT path, content_sha, branches @> ... AS carries FROM files WHERE
+    repo_id = :id``: that drops the branch predicate entirely (so
+    ``ix_files_branches_gin`` is never consulted) *and* projects ``branches``.
+    The containment form ``branches @> ARRAY[:branch]`` is what the GIN index can
+    serve; ``_sweep_membership``'s ``:branch = ANY(branches)`` cannot be.
+
+    **Keyed on ``(path, content_sha)``, NEVER on path alone.**
+    ``uq_files_repo_path_sha`` permits several rows for one path with different
+    content (the divergent-branch case), so a path-keyed dict silently drops rows
+    and which one survives depends on row order.
+    """
+    carried = {
+        (row.path, row.content_sha)
+        for row in conn.execute(
+            text(
+                "SELECT path, content_sha FROM files "
+                "WHERE repo_id = :repo_id AND branches @> CAST(:branch_arr AS text[])"
+            ),
+            {"repo_id": repo_id, "branch_arr": [branch]},
+        )
+    }
+    present = {
+        (row.path, row.content_sha)
+        for row in conn.execute(
+            text("SELECT path, content_sha FROM files WHERE repo_id = :repo_id"),
+            {"repo_id": repo_id},
+        )
+    }
+    return carried, present
+
+
+def read_indexed_shas(conn: Connection, *, name: str, branch: str) -> ContentShaSets:
+    """Name-keyed wrapper around :func:`read_repo_content_shas` for ``indexer.job``.
+
+    Resolves ``repos.name -> id`` itself and returns two empty sets for a repo
+    that has never been indexed (which degrades to "everything is changed/new" --
+    safe in the correct direction). This is the ADVISORY copy of the read: the
+    authoritative one runs inside ``index_repo``'s transaction. Both go through
+    the same helper so there is exactly one pair of queries and one keying rule.
+
+    Called on its own short-lived connection that is closed BEFORE embedding
+    starts -- never on a connection held across network I/O.
+    """
+    repo_id = conn.execute(
+        text("SELECT id FROM repos WHERE name = :name"), {"name": name}
+    ).scalar_one_or_none()
+    if repo_id is None:
+        return set(), set()
+    return read_repo_content_shas(conn, repo_id=int(repo_id), branch=branch)
+
 
 def index_repo(
     conn: Connection,
@@ -95,14 +170,30 @@ def index_repo(
     2. Upsert/read the ``repo_branches`` row for ``(repo_id, branch)`` under its
        row lock, capturing ``(baseline_commit, baseline_version)`` -- the CAS
        baseline for step 5, mirroring the same ``RETURNING`` trick as step 1.
-    3. Per file: an array-union upsert on ``uq_files_repo_path_sha`` -- a file
-       whose content already exists under another branch gets THIS branch
-       unioned into its ``branches`` array (one row, shared content); a file
-       whose content differs from every existing version gets its own row. Then
-       delete-and-reinsert its ``symbols`` and ``reference_edges`` (neither has a
-       natural key), then call ``chunk_writer`` (if given) so chunk writes
-       commit/roll back with the rest of that file's row. Each processed file's
-       ``(path, content_sha)`` is collected into this branch's seen-set.
+    3. Two projection reads (:func:`read_repo_content_shas`), issued ONLY when
+       the delta gate is open -- see below -- then, per file, a three-way
+       classification on ``(pf.path, content_sha(pf.content))``:
+
+       * **unchanged** (the pair is already on a row carrying this branch): no
+         statement at all.
+       * **membership-only** (the pair is stored for this repo but on a row this
+         branch does not carry, AND statement 4 proves every branch of this repo
+         is at the current semantics version): no symbol/edge work; the whole
+         class is unioned in by ONE batched ``UPDATE ... RETURNING`` after the
+         loop, which also supplies the ``file_id`` for its ``chunk_writer`` call
+         (see :func:`_union_membership`).
+       * **changed/new** (everything else): an array-union upsert on
+         ``uq_files_repo_path_sha`` -- a file whose content already exists under
+         another branch gets THIS branch unioned into its ``branches`` array (one
+         row, shared content); a file whose content differs from every existing
+         version gets its own row. Then delete-and-reinsert its ``symbols`` and
+         ``reference_edges`` (neither has a natural key), then call
+         ``chunk_writer`` (if given) so chunk writes commit/roll back with the
+         rest of that file's row.
+
+       **Every** parsed file -- classified or written -- is collected into this
+       branch's seen-set, so step 4 and its empty-seen-set guard are correct by
+       construction and untouched by the delta path.
     4. Membership sweep, keyed on THIS branch's seen-set (never on ``commit``,
        which is ambiguous under dedup): strip ``branch`` from any row's
        ``branches`` array that is not in the seen-set, then delete any row left
@@ -112,17 +203,66 @@ def index_repo(
        set is empty** -- an empty seen-set would otherwise strip ``branch`` from
        every row in the repo; conservatively skipping is safer than wiping.
     5. CAS-stamp the ``repo_branches`` row for ``(repo_id, branch)`` against the
-       step-2 baseline (raises :class:`StaleIndexError` on mismatch).
+       step-2 baseline (raises :class:`StaleIndexError` on mismatch). A run whose
+       seen-set was EMPTY advances ``last_indexed_commit`` but leaves
+       ``index_semantics_version`` at the step-2 baseline -- it wrote nothing, so
+       it indexed nothing at the current semantics version. See
+       :func:`_stamp_repo_branch`.
 
     ``items`` may be a lazy generator; it is consumed inside the open
     transaction so memory stays bounded. ``chunk_writer`` defaults to ``None``,
     which makes this byte-identical to the core (semantic-off) path; when given,
     it must write PRECOMPUTED chunks -- embeddings are computed outside this
     transaction, so no network call ever happens here.
+
+    **The delta gate.** The classification above is taken only when
+    ``baseline_version == INDEX_SEMANTICS_VERSION`` -- statement 2's ``RETURNING``
+    value, already in hand, no extra query. A ``NULL`` or older version means
+    every file takes the full write path and statements 3a/3b are never issued.
+
+    Why the unchanged path is sound, inductively:
+
+    * A row carrying this branch was necessarily written by this branch's last
+      COMPLETED run, and that run ran at ``baseline_version ==
+      INDEX_SEMANTICS_VERSION``. In it the row was either written full-path (so
+      it is current), or skipped as unchanged (current, by induction).
+    * ... or acquired membership-only, which
+      :func:`_repo_is_wholly_at_current_version` only permits when every branch
+      of the repo is at the current version (so every surviving row of the repo
+      was last written at it).
+    * Base case: the first run after ANY version transition has
+      ``baseline_version != INDEX_SEMANTICS_VERSION``, so it is full-path for
+      every parsed file. A zero-parse run cannot manufacture a spurious base
+      case -- it does not advance the version stamp (see
+      :func:`_stamp_repo_branch`).
+
+    Two columns are deliberately NOT re-derived for a skipped file:
+
+    * ``lang`` and ``size`` are pure functions of ``(path, content)`` via
+      ``indexer/parse.py`` + ``indexer/languages.py``, both watched by
+      ``tests/unit/test_semantics_version_tripwire.py`` -- so a change to either
+      derivation is MEANT to force a version bump, which closes this gate. That
+      tripwire is a local-developer guard rather than a CI one, so treat this as
+      a strong convention backed by review, not a machine-enforced invariant.
+    * ``files.commit`` goes staler. No production read path exists (every
+      ``commit:`` filter resolves from ``repo_branches.last_indexed_commit``,
+      and the column is documented write-only and ambiguous under dedup in
+      ``app/db/models.py``). This makes it staler; it makes nothing wrong.
+
+    The breakdown is reported on one INFO line per call, immediately before the
+    sweep, in both the gate-open and gate-closed cases::
+
+        acme/widgets@main: delta write set 412/30214 files (unchanged=29790 membership=12,
+        semantics gate open)
+
+    ``IndexCounts`` is unchanged: ``files`` still counts files SEEN this run, and
+    ``symbols``/``edges`` still count rows actually inserted -- so they
+    legitimately read ``0`` on an all-unchanged run. That is the correct signal.
     """
     file_count = 0
     symbol_count = 0
     edge_count = 0
+    unchanged_count = 0
     seen_paths: list[str] = []
     seen_shas: list[str] = []
 
@@ -159,8 +299,47 @@ def index_repo(
         )
         baseline_commit, baseline_version = conn.execute(branch_stmt).one()
 
+        # Statements 3a/3b/4, issued only behind the delta gate. Everything the
+        # classification below needs is now in hand; nothing else is read.
+        delta_on = baseline_version == INDEX_SEMANTICS_VERSION
+        carried: set[tuple[str, str]] = set()
+        present: set[tuple[str, str]] = set()
+        membership_ok = False
+        if delta_on:
+            carried, present = read_repo_content_shas(conn, repo_id=repo_id, branch=branch)
+            membership_ok = _repo_is_wholly_at_current_version(conn, repo_id=repo_id)
+
+        # (pf, content_sha) for each membership-only file, held until the batched
+        # UPDATE below can hand back their file ids. A bounded exception to the
+        # "items stream through the transaction" rule: membership-only is the
+        # rare class (a branch ACQUIRING content another branch already stored),
+        # not the steady state, and chunk_writer's seam takes the ParsedFile.
+        membership: list[tuple[ParsedFile, str]] = []
+
         for pf, ex in items:
             sha = content_sha(pf.content)
+            # Seen-set membership is recorded for EVERY parsed file, whatever its
+            # class -- that is what keeps the sweep (and its empty-seen-set
+            # guard) correct without any delta awareness of its own.
+            file_count += 1
+            seen_paths.append(pf.path)
+            seen_shas.append(sha)
+
+            if delta_on and (pf.path, sha) in carried:
+                # Unchanged: this exact content is already stored on a row this
+                # branch already carries. No file upsert, no symbol/edge
+                # delete-reinsert, no chunk_writer call.
+                unchanged_count += 1
+                continue
+
+            if delta_on and membership_ok and (pf.path, sha) in present:
+                # Membership-only: the row exists (written by another branch) but
+                # does not carry this branch yet. Statement 4 has proven every
+                # branch of this repo is at the current semantics version, so its
+                # symbols/edges are current and only the array union is owed.
+                membership.append((pf, sha))
+                continue
+
             file_stmt = (
                 pg_insert(File)
                 .values(
@@ -194,9 +373,6 @@ def index_repo(
                 .returning(File.id)
             )
             file_id = conn.execute(file_stmt).scalar_one()
-            file_count += 1
-            seen_paths.append(pf.path)
-            seen_shas.append(sha)
 
             conn.execute(delete(Symbol).where(Symbol.file_id == file_id))
             if ex.symbols:
@@ -243,6 +419,38 @@ def index_repo(
             if chunk_writer is not None:
                 chunk_writer(conn, repo_id, file_id, pf)
 
+        # ONE statement for the whole membership-only class, skipped entirely
+        # when that class is empty (rather than issued as a no-op) so the
+        # statement inventory stays stable and greppable.
+        if membership:
+            _union_membership(
+                conn,
+                repo_id=repo_id,
+                branch=branch,
+                membership=membership,
+                chunk_writer=chunk_writer,
+            )
+
+        # One INFO line per index_repo call, immediately before the sweep, in
+        # BOTH the gate-open and gate-closed cases -- one format string, no
+        # conditional fields, so the line is always present and always greppable.
+        # The reason tail is the only part that varies. IndexCounts is
+        # deliberately NOT extended to carry this: it is a frozen dataclass
+        # compared by value in existing assertions, and `files` keeps meaning
+        # "files seen this run" (the seen-set size).
+        logger.info(
+            "%s@%s: delta write set %d/%d files (unchanged=%d membership=%d, %s)",
+            name,
+            branch,
+            file_count - unchanged_count - len(membership),
+            file_count,
+            unchanged_count,
+            len(membership),
+            "semantics gate open"
+            if delta_on
+            else f"semantics gate closed: stored v{baseline_version} != v{INDEX_SEMANTICS_VERSION}",
+        )
+
         # Timed into indexer.job's ambient per-branch PhaseTimer, if one is
         # installed -- a no-op otherwise, so a direct index_repo call (tests,
         # scripts) is unaffected. Deliberately NOT a return value: IndexCounts is
@@ -269,9 +477,96 @@ def index_repo(
             head_sha=head_sha,
             baseline_commit=baseline_commit,
             baseline_version=baseline_version,
+            seen_any=bool(seen_paths),
         )
 
     return IndexCounts(files=file_count, symbols=symbol_count, swept=swept, edges=edge_count)
+
+
+def _repo_is_wholly_at_current_version(conn: Connection, *, repo_id: int) -> bool:
+    """Statement 4: is EVERY ``repo_branches`` row for this repo at the current version?
+
+    The provenance gate the membership-only class depends on, and the hole
+    ``(path, content_sha)`` alone does not close. Counter-example it exists for:
+    branch ``b`` is stamped at the current version (delta on); sibling branch
+    ``a`` was written at an OLDER version and has not re-indexed since. ``b``'s
+    HEAD moves and acquires a file whose exact ``(path, content)`` already exists
+    as ``a``'s stale-version row. Taking the membership-only path would skip the
+    symbol/edge rewrite, so ``b`` would serve old-extractor symbols under a
+    current-version stamp -- silently, and exactly the failure
+    ``INDEX_SEMANTICS_VERSION`` exists to prevent.
+
+    Given this gate, every surviving ``files`` row of the repo was last written
+    at the current version: every row carries at least one branch (both sweep
+    sites delete rows at ``cardinality(branches) = 0``), and every branch string
+    on a ``branches`` array has a ``repo_branches`` row (``index_repo`` writes
+    statement 2 before any file row for that branch, and
+    ``reconcile_retired_branches`` deletes both in one transaction). Both
+    directions are load-bearing and both are pinned by tests.
+    """
+    return bool(
+        conn.execute(
+            text(
+                "SELECT NOT EXISTS (SELECT 1 FROM repo_branches "
+                "WHERE repo_id = :repo_id "
+                "AND index_semantics_version IS DISTINCT FROM :version)"
+            ),
+            {"repo_id": repo_id, "version": INDEX_SEMANTICS_VERSION},
+        ).scalar_one()
+    )
+
+
+def _union_membership(
+    conn: Connection,
+    *,
+    repo_id: int,
+    branch: str,
+    membership: list[tuple[ParsedFile, str]],
+    chunk_writer: ChunkWriter | None,
+) -> None:
+    """Union ``branch`` into every membership-only row in ONE statement, then write their chunks.
+
+    ``array_agg(DISTINCT ...)`` rather than ``||`` alone so the stored array
+    stays sorted-distinct, matching ``index_repo``'s per-file upsert idiom --
+    existing assertions compare ``branches`` by value.
+
+    ``RETURNING id, path, content_sha`` supplies each row's ``file_id`` without a
+    second lookup, which is what makes the ``chunk_writer`` call below possible.
+    **Membership-only DOES write chunks** even though it writes no symbols or
+    edges: the acquired row may legitimately have zero chunk rows (the branch
+    that first wrote it ran semantic-off, or its precompute failed), and skipping
+    the write would make that gap permanent for the acquiring branch where the
+    full path would have filled it. The vectors are already in hand -- ``job.py``
+    embeds every file the advisory read did not call unchanged.
+    """
+    paths = [pf.path for pf, _sha in membership]
+    shas = [sha for _pf, sha in membership]
+    rows = conn.execute(
+        text(
+            "UPDATE files SET branches = (SELECT array_agg(DISTINCT e) FROM "
+            "unnest(files.branches || CAST(:branch_arr AS text[])) e) "
+            "WHERE repo_id = :repo_id "
+            "AND EXISTS (SELECT 1 FROM unnest(CAST(:paths AS text[]), CAST(:shas AS text[])) "
+            "AS t(p, s) WHERE t.p = files.path AND t.s = files.content_sha) "
+            "RETURNING id, path, content_sha"
+        ),
+        {"repo_id": repo_id, "branch_arr": [branch], "paths": paths, "shas": shas},
+    ).all()
+
+    if chunk_writer is None:
+        return
+    file_ids = {(row.path, row.content_sha): row.id for row in rows}
+    for pf, sha in membership:
+        file_id = file_ids.get((pf.path, sha))
+        if file_id is None:
+            # Unreachable while the single-writer invariant holds: the row was in
+            # statement 3b's projection moments ago, inside this transaction.
+            logger.warning(
+                "membership-only row for %s vanished before its union; skipping its chunk write",
+                pf.path,
+            )
+            continue
+        chunk_writer(conn, repo_id, file_id, pf)
 
 
 def _sweep_membership(
@@ -339,12 +634,43 @@ def _stamp_repo_branch(
     head_sha: str,
     baseline_commit: str | None,
     baseline_version: int | None,
+    seen_any: bool = True,
 ) -> None:
     """Compare-and-set the ``repo_branches`` stamp against the statement-2 baseline.
 
     Raises :class:`StaleIndexError` if the row no longer matches the baseline,
     which propagates out of ``index_repo``'s ``conn.begin()`` and rolls the whole
     ``(repo, branch)`` transaction back rather than regressing the index.
+
+    **``seen_any=False`` holds the semantics version at ``baseline_version``.**
+    A run that parsed zero indexable files (the transient case
+    ``_sweep_membership``'s empty-seen-set guard exists for) has written nothing,
+    so it has not indexed anything at the CURRENT semantics version and must not
+    claim to have. Without this the following is silent and terminal:
+
+    1. ``INDEX_SEMANTICS_VERSION`` goes 4 -> 5; branch ``b`` is stored at
+       ``(sha1, 4)``, so the skip seam forces a re-index.
+    2. That re-index parses zero files. Nothing is written -- but the stamp
+       advances to ``(sha2, 5)``.
+    3. The next run sees ``baseline_version == 5 == current``, opens the
+       file-level delta gate, and finds every row carrying ``b`` unchanged on
+       ``(path, content_sha)`` -- so it skips them all.
+    4. ``b`` serves v4-extracted rows under a v5 stamp, permanently.
+
+    ``last_indexed_commit`` still advances to ``head_sha``: the commit IS what
+    this run looked at. Leaving the version behind is what makes the branch
+    mismatch (and therefore re-index) on its next run -- self-healing, in the
+    safe direction. The statement shape, the CAS predicate, and
+    :class:`StaleIndexError` are untouched.
+
+    **Known, deliberate divergence:** ``index_repo``'s statement 1 writes the
+    DEPRECATED ``repos.index_semantics_version`` unconditionally on
+    ``is_default``, with no seen-set awareness. So a zero-parse default-branch
+    run leaves ``repos`` at the current version while ``repo_branches`` sits at
+    the old one. That is cosmetic -- no decision anywhere reads
+    ``repos.index_semantics_version`` (the three legacy columns are documented
+    deprecated in ``app/db/models.py``) -- and extending this fix to the legacy
+    stamp is scope this change deliberately does not take.
     """
     result = conn.execute(
         update(RepoBranch)
@@ -356,7 +682,7 @@ def _stamp_repo_branch(
         )
         .values(
             last_indexed_commit=head_sha,
-            index_semantics_version=INDEX_SEMANTICS_VERSION,
+            index_semantics_version=(INDEX_SEMANTICS_VERSION if seen_any else baseline_version),
             last_indexed_at=func.now(),
         )
     )

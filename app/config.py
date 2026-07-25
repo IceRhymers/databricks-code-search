@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     # this loud check could ever fire, which would defeat the point of having a ceiling.
     # A repo that legitimately exceeds this needs a temp-table staging path, not a bigger
     # buffer.
+    #
+    # Scope note (#104): under file-level delta indexing this cap is enforced against
+    # whatever ONE RUN embeds (changed/new + membership-only files), not a branch's whole
+    # corpus -- a branch can legitimately drift above this number between full reindexes
+    # (a semantics bump, or its first index), re-enforced in full at each of those. This is
+    # a deliberate, accepted trade-off (see indexer/job.py's module docstring and
+    # docs/runbooks/indexing-parallelism.md §4.1), not a bug; the constant is unchanged.
     semantic_max_chunks_per_repo: int = 8000
 
     # Chunk size bound (tokens) fed to the embedding model. Distinct from MAX_FILE_BYTES,

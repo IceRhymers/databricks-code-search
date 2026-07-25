@@ -85,6 +85,22 @@ which makes the job a true semantic no-op (no embedder built, no chunking, the
 environment. Precedence for the job is `config.yaml > CODE_SEARCH_* env > default`, so
 `semantic.enabled: false` wins even if the env says enabled.
 
+**Re-enabling the job's semantic flag does not backfill on its own (#104).** This
+runbook's §2 above promises that an `INDEX_SEMANTICS_VERSION` bump "forces every
+already-indexed branch to re-index once … which backfills `chunks`" — true for a
+version bump, but **not** for flipping `semantic.enabled` back to `true` after a
+period disabled. Under file-level delta indexing a branch whose stamp is already at
+the current `INDEX_SEMANTICS_VERSION` classifies every unchanged file as unchanged
+and skips embedding it, with no awareness that this run is the first to have an
+embedder at all. A branch that never changes again after re-enabling never gets
+chunks. Clear that branch's stamp to force the backfill (same remedy as a degraded
+branch — see `docs/runbooks/indexing-parallelism.md` §4.1):
+
+```sql
+UPDATE repo_branches SET index_semantics_version = NULL
+  WHERE repo_id = (SELECT id FROM repos WHERE name = 'acme/widgets');
+```
+
 **All three surfaces, not just one:** the flag must be off on the MCP app, the webui
 app (both via env), **and** the indexer job (via `config.yaml`) — each has its own
 config source. The webui SPA's Semantic tab is driven entirely by
