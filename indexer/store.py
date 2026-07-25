@@ -22,16 +22,47 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
-from sqlalchemy import Connection, delete, func, text, update
+from sqlalchemy import (
+    ARRAY,
+    BigInteger,
+    Connection,
+    Table,
+    any_,
+    bindparam,
+    delete,
+    func,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.models import INDEX_SEMANTICS_VERSION, File, ReferenceEdge, Repo, RepoBranch, Symbol
+from indexer.bulk import insert_rows
 from indexer.hashing import content_sha
 from indexer.languages import FileExtraction, IndexCounts, ParsedFile
 from indexer.timing import now, record
 
 logger = logging.getLogger("indexer.store")
+
+# Batch bounds for the changed/new write path (#105). Guardrail constants, not
+# Settings fields (indexer/AGENTS.md: "guardrail constants with config-level
+# fixes, not override flags") -- raising _BATCH_MAX_FILES is a deploy, never a
+# runtime knob.
+_BATCH_MAX_FILES = 500
+# Bounds two things at once: (1) peak retention of this buffer, additive to
+# ingest.py's MAX_FILE_BYTES + seen-path set (#106) -- this buffer did not
+# exist before #106 either, since the pre-#106 extracted tree held the whole
+# corpus on disk; (2) the wire payload of the single `files` multi-row INSERT,
+# kept in the same order as CHUNK_PARAM_BUDGET's ~4 MB target.
+_BATCH_MAX_CONTENT_BYTES = 8 * 1024 * 1024
+# repo_id, path, lang, size, content, commit, content_sha, branches.
+_FILE_UPSERT_COLUMNS = 8
+# INVARIANT: libpq's Bind message carries the parameter count in an int16, so
+# no single statement may bind more than 65535 params. 500 * 8 = 4000, 16x
+# headroom. Asserted in tests/unit/test_store_batching.py.
+assert _BATCH_MAX_FILES * _FILE_UPSERT_COLUMNS < 65535
 
 
 class StaleIndexError(RuntimeError):
@@ -183,14 +214,19 @@ def index_repo(
          class is unioned in by ONE batched ``UPDATE ... RETURNING`` after the
          loop, which also supplies the ``file_id`` for its ``chunk_writer`` call
          (see :func:`_union_membership`).
-       * **changed/new** (everything else): an array-union upsert on
-         ``uq_files_repo_path_sha`` -- a file whose content already exists under
-         another branch gets THIS branch unioned into its ``branches`` array (one
-         row, shared content); a file whose content differs from every existing
-         version gets its own row. Then delete-and-reinsert its ``symbols`` and
-         ``reference_edges`` (neither has a natural key), then call
-         ``chunk_writer`` (if given) so chunk writes commit/roll back with the
-         rest of that file's row.
+       * **changed/new** (everything else): accumulated into an in-memory batch
+         and flushed (see :func:`_flush_file_batch`) once it reaches
+         ``_BATCH_MAX_FILES`` files or ``_BATCH_MAX_CONTENT_BYTES`` bytes,
+         whichever trips first, plus once more after the loop for whatever
+         remains. A flush issues ONE multi-row array-union upsert on
+         ``uq_files_repo_path_sha`` for the whole batch -- a file whose content
+         already exists under another branch gets THIS branch unioned into its
+         ``branches`` array (one row, shared content); a file whose content
+         differs from every existing version gets its own row -- then bulk
+         delete-and-reinsert of the batch's ``symbols`` and ``reference_edges``
+         (neither has a natural key), then ONE ``chunk_writer`` call (if given)
+         for the whole batch, so every flushed file's rows commit/roll back
+         together as part of this same transaction.
 
        **Every** parsed file -- classified or written -- is collected into this
        branch's seen-set, so step 4 and its empty-seen-set guard are correct by
@@ -320,6 +356,14 @@ def index_repo(
         # not the steady state, and chunk_writer's seam takes the ParsedFile.
         membership: list[tuple[ParsedFile, str]] = []
 
+        # Changed/new files accumulate here and flush in batches of up to
+        # _BATCH_MAX_FILES files / _BATCH_MAX_CONTENT_BYTES bytes (whichever
+        # trips first), rather than issuing 5-7 statements per file. The check
+        # is POST-append, so a single file larger than the byte bound is never
+        # dropped or split -- it flushes with whatever batch it landed in.
+        batch: list[tuple[ParsedFile, FileExtraction, str]] = []
+        batch_bytes = 0
+
         for pf, ex in items:
             sha = content_sha(pf.content)
             # Seen-set membership is recorded for EVERY parsed file, whatever its
@@ -344,84 +388,33 @@ def index_repo(
                 membership.append((pf, sha))
                 continue
 
-            file_stmt = (
-                pg_insert(File)
-                .values(
+            batch.append((pf, ex, sha))
+            batch_bytes += pf.size
+            if len(batch) >= _BATCH_MAX_FILES or batch_bytes >= _BATCH_MAX_CONTENT_BYTES:
+                s, e = _flush_file_batch(
+                    conn,
                     repo_id=repo_id,
-                    path=pf.path,
-                    lang=pf.lang,
-                    size=pf.size,
-                    content=pf.content,
-                    commit=head_sha,
-                    content_sha=sha,
-                    branches=[branch],
+                    branch=branch,
+                    head_sha=head_sha,
+                    batch=batch,
+                    chunk_writer=chunk_writer,
                 )
-                .on_conflict_do_update(
-                    constraint="uq_files_repo_path_sha",
-                    set_={
-                        "lang": pf.lang,
-                        "size": pf.size,
-                        "content": pf.content,
-                        "commit": head_sha,
-                        # Union this branch into whatever branches already share
-                        # this exact content version -- a plain UNION via
-                        # unnest+array_agg, row-lock-atomic regardless of
-                        # concurrent readers (there is no concurrent WRITER for
-                        # this repo -- see module docstring).
-                        "branches": text(
-                            "(SELECT array_agg(DISTINCT e) FROM "
-                            "unnest(files.branches || excluded.branches) e)"
-                        ),
-                    },
-                )
-                .returning(File.id)
+                symbol_count += s
+                edge_count += e
+                batch = []
+                batch_bytes = 0
+
+        if batch:
+            s, e = _flush_file_batch(
+                conn,
+                repo_id=repo_id,
+                branch=branch,
+                head_sha=head_sha,
+                batch=batch,
+                chunk_writer=chunk_writer,
             )
-            file_id = conn.execute(file_stmt).scalar_one()
-
-            conn.execute(delete(Symbol).where(Symbol.file_id == file_id))
-            if ex.symbols:
-                conn.execute(
-                    pg_insert(Symbol),
-                    [
-                        {
-                            "file_id": file_id,
-                            "repo_id": repo_id,
-                            "name": s.name,
-                            "kind": s.kind,
-                            "start_line": s.start_line,
-                            "end_line": s.end_line,
-                        }
-                        for s in ex.symbols
-                    ],
-                )
-                symbol_count += len(ex.symbols)
-
-            # UNCONDITIONAL, same as the symbols delete above: a file whose edges
-            # all vanish (e.g. every call/import site removed) must shed its stale
-            # rows even when this run's ex.edges is empty.
-            conn.execute(delete(ReferenceEdge).where(ReferenceEdge.file_id == file_id))
-            if ex.edges:
-                conn.execute(
-                    pg_insert(ReferenceEdge),
-                    [
-                        {
-                            "file_id": file_id,
-                            "repo_id": repo_id,
-                            "edge_kind": e.kind,
-                            "target_name": e.target,
-                            "line": e.line,
-                            "enclosing_name": e.enclosing.name if e.enclosing else None,
-                            "enclosing_kind": e.enclosing.kind if e.enclosing else None,
-                            "enclosing_start_line": e.enclosing.start_line if e.enclosing else None,
-                            "enclosing_end_line": e.enclosing.end_line if e.enclosing else None,
-                        }
-                        for e in ex.edges
-                    ],
-                )
-                edge_count += len(ex.edges)
-
-            if chunk_writer is not None:
-                chunk_writer(conn, repo_id, [(file_id, pf)])
+            symbol_count += s
+            edge_count += e
 
         # ONE statement for the whole membership-only class, skipped entirely
         # when that class is empty (rather than issued as a no-op) so the
@@ -485,6 +478,174 @@ def index_repo(
         )
 
     return IndexCounts(files=file_count, symbols=symbol_count, swept=swept, edges=edge_count)
+
+
+def _flush_file_batch(
+    conn: Connection,
+    *,
+    repo_id: int,
+    branch: str,
+    head_sha: str,
+    batch: list[tuple[ParsedFile, FileExtraction, str]],
+    chunk_writer: ChunkWriter | None,
+) -> tuple[int, int]:
+    """Write one batch of changed/new files: one upsert, bulk delete+insert, one chunk_writer call.
+
+    Returns ``(symbols_written, edges_written)`` to fold into ``index_repo``'s
+    running counts. Issues, in order:
+
+    (a) **Intra-batch dedup guard**, keyed on ``(path, content_sha)``, keeping
+        the LAST occurrence (matching this module's existing per-file
+        last-write-wins) and logging one WARNING per collapsed key. Mandatory,
+        not defensive polish: a multi-row ``INSERT ... ON CONFLICT DO UPDATE``
+        containing two rows with the same constrained values raises ``ON
+        CONFLICT DO UPDATE command cannot affect row a second time`` and
+        POISONS the transaction. A duplicate ``(path, content_sha)`` should be
+        impossible from the production source -- ``iter_tar_source_files``
+        carries its own ``seen`` set and drops a repeat first-wins with a
+        WARNING (``indexer/ingest.py``) -- but ``items`` is an injected seam
+        other callers (tests, ``test_reconcile.py``) can feed directly.
+    (b) **One multi-row ``files`` upsert**, ``RETURNING id, path,
+        content_sha``. The ``SET`` clause uses ``excluded.*`` for every
+        per-row column (``lang``/``size``/``content``/``commit``) -- NEVER a
+        Python literal from one file, which would attach the LAST file's
+        values to every conflicting row in the batch: silent, committed,
+        corpus-wide corruption. ``commit`` becomes ``excluded.commit`` too
+        (every row in one batch shares ``head_sha`` so a literal would happen
+        to work here) so the rule stays uniform. ``branches`` keeps the same
+        array-union ``SET`` expression as the per-file upsert -- verified to
+        survive the multi-row form.
+    (c) **``DELETE ... WHERE file_id = ANY(:ids)``** for ``symbols`` and
+        ``reference_edges``, one statement each, over every id in this batch,
+        UNCONDITIONALLY (a file whose edges/symbols all vanished must still
+        shed its stale rows) -- then one param-budgeted bulk insert each via
+        :func:`indexer.bulk.insert_rows`.
+    (e) **One ``chunk_writer`` call** for the whole batch, given every
+        ``(file_id, pf)`` pair in batch order.
+
+    **Ids are mapped from the upsert's ``RETURNING`` by ``(path,
+    content_sha)``, NEVER by row order** -- ``DO UPDATE ... RETURNING`` yields
+    one row per input row but makes no ordering guarantee. A missing key after
+    the map is built RAISES and rolls the whole ``(repo, branch)`` transaction
+    back (deliberately harsher than ``_union_membership``'s warn-and-skip: a
+    wrong or missing ``file_id`` here would attach one file's symbols to
+    another file's row -- durable core-corpus corruption, not a stale-vector
+    gap).
+
+    Memory: this function's peak retention (``batch`` plus the row dicts built
+    below) is bounded by ``_BATCH_MAX_FILES`` / ``_BATCH_MAX_CONTENT_BYTES``,
+    ADDITIVE to ``indexer/ingest.py``'s ``MAX_FILE_BYTES`` + seen-path-set
+    retention (#106) -- this buffer is net-new retention, not a re-slicing of
+    memory the old extracted-tree path already held.
+    """
+    # (a) Intra-batch dedup guard -- last occurrence wins.
+    deduped: dict[tuple[str, str], tuple[ParsedFile, FileExtraction, str]] = {}
+    for pf, ex, sha in batch:
+        key = (pf.path, sha)
+        if key in deduped:
+            logger.warning(
+                "duplicate (path, content_sha) %r within one batch; keeping the last occurrence",
+                key,
+            )
+        deduped[key] = (pf, ex, sha)
+    entries = list(deduped.values())
+
+    # (b) One multi-row files upsert. excluded.* everywhere a per-file literal
+    # would otherwise leak the LAST file's values onto every conflicting row.
+    file_rows = [
+        {
+            "repo_id": repo_id,
+            "path": pf.path,
+            "lang": pf.lang,
+            "size": pf.size,
+            "content": pf.content,
+            "commit": head_sha,
+            "content_sha": sha,
+            "branches": [branch],
+        }
+        for pf, _ex, sha in entries
+    ]
+    ins = pg_insert(cast(Table, File.__table__)).values(file_rows)
+    upsert_stmt = ins.on_conflict_do_update(
+        constraint="uq_files_repo_path_sha",
+        set_={
+            "lang": ins.excluded.lang,
+            "size": ins.excluded.size,
+            "content": ins.excluded.content,
+            "commit": ins.excluded.commit,
+            "branches": text(
+                "(SELECT array_agg(DISTINCT e) FROM unnest(files.branches || excluded.branches) e)"
+            ),
+        },
+    ).returning(File.id, File.path, File.content_sha)
+    returned = conn.execute(upsert_stmt).all()
+    file_ids = {(row.path, row.content_sha): row.id for row in returned}
+
+    pairs: list[tuple[int, ParsedFile]] = []
+    symbol_rows: list[dict[str, object]] = []
+    edge_rows: list[dict[str, object]] = []
+    ids: list[int] = []
+    symbol_count = 0
+    edge_count = 0
+    for pf, ex, sha in entries:
+        file_id = file_ids.get((pf.path, sha))
+        if file_id is None:
+            # NOT a warn-and-skip: an id missing from RETURNING means this
+            # file's symbols/edges could only be attached to the wrong row.
+            raise RuntimeError(
+                f"files upsert RETURNING has no row for (path={pf.path!r}, "
+                f"content_sha={sha!r}); refusing to attach its symbols/edges to another file"
+            )
+        ids.append(file_id)
+        pairs.append((file_id, pf))
+        symbol_rows.extend(
+            {
+                "file_id": file_id,
+                "repo_id": repo_id,
+                "name": s.name,
+                "kind": s.kind,
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+            }
+            for s in ex.symbols
+        )
+        symbol_count += len(ex.symbols)
+        edge_rows.extend(
+            {
+                "file_id": file_id,
+                "repo_id": repo_id,
+                "edge_kind": e.kind,
+                "target_name": e.target,
+                "line": e.line,
+                "enclosing_name": e.enclosing.name if e.enclosing else None,
+                "enclosing_kind": e.enclosing.kind if e.enclosing else None,
+                "enclosing_start_line": e.enclosing.start_line if e.enclosing else None,
+                "enclosing_end_line": e.enclosing.end_line if e.enclosing else None,
+            }
+            for e in ex.edges
+        )
+        edge_count += len(ex.edges)
+
+    # (c) Bulk delete-then-insert, unconditional (same semantics as the old
+    # per-file DELETE, which ran even for a file with zero symbols/edges).
+    conn.execute(
+        delete(Symbol).where(Symbol.file_id == any_(bindparam("ids", type_=ARRAY(BigInteger)))),
+        {"ids": ids},
+    )
+    insert_rows(conn, Symbol.__table__, symbol_rows)
+
+    conn.execute(
+        delete(ReferenceEdge).where(
+            ReferenceEdge.file_id == any_(bindparam("ids", type_=ARRAY(BigInteger)))
+        ),
+        {"ids": ids},
+    )
+    insert_rows(conn, ReferenceEdge.__table__, edge_rows)
+
+    if chunk_writer is not None:
+        chunk_writer(conn, repo_id, pairs)
+
+    return symbol_count, edge_count
 
 
 def _repo_is_wholly_at_current_version(conn: Connection, *, repo_id: int) -> bool:

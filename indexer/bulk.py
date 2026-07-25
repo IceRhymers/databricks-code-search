@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import Connection, Table
+from sqlalchemy import Connection
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 # libpq's Bind message carries the parameter count in an int16, so no single
@@ -39,7 +39,7 @@ CHUNK_PARAM_BUDGET = 6_000
 
 def insert_rows(
     conn: Connection,
-    table: Table,
+    table: Any,
     rows: Sequence[dict[str, Any]],
     *,
     param_budget: int = PARAM_BUDGET,
