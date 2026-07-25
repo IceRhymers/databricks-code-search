@@ -10,7 +10,9 @@ opening a database connection.
 Orchestrates, per resolved repo: resolve the default branch's HEAD -> resolve the
 repo's concrete branch list from the config globs -> for each branch,
 SEQUENTIALLY: resolve its HEAD SHA -> download the tarball by that immutable SHA
--> extract -> parse text files -> extract symbols -> atomic upsert + mark-and-sweep
+-> stream text files straight out of that archive (:func:`indexer.ingest.
+iter_tar_source_files`, one pass, nothing extracted to disk) -> extract symbols
+-> atomic upsert + mark-and-sweep
 via :func:`indexer.store.index_repo`. Branches within one repo are sequential
 (never concurrent) -- that is the invariant that keeps ``store.py``'s per-branch
 sweep sound without an advisory lock. Each BRANCH is isolated: one branch's
@@ -98,7 +100,7 @@ for why that is no longer self-healing on the next run under delta indexing,
 and the aggregate run-completion WARNING this module emits for it.
 
 Every INDEXED branch also emits one ``phase timing`` line accounting for its whole
-wall clock -- resolve / download / extract / parse / embed / db / sweep, plus an
+wall clock -- resolve / download / parse / embed / db / sweep, plus an
 ``other`` residual so no time is silently unattributed. The fields are fixed and
 unconditional (a phase that did not run prints ``0.00s``) so the line stays
 greppable whether or not semantic indexing is on. Skipped, failed, and conflicted
@@ -143,14 +145,14 @@ from indexer.fetch import (
     REQUIRED_FREE_BYTES,
     assert_disk_headroom,
     download_tarball,
-    extract_tarball,
     list_branches,
     resolve_branch_head,
     resolve_ref,
 )
 from indexer.hashing import content_sha
+from indexer.ingest import iter_tar_source_files
 from indexer.languages import Chunk, FileExtraction, IndexCounts, ParsedFile
-from indexer.parse import iter_chunks, iter_source_files
+from indexer.parse import iter_chunks
 from indexer.repo_config import RepoConfig, effective_workers, load_config, normalize_repo
 from indexer.resolve import MAX_REPOS, RepoEntry, resolve_repos
 from indexer.store import (
@@ -1180,10 +1182,6 @@ def _index_one_branch(
             tar_path = download_tarball(http_client, org, repo, head_sha, tmp_path)
             timer.add("download", timer.clock() - t0)
 
-            t0 = timer.clock()
-            root = extract_tarball(tar_path, tmp_path / "extracted")
-            timer.add("extract", timer.clock() - t0)
-
             chunk_writer: ChunkWriter | None = None
             precompute_failed = False
             if cfg.semantic_enabled and embed_fn is not None:
@@ -1192,13 +1190,15 @@ def _index_one_branch(
                 # index_repo's open transaction.
                 #
                 # This walk is charged to `parse` explicitly: it is the same
-                # rglob + stat + read + decode work that _timed_items charges on
+                # stream + decompress + decode work that _timed_items charges on
                 # the non-semantic path, and leaving it unwrapped would dump the
                 # entire file-walk cost of the PRODUCTION (semantic-on) path into
                 # `other`, which is exactly the number this instrumentation
-                # exists to route work by.
+                # exists to route work by. Since #106 it also carries the gzip
+                # decompression that used to be reported as its own `extract`
+                # phase -- there is no separate extraction step any more.
                 t0 = timer.clock()
-                files = list(iter_source_files(root))
+                files = list(iter_tar_source_files(tar_path))
                 timer.add("parse", timer.clock() - t0)
 
                 # In a `finally`, unlike every other phase wrap: the degrade path
@@ -1207,7 +1207,7 @@ def _index_one_branch(
                 # advisory shas_fn read is charged here too, deliberately NOT as
                 # its own timed phase: it exists solely to decide what this block
                 # embeds, and #103's `phase timing` line is pinned exhaustive
-                # (nine fixed fields, tests/unit/test_job.py) -- adding a tenth
+                # (eight fixed fields, tests/unit/test_job.py) -- adding a ninth
                 # field is out of this change's scope.
                 t0 = timer.clock()
                 try:
@@ -1266,7 +1266,7 @@ def _index_one_branch(
                 items = ((pf, extract_file(pf)) for pf in files)
             else:
                 # Lazy generator: files stream through the open transaction (bounded memory).
-                items = ((pf, extract_file(pf)) for pf in iter_source_files(root))
+                items = ((pf, extract_file(pf)) for pf in iter_tar_source_files(tar_path))
 
             # Parse time is INSIDE the db window (items are produced lazily as
             # index_repo consumes them), so `db` subtracts only the parse accrued
@@ -1290,8 +1290,9 @@ def _index_one_branch(
                 )
             db_wall = timer.clock() - t0
 
-        # Emitted HERE -- after the TemporaryDirectory teardown (an rm -rf of a
-        # possibly multi-GB extracted tree, which `other` must include) and from
+        # Emitted HERE -- after the TemporaryDirectory teardown (since #106 an
+        # rm -rf of one compressed tarball rather than a multi-GB extracted
+        # tree, but still time `other` must include) and from
         # inside the worker, where _index_one's _repo_ctx still resolves the
         # [%(repo)s] field. The drain loop on the main thread would render `[-]`.
         #
@@ -1315,7 +1316,6 @@ def _index_one_branch(
                 total
                 - timer.total("resolve")
                 - timer.total("download")
-                - timer.total("extract")
                 - timer.total("parse")
                 - timer.total("embed")
                 - db
@@ -1323,16 +1323,20 @@ def _index_one_branch(
             )
             # One format string, no branches: a phase that did not run prints 0.00s
             # rather than vanishing, so the line stays greppable and field-stable
-            # whether or not semantic indexing is on.
+            # whether or not semantic indexing is on. That is a promise about one
+            # build's runs, NOT that the field set is immutable across releases:
+            # #106 removed `extract=` because the phase ceased to exist (the
+            # archive is streamed, never extracted), not because it could read
+            # zero. A field that can never be non-zero is dead weight that sends
+            # an operator hunting for a phase that is not there.
             logger.info(
-                "phase timing %s@%s: total=%.2fs resolve=%.2fs download=%.2fs extract=%.2fs "
+                "phase timing %s@%s: total=%.2fs resolve=%.2fs download=%.2fs "
                 "parse=%.2fs embed=%.2fs db=%.2fs sweep=%.2fs other=%.2fs",
                 name,
                 branch,
                 total,
                 timer.total("resolve"),
                 timer.total("download"),
-                timer.total("extract"),
                 timer.total("parse"),
                 timer.total("embed"),
                 db,

@@ -114,10 +114,10 @@ of their own. Records emitted outside a worker (config resolution, the drain
 loop, third-party libraries) carry `-`.
 
 ```
-INFO indexer.job [-]: local disk at /tmp: 41.2 GB free of 64.0 GB total; 4 worker(s) x 2.5 GB peak
+INFO indexer.job [-]: local disk at /tmp: 41.2 GB free of 64.0 GB total; 4 worker(s) x 0.5 GB peak
 INFO indexer.fetch [acme/widgets]: ...
-INFO indexer.job [acme/widgets]: phase timing acme/widgets@main: total=213.32s resolve=0.00s download=12.10s extract=8.40s parse=31.00s embed=88.20s db=64.50s sweep=0.30s other=8.82s
-INFO indexer.job [acme/widgets]: finished acme/widgets in 213.74s (resolve=0.42s list=0.00s)
+INFO indexer.job [acme/widgets]: phase timing acme/widgets@main: total=204.92s resolve=0.00s download=12.10s parse=31.00s embed=88.20s db=64.50s sweep=0.30s other=8.82s
+INFO indexer.job [acme/widgets]: finished acme/widgets in 205.34s (resolve=0.42s list=0.00s)
 INFO indexer.job [acme/gadgets]: skipped acme/gadgets@main: already indexed at abc123 (semantics v1) in 0.41s
 ```
 
@@ -141,15 +141,21 @@ to attribute.
 grep 'phase timing' run.log            # one line per indexed branch
 ```
 
-The nine fields are fixed, always present, always in this order, always `%.2fs`.
+The eight fields are fixed, always present, always in this order, always `%.2fs`.
 A phase that did not run prints `0.00s` rather than disappearing, so the line
 never changes shape between a semantic-on and a semantic-off run and every grep
 you write keeps working. Read the largest field; that is the branch's bottleneck.
 
+(There used to be a ninth, `extract=`. #106 removed the phase itself — the
+tarball is streamed once, in memory, and never extracted — so the field was
+deleted rather than pinned at `0.00s`. The "prints `0.00s` rather than
+disappearing" rule is about one build's semantic-on vs semantic-off runs, not a
+promise that the field set never changes across releases.)
+
 | Dominant phase | What it means | Which issue addresses it |
 |---|---|---|
-| `download` / `extract` | archive I/O bound | #106 (single-pass in-memory ingestion) |
-| `parse` | GIL-bound tree-sitter extraction | #108 (process-pool extraction) |
+| `download` | archive I/O bound | — (the decompression it used to be paired with is now fused into `parse`, #106) |
+| `parse` | GIL-bound tree-sitter extraction — **plus, since #106, the archive's gzip decompression, tar-stream read and UTF-8 decode**, which used to be the separate `extract=` field | #108 (process-pool extraction) addresses the tree-sitter half only |
 | `embed` | serial AI Gateway round trips | #107 (concurrent embedding) |
 | `db` | per-file round trips | #105 (batched writes) |
 | any of the above, on **unchanged** content | redundant work | #104 (file-level delta indexing) |
@@ -158,7 +164,7 @@ you write keeps working. Read the largest field; that is the branch's bottleneck
 its size — but it does NOT touch `parse`: extraction still runs on every
 file every run (tree-sitter must produce a `FileExtraction` before
 `index_repo` can classify it), so an all-unchanged branch on a large repo
-still pays its full `download`+`extract`+`parse` cost. See `indexer.store`'s
+still pays its full `download`+`parse` cost. See `indexer.store`'s
 `delta write set …` line (below) to tell "this branch is genuinely mostly-new"
 from "this branch is mostly-unchanged but still parsing everything" — the
 latter is exactly the case `#108` (process-pool extraction) or a future
@@ -176,10 +182,13 @@ Four fields need interpretation before you act on them:
   `finished … in Xs` is measured on its own clock and is deliberately not
   reconciled against the parenthesised numbers.
 - **`other=` is the unattributed residual**, `total` minus every measured phase,
-  clamped at zero. It is dominated by the temp-dir teardown — an `rm -rf` of a
-  freshly extracted multi-GB tree — plus the pre-flight disk check. It exists so
-  the line has no silently missing time; a large `other` means something real is
-  happening outside every instrumented phase and is worth chasing.
+  clamped at zero. It covers the temp-dir teardown plus the pre-flight disk
+  check. Since #106 that teardown is an `rm -rf` of one compressed tarball, not
+  of a freshly extracted multi-GB tree, so `other` shrinks materially on large
+  repos — if you are reading an old run's numbers, do not go hunting for a
+  teardown cost that no longer exists. It exists so the line has no silently
+  missing time; a large `other` means something real is happening outside every
+  instrumented phase and is worth chasing.
 - **`embed=` covers chunking as well as the network.** It spans `iter_chunks`
   (CPU/GIL-bound) *and* the serial AI Gateway round trips. #107 addresses only
   the round trips, so before routing work there, confirm the phase is
@@ -189,10 +198,19 @@ Four fields need interpretation before you act on them:
   transaction.** Files stream lazily through `index_repo`'s open transaction for
   bounded memory, so file production is timed separately and subtracted from
   `db`; the sweep is subtracted too. On the **non-semantic** path, though, the
-  directory walk itself materializes inside that open transaction (`parse.py`'s
-  `rglob`, on the first item). That is long-standing behavior which this
-  instrumentation merely makes visible for the first time — it is not a new
-  regression.
+  file walk itself materializes inside that open transaction — since #106 that
+  is the tar stream (`ingest.py`), not `parse.py`'s `rglob`, on the first item.
+  That is long-standing behavior which this instrumentation merely makes visible
+  for the first time — it is not a new regression. What #106 *did* move into that
+  window is **archive validation**: the decompression-bomb cap, the
+  exactly-one-top-level-dir check, member-name and link-target safety, and any
+  `tarfile` corruption error are now raised as the stream is consumed rather than
+  before the connection is taken. A malformed archive therefore surfaces as a
+  rolled-back transaction and one briefly-held pooled connection instead of a
+  pre-connection failure. **The branch-level outcome is unchanged** —
+  `failed`, exit code non-zero, nothing written. On the semantic (production)
+  path nothing moved at all: the file list is materialized up front, so the
+  archive is fully validated before any connection is opened.
 
 ### 2.2 The delta write set line (#104)
 
@@ -232,25 +250,30 @@ provenance gate).
 |---|---|---|
 | `index_concurrency` | 1..8, default **4** | Repos in flight |
 | `MAX_TARBALL_BYTES` | 500 MB | The compressed download, per worker |
-| `MAX_EXTRACTED_BYTES` | 2 GB | The uncompressed tree, per worker |
+| `MAX_EXTRACTED_BYTES` | 2 GB | The streamed uncompressed content, per branch |
 
-The two byte caps **sum**, they do not `max()`: the tarball stays on disk inside
-the worker's temp directory while the extraction grows beside it. Peak local
-disk is therefore:
+Only the first of the two byte caps is a **disk** cap. Since #106 the tarball is
+streamed once, in memory, and is never extracted, so `MAX_EXTRACTED_BYTES` is a
+**work** cap — a decompression-bomb guard on how much content one branch may pull
+out of its archive — and it lives in `indexer/ingest.py`, beside its only
+consumer, rather than in `indexer/fetch.py`. The two therefore no longer sum:
+the compressed tarball is the only artifact on disk, so peak local disk is
+`index_concurrency` × 500 MB:
 
 | `index_concurrency` | Peak local disk |
 |---|---|
-| 1 | 2.5 GB |
-| 2 | 5 GB |
-| **4 (default)** | **10 GB** |
-| 8 (ceiling) | 20 GB |
+| 1 | 0.5 GB |
+| 2 | 1 GB |
+| **4 (default)** | **2 GB** |
+| 8 (ceiling) | 4 GB |
 
 **Returns at the ceiling are sublinear; the disk cost is not.** Symbol
 extraction was measured at **0.95x on 4 threads** — the tree walk is
 GIL-serialized and is ~56% of extraction time, so Amdahl's law caps the speedup
-well below 8x. Meanwhile the 20 GB is a hard, linear, unavoidable cost. Raise
+well below 8x. Meanwhile the 4 GB is a hard, linear, unavoidable cost. Raise
 `index_concurrency` to 8 only knowing you are buying a fraction of a speedup
-with a doubling of disk.
+with a doubling of disk. (#106 lowered these numbers by 5x but deliberately did
+**not** move the default of 4; re-deriving it is #109's job.)
 
 **Semantic indexing clamps the pool to 2**, regardless of `index_concurrency`.
 That clamp is a *memory* bound, not a CPU one: embedding materialises a whole
@@ -276,12 +299,12 @@ The app/serving pool is separate and unaffected (5, paired with a matching
 ### The disk guard
 
 Before any bytes are downloaded, each worker checks free space on the filesystem
-it is about to write to. Below 2.5 GB it fails **that repo**, not the run:
+it is about to write to. Below 0.5 GB it fails **that repo**, not the run:
 
 ```
 ERROR indexer.job [acme/leviathan]: failed to index acme/leviathan
-OSError: insufficient local disk for acme/leviathan: 1904214016 bytes free at /tmp/tmpXXXX,
-need 2500000000 (...); lower index_concurrency in config.yaml
+OSError: insufficient local disk for acme/leviathan: 104214016 bytes free at /tmp/tmpXXXX,
+need 500000000 (...); lower index_concurrency in config.yaml
 ```
 
 A shortfall fails that repo alone, not the run, and the job exits non-zero.
@@ -290,12 +313,12 @@ and re-run — the completed repos are skipped, so the retry is cheap (see §1).
 
 **This guard is a pre-flight sanity check, not admission control.** It reserves
 nothing: each worker calls `shutil.disk_usage` independently before it writes,
-so at 5 GB free with 4 workers all four pass their check and all four then
+so at 1 GB free with 4 workers all four pass their check and all four then
 download. It reliably catches the *steady-state* case — disk already low when a
 repo starts — and turns it into the legible error above. It does **not** bound
 the *transient* case, where the combined footprint exhausts the disk mid-flight;
 that still surfaces as an opaque `tarfile` error. Sizing `index_concurrency` to
-your actual disk (2.5 GB per worker peak) is the real control.
+your actual disk (0.5 GB per worker peak) is the real control.
 
 ---
 
