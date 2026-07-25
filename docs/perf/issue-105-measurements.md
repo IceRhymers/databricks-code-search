@@ -76,20 +76,37 @@ def _fixture_items(branch):
     items = []
     for i in range(5):
         content = f"def shared{i}():\n    return {i}\n"
-        items.append((_pf(f"shared{i}.py", content), FileExtraction(symbols=[_sym("shared", i)], edges=[])))
+        items.append(
+            (_pf(f"shared{i}.py", content), FileExtraction(symbols=[_sym("shared", i)], edges=[]))
+        )
     for i in range(2):
         magic = (sum(ord(c) for c in branch) * 31 + i) % 997
         content = f"def divergent{i}():\n    return {magic}\n"
-        items.append((_pf(f"divergent{i}.py", content), FileExtraction(symbols=[_sym("divergent", i)], edges=[])))
+        items.append(
+            (
+                _pf(f"divergent{i}.py", content),
+                FileExtraction(symbols=[_sym("divergent", i)], edges=[]),
+            )
+        )
     items.append((_pf("nosymbols.py", "# just a comment\n"), FileExtraction(symbols=[], edges=[])))
     caller = _sym("caller", 0)
-    items.append((
-        _pf(f"{branch}_withedges.py", "def caller0():\n    callee()\n"),
-        FileExtraction(symbols=[caller], edges=[ExtractedEdge(kind="call", target="callee", line=2, enclosing=caller)]),
-    ))
+    items.append(
+        (
+            _pf(f"{branch}_withedges.py", "def caller0():\n    callee()\n"),
+            FileExtraction(
+                symbols=[caller],
+                edges=[ExtractedEdge(kind="call", target="callee", line=2, enclosing=caller)],
+            ),
+        )
+    )
     for i in range(6):
         content = f"def {branch}_only{i}():\n    return {i}\n"
-        items.append((_pf(f"{branch}_only{i}.py", content), FileExtraction(symbols=[_sym(f"{branch}_only", i)], edges=[])))
+        items.append(
+            (
+                _pf(f"{branch}_only{i}.py", content),
+                FileExtraction(symbols=[_sym(f"{branch}_only", i)], edges=[]),
+            )
+        )
     return items
 
 
@@ -106,32 +123,62 @@ def main():
         Base.metadata.create_all(bind=conn)
         conn.commit()
 
-        index_repo(conn, name="acme/widgets", branch="a", is_default=True, head_sha="sha_a", items=_fixture_items("a"))
+        index_repo(
+            conn,
+            name="acme/widgets",
+            branch="a",
+            is_default=True,
+            head_sha="sha_a",
+            items=_fixture_items("a"),
+        )
         conn.commit()
-        index_repo(conn, name="acme/widgets", branch="b", is_default=False, head_sha="sha_b", items=_fixture_items("b"))
+        index_repo(
+            conn,
+            name="acme/widgets",
+            branch="b",
+            is_default=False,
+            head_sha="sha_b",
+            items=_fixture_items("b"),
+        )
         conn.commit()
-        index_repo(conn, name="acme/widgets", branch="c", is_default=False, head_sha="sha_c", items=_fixture_items("c"))
+        index_repo(
+            conn,
+            name="acme/widgets",
+            branch="c",
+            is_default=False,
+            head_sha="sha_c",
+            items=_fixture_items("c"),
+        )
         conn.commit()
 
         files = sorted(
-            tuple(r) for r in conn.execute(text(
-                "SELECT repo_id, path, content_sha, lang, size, content, commit, "
-                "array_to_string((SELECT array_agg(x ORDER BY x) FROM unnest(branches) x), ',') "
-                "FROM files ORDER BY path, content_sha"
-            )).all()
+            tuple(r)
+            for r in conn.execute(
+                text(
+                    "SELECT repo_id, path, content_sha, lang, size, content, commit, "
+                    "array_to_string((SELECT array_agg(x ORDER BY x) FROM unnest(branches) x), ',') "
+                    "FROM files ORDER BY path, content_sha"
+                )
+            ).all()
         )
         symbols = sorted(
-            tuple(r) for r in conn.execute(text(
-                "SELECT f.path, s.name, s.kind, s.start_line, s.end_line "
-                "FROM symbols s JOIN files f ON f.id = s.file_id"
-            )).all()
+            tuple(r)
+            for r in conn.execute(
+                text(
+                    "SELECT f.path, s.name, s.kind, s.start_line, s.end_line "
+                    "FROM symbols s JOIN files f ON f.id = s.file_id"
+                )
+            ).all()
         )
         edges = sorted(
-            tuple(r) for r in conn.execute(text(
-                "SELECT f.path, e.edge_kind, e.target_name, e.line, e.enclosing_name, e.enclosing_kind, "
-                "e.enclosing_start_line, e.enclosing_end_line "
-                "FROM reference_edges e JOIN files f ON f.id = e.file_id"
-            )).all()
+            tuple(r)
+            for r in conn.execute(
+                text(
+                    "SELECT f.path, e.edge_kind, e.target_name, e.line, e.enclosing_name, e.enclosing_kind, "
+                    "e.enclosing_start_line, e.enclosing_end_line "
+                    "FROM reference_edges e JOIN files f ON f.id = e.file_id"
+                )
+            ).all()
         )
         print(json.dumps({"files": files, "symbols": symbols, "edges": edges}))
     finally:
@@ -212,10 +259,12 @@ def _fixture(n):
     items = []
     for i in range(n):
         content = f"def f{i}():\n    x = {i}\n    return x\n"
-        items.append((
-            _pf(f"pkg/mod{i}.py", content),
-            FileExtraction(symbols=[ExtractedSymbol(f"f{i}", "function", 1, 3)], edges=[]),
-        ))
+        items.append(
+            (
+                _pf(f"pkg/mod{i}.py", content),
+                FileExtraction(symbols=[ExtractedSymbol(f"f{i}", "function", 1, 3)], edges=[]),
+            )
+        )
     return items
 
 
@@ -240,8 +289,12 @@ def main():
         try:
             wall_start = time.perf_counter()
             index_repo(
-                conn, name="acme/bigrepo", branch="main", is_default=True,
-                head_sha="sha1", items=items,
+                conn,
+                name="acme/bigrepo",
+                branch="main",
+                is_default=True,
+                head_sha="sha1",
+                items=items,
             )
             wall = time.perf_counter() - wall_start
         finally:
