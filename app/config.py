@@ -112,6 +112,14 @@ class Settings(BaseSettings):
     # which bounds file ingestion, not embedding-chunk granularity.
     semantic_chunk_max_tokens: int = 512
 
+    # In-flight embedding requests per worker (#107). The indexer clamps to 2 workers when
+    # semantic is on (indexer/repo_config.py:effective_workers), so total in-flight gateway
+    # requests are workers x concurrency: 2 x 4 = 8 at this default, 2 x 8 = 16 at the
+    # config.yaml-enforced ceiling of 8 -- both under the SDK's 20-connection pool
+    # (pool_block=True, so exceeding it would silently serialize rather than error). Setting
+    # this to 1 restores today's fully serial embed() and spawns no thread pool.
+    semantic_embedding_concurrency: int = 4
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

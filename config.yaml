@@ -94,6 +94,14 @@ connections:
 # `enabled: false` makes the job a true semantic no-op (no embedder built, no
 # chunking, the 2-worker memory clamp not applied) even if the env says enabled —
 # the fastest way to turn semantic off for the job alone.
+#
+# `embedding_concurrency` (#107) is in-flight embedding requests PER WORKER, sent
+# via a ThreadPoolExecutor that preserves submission order — vectors always come
+# back in the order their texts were sent, regardless of which request finishes
+# first. Total in-flight gateway requests for the job is workers x concurrency:
+# 2 x 4 = 8 at this default, 2 x 8 = 16 at the max of 8, both under the SDK's
+# 20-connection pool. Set to 1 to restore fully serial embedding (no thread pool
+# spawned at all) if you need to roll back.
 # semantic:
 #   enabled: true
 #   max_chunks_per_repo: 8000
@@ -101,3 +109,4 @@ connections:
 #   embedding_model: system.ai.gte-large-en
 #   embedding_batch_size: 64
 #   embedding_timeout_s: 20.0
+#   embedding_concurrency: 4

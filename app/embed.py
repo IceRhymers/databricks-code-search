@@ -18,6 +18,7 @@ connection or is called while a lock is held.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from app.config import SEMANTIC_EMBEDDING_DIM, Settings
@@ -50,13 +51,27 @@ def _assert_dims(vectors: Sequence[list[float]], dim: int) -> None:
 
 
 def _query_batch(
-    client: Any, endpoint: str, model: str, batch: list[str], *, max_retries: int
+    client: Any,
+    endpoint: str,
+    model: str,
+    batch: list[str],
+    *,
+    max_retries: int,
+    ordinal: int = 0,
+    offset: int = 0,
 ) -> list[list[float]]:
     """Query one batch, retrying up to ``max_retries`` times (small, bounded).
 
     ``endpoint`` is the gateway route path (e.g. ``/ai-gateway/mlflow/v1/embeddings``),
     POSTed via the SDK's raw API client; the response is OpenAI-shaped
     (``{"data": [{"embedding": [...]}, ...]}``).
+
+    ``ordinal``/``offset`` identify this batch's position in the caller's flat text
+    list (batch index and its starting position, respectively) purely so a count
+    mismatch can name the offending batch -- serially that batch was recoverable
+    from context (the one after the last success), but under concurrent dispatch
+    (:func:`databricks_embedder`) it is not. Both default to 0 so ``_query_batch``
+    stays directly callable in isolation.
     """
     last_exc: Exception | None = None
     for _attempt in range(max_retries + 1):
@@ -69,7 +84,8 @@ def _query_batch(
             # confusing IndexError (or silent corruption) much further downstream.
             if len(vectors) != len(batch):
                 raise EmbeddingCountMismatchError(
-                    f"embedder returned {len(vectors)} vectors for {len(batch)} texts"
+                    f"embedder returned {len(vectors)} vectors for {len(batch)} texts "
+                    f"(batch {ordinal}, texts[{offset}:{offset + len(batch)}])"
                 )
             return vectors
         except EmbeddingCountMismatchError:
@@ -89,6 +105,7 @@ def databricks_embedder(
     batch_size: int = 64,
     timeout: float = 20.0,
     max_retries: int = 2,
+    concurrency: int = 1,
 ) -> EmbedFn:
     """Build an :data:`EmbedFn` backed by the AI Gateway embeddings route ``endpoint``.
 
@@ -105,6 +122,19 @@ def databricks_embedder(
     client's concern. When omitted, the real ``WorkspaceClient`` is built with a
     ``Config`` carrying ``http_timeout_seconds=timeout`` (the raw API client has no
     per-call timeout).
+
+    ``concurrency`` dispatches up to that many batches at once via a
+    ``ThreadPoolExecutor``. It deliberately does NOT mirror this file's usual
+    default-mirroring convention (every other parameter here matches its
+    ``Settings`` twin): the concurrent path must be opt-in at the call site that
+    knows it is the indexer. ``get_embedder`` supplies the real value from
+    ``Settings.semantic_embedding_concurrency``; every direct caller and existing
+    unit test keeps today's serial semantics untouched. Do not "fix" this default
+    to match -- a higher default would make ``tests/unit/test_embed.py``'s
+    single-threaded fakes (e.g. ``_FakeApiClient.batches.append``) nondeterministic
+    under concurrent append. ``concurrency <= 1``, or a text list short enough to
+    produce only one batch, constructs no pool and spawns no thread -- the query
+    path (one text, one batch) is a strict no-op.
     """
     if client is None:
         from databricks.sdk import WorkspaceClient  # lazy: see module docstring
@@ -113,10 +143,33 @@ def databricks_embedder(
         client = WorkspaceClient(config=_SdkConfig(http_timeout_seconds=timeout))
 
     def embed(texts: list[str]) -> list[list[float]]:
-        vectors: list[list[float]] = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            vectors.extend(_query_batch(client, endpoint, model, batch, max_retries=max_retries))
+        batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+        workers = max(1, min(concurrency, len(batches)))
+
+        def run_batch(indexed: tuple[int, list[str]]) -> list[list[float]]:
+            ordinal, batch = indexed
+            return _query_batch(
+                client,
+                endpoint,
+                model,
+                batch,
+                max_retries=max_retries,
+                ordinal=ordinal,
+                offset=ordinal * batch_size,
+            )
+
+        if workers == 1:
+            per_batch = [run_batch(item) for item in enumerate(batches)]
+        else:
+            # .map() yields in SUBMISSION order regardless of completion order --
+            # never as_completed(), which yields in completion order and would
+            # silently reorder vectors across files. See the module docstring's
+            # EmbeddingCountMismatchError note and tests/unit/test_embed.py's
+            # test_embed_module_never_uses_as_completed.
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="embed") as pool:
+                per_batch = list(pool.map(run_batch, enumerate(batches)))
+
+        vectors = [v for batch_vectors in per_batch for v in batch_vectors]
         _assert_dims(vectors, dim)
         return vectors
 
@@ -140,4 +193,5 @@ def get_embedder(cfg: Settings) -> EmbedFn:
         dim=cfg.semantic_embedding_dim,
         batch_size=cfg.semantic_embedding_batch_size,
         timeout=cfg.semantic_embedding_timeout_s,
+        concurrency=cfg.semantic_embedding_concurrency,
     )

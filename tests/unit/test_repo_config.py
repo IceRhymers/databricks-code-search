@@ -323,7 +323,7 @@ def test_semantic_block_absent_is_a_noop() -> None:
 
 @pytest.mark.unit
 def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
-    """A fully-populated block emits all six Settings-named keys, values intact."""
+    """A fully-populated block emits all seven Settings-named keys, values intact."""
     raw = (
         b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
         b"semantic:\n"
@@ -333,6 +333,7 @@ def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
         b"  embedding_model: acme.embed-v2\n"
         b"  embedding_batch_size: 32\n"
         b"  embedding_timeout_s: 15.0\n"
+        b"  embedding_concurrency: 4\n"
     )
     cfg = parse_config(raw, source="cfg")
     assert cfg.semantic.settings_overrides() == {
@@ -342,6 +343,7 @@ def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
         "semantic_embedding_model": "acme.embed-v2",
         "semantic_embedding_batch_size": 32,
         "semantic_embedding_timeout_s": 15.0,
+        "semantic_embedding_concurrency": 4,
     }
 
 
@@ -371,6 +373,8 @@ def test_semantic_block_partial_emits_only_set_fields() -> None:
         ("embedding_timeout_s", b"-2.5"),
         ("embedding_endpoint", b'""'),
         ("embedding_model", b'""'),
+        ("embedding_concurrency", b"0"),
+        ("embedding_concurrency", b"9"),
     ],
 )
 def test_semantic_block_rejects_out_of_bound_values(field: str, value: bytes) -> None:
@@ -471,10 +475,11 @@ def test_settings_overrides_keys_are_real_settings_fields_and_types_survive() ->
         embedding_model="custom.model",
         embedding_batch_size=8,
         embedding_timeout_s=5.5,
+        embedding_concurrency=6,
     )
     overrides = ov.settings_overrides()
-    # All six set -> all six emitted, and every key is a real Settings field.
-    assert len(overrides) == 6
+    # All seven set -> all seven emitted, and every key is a real Settings field.
+    assert len(overrides) == 7
     assert set(overrides) <= set(Settings.model_fields)
 
     # model_copy(update=) does NOT validate; re-validating the dumped model is what
@@ -487,6 +492,7 @@ def test_settings_overrides_keys_are_real_settings_fields_and_types_survive() ->
     assert revalidated.semantic_embedding_model == "custom.model"
     assert revalidated.semantic_embedding_batch_size == 8
     assert revalidated.semantic_embedding_timeout_s == 5.5
+    assert revalidated.semantic_embedding_concurrency == 6
 
 
 # --- parse failures -------------------------------------------------------
