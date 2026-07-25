@@ -16,6 +16,7 @@ assertion reads as the inventory it is checking.
 from __future__ import annotations
 
 import contextlib
+import logging
 from typing import Any, NamedTuple
 
 import pytest
@@ -415,6 +416,53 @@ def test_membership_without_a_chunk_writer_issues_only_the_union() -> None:
     )
     _index(conn, [_item("a.py", "x = 1\n")], chunk_writer=None)
     assert conn.kinds.count("membership-union") == 1
+
+
+# --- The `delta write set` line: always emitted, one shape -------------------
+
+
+@pytest.mark.unit
+def test_delta_write_set_line_reports_the_breakdown_with_the_gate_open(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T7: the breakdown rides its OWN line from indexer.store -- IndexCounts is
+    unchanged, so this is where unchanged/membership become visible."""
+    conn = _FakeConn(
+        baseline=("sha_old", INDEX_SEMANTICS_VERSION),
+        carried={_key("keep.py", "k = 1\n")},
+        present={_key("keep.py", "k = 1\n"), _key("shared.py", "s = 1\n")},
+    )
+    with caplog.at_level(logging.INFO, logger="indexer.store"):
+        _index(
+            conn,
+            [
+                _item("keep.py", "k = 1\n"),
+                _item("shared.py", "s = 1\n"),
+                _item("new.py", "n = 1\n"),
+            ],
+        )
+
+    assert (
+        "acme/widgets@main: delta write set 1/3 files "
+        "(unchanged=1 membership=1, semantics gate open)"
+    ) in caplog.text
+
+
+@pytest.mark.unit
+def test_delta_write_set_line_is_present_with_the_gate_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T7, the other half: the line never disappears -- a closed gate reports the
+    full-path reason instead, so no grep an operator writes breaks."""
+    conn = _FakeConn(baseline=("sha_old", INDEX_SEMANTICS_VERSION - 1))
+    with caplog.at_level(logging.INFO, logger="indexer.store"):
+        _index(conn, [_item("a.py", "x = 1\n"), _item("b.py", "y = 2\n")])
+
+    assert (
+        f"acme/widgets@main: delta write set 2/2 files (unchanged=0 membership=0, "
+        f"semantics gate closed: stored v{INDEX_SEMANTICS_VERSION - 1} "
+        f"!= v{INDEX_SEMANTICS_VERSION})"
+    ) in caplog.text
 
 
 # --- Transaction shape and the untouched guards ------------------------------

@@ -248,10 +248,21 @@ def index_repo(
       ``commit:`` filter resolves from ``repo_branches.last_indexed_commit``,
       and the column is documented write-only and ambiguous under dedup in
       ``app/db/models.py``). This makes it staler; it makes nothing wrong.
+
+    The breakdown is reported on one INFO line per call, immediately before the
+    sweep, in both the gate-open and gate-closed cases::
+
+        acme/widgets@main: delta write set 412/30214 files (unchanged=29790 membership=12,
+        semantics gate open)
+
+    ``IndexCounts`` is unchanged: ``files`` still counts files SEEN this run, and
+    ``symbols``/``edges`` still count rows actually inserted -- so they
+    legitimately read ``0`` on an all-unchanged run. That is the correct signal.
     """
     file_count = 0
     symbol_count = 0
     edge_count = 0
+    unchanged_count = 0
     seen_paths: list[str] = []
     seen_shas: list[str] = []
 
@@ -318,6 +329,7 @@ def index_repo(
                 # Unchanged: this exact content is already stored on a row this
                 # branch already carries. No file upsert, no symbol/edge
                 # delete-reinsert, no chunk_writer call.
+                unchanged_count += 1
                 continue
 
             if membership_ok and (pf.path, sha) in present:
@@ -418,6 +430,26 @@ def index_repo(
                 membership=membership,
                 chunk_writer=chunk_writer,
             )
+
+        # One INFO line per index_repo call, immediately before the sweep, in
+        # BOTH the gate-open and gate-closed cases -- one format string, no
+        # conditional fields, so the line is always present and always greppable.
+        # The reason tail is the only part that varies. IndexCounts is
+        # deliberately NOT extended to carry this: it is a frozen dataclass
+        # compared by value in existing assertions, and `files` keeps meaning
+        # "files seen this run" (the seen-set size).
+        logger.info(
+            "%s@%s: delta write set %d/%d files (unchanged=%d membership=%d, %s)",
+            name,
+            branch,
+            file_count - unchanged_count - len(membership),
+            file_count,
+            unchanged_count,
+            len(membership),
+            "semantics gate open"
+            if delta_on
+            else f"semantics gate closed: stored v{baseline_version} != v{INDEX_SEMANTICS_VERSION}",
+        )
 
         # Timed into indexer.job's ambient per-branch PhaseTimer, if one is
         # installed -- a no-op otherwise, so a direct index_repo call (tests,
