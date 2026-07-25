@@ -275,7 +275,7 @@ def test_all_unchanged_run_calls_no_chunk_writer() -> None:
     _index(
         conn,
         items,
-        chunk_writer=lambda _c, _r, _f, pf: calls.append(pf.path),
+        chunk_writer=lambda _c, _r, pairs: calls.extend(pf.path for _fid, pf in pairs),
     )
     assert calls == []
 
@@ -303,24 +303,31 @@ def test_changed_content_at_a_known_path_takes_the_full_path() -> None:
 @pytest.mark.unit
 def test_membership_only_issues_one_batched_union_and_no_symbol_work() -> None:
     """T3 (AC3): a file stored for this repo but not carried by this branch takes
-    the membership path -- ONE batched UPDATE for the whole class, one
-    chunk_writer call per file, and no symbols/reference_edges statements."""
-    calls: list[tuple[int, str]] = []
+    the membership path -- ONE batched UPDATE for the whole class, ONE
+    chunk_writer call carrying every file's (file_id, pf) pair, and no
+    symbols/reference_edges statements."""
+    chunk_writer_calls: list[list[tuple[int, str]]] = []
     items = [_item("a.py", "x = 1\n"), _item("b.py", "y = 2\n")]
     conn = _FakeConn(
         baseline=("sha_old", INDEX_SEMANTICS_VERSION),
         carried=set(),
         present={_key("a.py", "x = 1\n"), _key("b.py", "y = 2\n")},
     )
-    counts = _index(conn, items, chunk_writer=lambda _c, _r, fid, pf: calls.append((fid, pf.path)))
+    counts = _index(
+        conn,
+        items,
+        chunk_writer=lambda _c, _r, pairs: chunk_writer_calls.append(
+            [(fid, pf.path) for fid, pf in pairs]
+        ),
+    )
 
     assert conn.kinds.count("membership-union") == 1
     assert "file-upsert" not in conn.kinds
     assert "symbols-delete" not in conn.kinds
     assert "edges-delete" not in conn.kinds
-    # The file_id each chunk write used came from the UPDATE's RETURNING, not a
-    # second lookup.
-    assert calls == [(1, "a.py"), (2, "b.py")]
+    # ONE chunk_writer call for the whole membership class, and the file_id each
+    # pair carries came from the UPDATE's RETURNING, not a second lookup.
+    assert chunk_writer_calls == [[(1, "a.py"), (2, "b.py")]]
     assert conn.membership_params["paths"] == ["a.py", "b.py"]
     assert conn.membership_params["branch_arr"] == ["main"]
     # symbols/edges legitimately fall to zero: no rows were inserted.

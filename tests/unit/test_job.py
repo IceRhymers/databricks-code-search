@@ -656,15 +656,18 @@ def test_semantic_enabled_builds_and_wires_a_chunk_writer() -> None:
 
     # Exercise the closure directly: writing main.py's chunks is a
     # delete-then-insert against the chunks table, keyed by the given file_id.
+    # The closure now takes a batch -- a sequence of (file_id, pf) pairs.
     conn = _FakeChunkConn()
     pf = ParsedFile(path="main.py", lang="python", size=10, content="def f():\n    return 1\n")
-    idx.chunk_writer(conn, 1, 42, pf)
+    idx.chunk_writer(conn, 1, [(42, pf)])
     assert len(conn.calls) == 2
-    delete_stmt, _ = conn.calls[0]
+    delete_stmt, delete_params = conn.calls[0]
     assert delete_stmt.table.name == "chunks"
+    assert delete_params == {"ids": [42]}
     insert_stmt, values = conn.calls[1]
     assert insert_stmt.table.name == "chunks"
-    assert values == [
+    assert values is None  # rows travel inside stmt.values(...), not as a param list
+    assert insert_stmt._multi_values[0] == [
         {
             "file_id": 42,
             "chunk_index": 0,
@@ -805,7 +808,7 @@ def test_chunk_writer_covered_guard_skips_an_uncovered_path(
     chunk_writer = _precompute_chunk_writer([], lambda texts: [[0.0] for _ in texts], 100)
     conn = _FakeChunkConn()
     with caplog.at_level(logging.WARNING, logger="indexer.job"):
-        chunk_writer(conn, 1, 99, pf)
+        chunk_writer(conn, 1, [(99, pf)])
     assert conn.calls == []
     assert any(
         "no precomputed chunks for ghost.py" in r.getMessage()
@@ -825,8 +828,8 @@ def test_chunk_writer_covers_every_embedded_path_including_zero_chunk_files() ->
     empty_pf = ParsedFile(path="empty.py", lang="python", size=0, content="")
     chunk_writer = _precompute_chunk_writer([empty_pf], lambda texts: [[0.0] for _ in texts], 100)
     conn = _FakeChunkConn()
-    chunk_writer(conn, 1, 99, empty_pf)
-    # write_chunks always issues its DELETE even for zero chunks (see
+    chunk_writer(conn, 1, [(99, empty_pf)])
+    # write_chunks_batch always issues its DELETE even for zero chunks (see
     # indexer/chunk_store.py) -- so a real (non-warning) statement was issued.
     assert len(conn.calls) >= 1
 

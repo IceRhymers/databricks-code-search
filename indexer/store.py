@@ -20,7 +20,7 @@ does so WITHOUT a CAS check.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 
 from sqlalchemy import Connection, delete, func, text, update
@@ -64,10 +64,11 @@ class ReconcileCounts:
     files_deleted: int
 
 
-# Called as chunk_writer(conn, repo_id, file_id, pf) once per file, inside the
-# same conn.begin() as the rest of that file's row. Vectors must already be
-# computed -- this seam never calls an embedder itself.
-ChunkWriter = Callable[[Connection, int, int, ParsedFile], None]
+# Called as chunk_writer(conn, repo_id, pairs) once per BATCH of files (a
+# sequence of (file_id, pf) pairs), inside the same conn.begin() as the rest of
+# those files' rows. Vectors must already be computed -- this seam never calls
+# an embedder itself.
+ChunkWriter = Callable[[Connection, int, Sequence[tuple[int, ParsedFile]]], None]
 
 # The two projection reads behind the file-level delta path. Returned as
 # ``(carried, present)`` -- see read_repo_content_shas.
@@ -420,7 +421,7 @@ def index_repo(
                 edge_count += len(ex.edges)
 
             if chunk_writer is not None:
-                chunk_writer(conn, repo_id, file_id, pf)
+                chunk_writer(conn, repo_id, [(file_id, pf)])
 
         # ONE statement for the whole membership-only class, skipped entirely
         # when that class is empty (rather than issued as a no-op) so the
@@ -559,6 +560,7 @@ def _union_membership(
     if chunk_writer is None:
         return
     file_ids = {(row.path, row.content_sha): row.id for row in rows}
+    pairs: list[tuple[int, ParsedFile]] = []
     for pf, sha in membership:
         file_id = file_ids.get((pf.path, sha))
         if file_id is None:
@@ -569,7 +571,9 @@ def _union_membership(
                 pf.path,
             )
             continue
-        chunk_writer(conn, repo_id, file_id, pf)
+        pairs.append((file_id, pf))
+    if pairs:
+        chunk_writer(conn, repo_id, pairs)
 
 
 def _sweep_membership(

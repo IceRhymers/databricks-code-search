@@ -109,8 +109,9 @@ def test_chunk_writer_defaults_to_none_and_behavior_is_unchanged() -> None:
 def test_chunk_writer_is_called_once_per_file_with_repo_id_and_file_id() -> None:
     calls: list[tuple[int, int, str]] = []
 
-    def chunk_writer(conn: Any, repo_id: int, file_id: int, pf: ParsedFile) -> None:
-        calls.append((repo_id, file_id, pf.path))
+    def chunk_writer(conn: Any, repo_id: int, pairs: Any) -> None:
+        for file_id, pf in pairs:
+            calls.append((repo_id, file_id, pf.path))
 
     items = [
         (_pf("a.py", "x = 1\n"), FileExtraction(symbols=[], edges=[])),

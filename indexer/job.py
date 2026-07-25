@@ -125,7 +125,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -140,7 +140,7 @@ from app.db.client import create_db_engine
 from app.db.models import INDEX_SEMANTICS_VERSION, Repo, RepoBranch
 from app.embed import EmbeddingCountMismatchError, EmbedFn, get_embedder
 from indexer.branches import resolve_branches
-from indexer.chunk_store import write_chunks
+from indexer.chunk_store import write_chunks_batch
 from indexer.fetch import (
     REQUIRED_FREE_BYTES,
     assert_disk_headroom,
@@ -869,11 +869,17 @@ def _precompute_chunk_writer(
     file in the branch. The closure below therefore closes over ``covered =
     set(per_file)`` -- every path THIS call embedded, including zero-chunk files
     -- and refuses to write chunks for any other path. This is defence-in-depth
-    for a path the single-writer-per-repo invariant says is unreachable: `
-    `write_chunks`` deletes a file's chunk rows before inserting, so calling it
-    for a path this precompute never embedded would silently delete that file's
-    chunks rather than merely leave them stale. See ``indexer/store.py``'s
-    ``_union_membership`` for the authoritative-side analogue of this guard.
+    for a path the single-writer-per-repo invariant says is unreachable:
+    ``write_chunks_batch`` deletes a file's chunk rows before inserting, so
+    calling it for a path this precompute never embedded would silently delete
+    that file's chunks rather than merely leave them stale. See
+    ``indexer/store.py``'s ``_union_membership`` for the authoritative-side
+    analogue of this guard.
+
+    The returned closure is called once per BATCH of files (a sequence of
+    ``(file_id, pf)`` pairs, per :data:`indexer.store.ChunkWriter`) -- the
+    ``covered`` guard is applied per pair, filtering the batch before one
+    :func:`indexer.chunk_store.write_chunks_batch` call for whatever survives.
     """
     per_file: dict[str, list[Chunk]] = {pf.path: list(iter_chunks(pf)) for pf in files}
     covered = set(per_file)
@@ -905,19 +911,23 @@ def _precompute_chunk_writer(
         ]
         i += len(chunks)
 
-    def chunk_writer(conn: Any, repo_id: int, file_id: int, pf: ParsedFile) -> None:
-        if pf.path not in covered:
-            # Unreachable while the single-writer invariant holds (see the
-            # docstring): index_repo only ever calls chunk_writer for a file this
-            # same precompute either embedded or classified membership-only (and
-            # index_repo's own _union_membership guards that case separately).
-            # Warn-and-skip rather than raise, matching this module's established
-            # additive-layer posture for the semantic path.
-            logger.warning(
-                "no precomputed chunks for %s; leaving its chunk rows untouched", pf.path
-            )
-            return
-        write_chunks(conn, file_id=file_id, chunks=by_path.get(pf.path, []))
+    def chunk_writer(conn: Any, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]) -> None:
+        rows: list[tuple[int, list[tuple[int, str, int, int, list[float]]]]] = []
+        for file_id, pf in pairs:
+            if pf.path not in covered:
+                # Unreachable while the single-writer invariant holds (see the
+                # docstring): index_repo only ever calls chunk_writer for a file
+                # this same precompute either embedded or classified
+                # membership-only (and index_repo's own _union_membership guards
+                # that case separately). Warn-and-skip rather than raise,
+                # matching this module's established additive-layer posture for
+                # the semantic path.
+                logger.warning(
+                    "no precomputed chunks for %s; leaving its chunk rows untouched", pf.path
+                )
+                continue
+            rows.append((file_id, by_path.get(pf.path, [])))
+        write_chunks_batch(conn, rows=rows)
 
     return chunk_writer
 
