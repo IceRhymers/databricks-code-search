@@ -27,7 +27,7 @@ PR body, per the plan for issue #104, §2.6a / §3.2.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import pytest
 from sqlalchemy import Connection, text
@@ -88,10 +88,15 @@ def _pf(path: str, content: str) -> ParsedFile:
 _STUB_VECTOR = [0.1] * SEMANTIC_EMBEDDING_DIM
 
 
-def _stub_chunk_writer(conn: Connection, repo_id: int, file_id: int, pf: ParsedFile) -> None:
+def _stub_chunk_writer(
+    conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
+) -> None:
     # A fixed, precomputed 1-chunk-per-file "embedding" -- proves the seam without
-    # needing a real embedder (chunk_writer never calls one).
-    write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
+    # needing a real embedder (chunk_writer never calls one). #105 reshaped this
+    # seam to one call per BATCH -- Lakebase-deferred (this module needs
+    # lakebase_vector, unavailable locally), so reasoned through, not verified.
+    for file_id, pf in pairs:
+        write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
 
 
 def _count(conn: Connection, table: str, where: str = "") -> int:
@@ -234,10 +239,11 @@ def test_unchanged_file_never_calls_chunk_writer_and_preserves_chunk_ids(
     calls: list[str] = []
 
     def _tracking_chunk_writer(
-        conn: Connection, repo_id: int, file_id: int, pf: ParsedFile
+        conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
     ) -> None:
-        calls.append(pf.path)
-        _stub_chunk_writer(conn, repo_id, file_id, pf)
+        for file_id, pf in pairs:
+            calls.append(pf.path)
+            _stub_chunk_writer(conn, repo_id, [(file_id, pf)])
 
     index_repo(
         conn,

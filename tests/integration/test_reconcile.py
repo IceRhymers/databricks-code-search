@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 import pytest
@@ -98,8 +98,15 @@ FEATURE_ONLY = (
 _STUB_VECTOR = [0.1] * SEMANTIC_EMBEDDING_DIM
 
 
-def _stub_chunk_writer(conn: Connection, repo_id: int, file_id: int, pf: ParsedFile) -> None:
-    write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
+def _stub_chunk_writer(
+    conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
+) -> None:
+    # #105 reshaped the seam to one call per BATCH -- Lakebase-deferred, this
+    # module cannot run locally (needs lakebase_vector), so this update is
+    # reasoned through against indexer/store.py's ChunkWriter alias, never
+    # locally verified.
+    for file_id, pf in pairs:
+        write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
 
 
 def _count(conn: Connection, table: str, where: str = "") -> int:
