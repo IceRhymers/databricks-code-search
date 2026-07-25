@@ -32,6 +32,7 @@ import pytest
 
 from app.config import Settings
 from app.db.models import INDEX_SEMANTICS_VERSION
+from indexer.hashing import content_sha
 from indexer.job import (
     BranchOutcome,
     RepoOutcome,
@@ -325,6 +326,18 @@ def _noop_removed_fn(conn: Any, *, desired_repos: Any) -> list[str]:
     return []
 
 
+def _noop_shas_fn(conn: Any, *, name: str, branch: str) -> tuple[set[Any], set[Any]]:
+    """Default ``shas_fn`` for ``_run()`` -- ``_FakeConn`` cannot answer the real
+    ``read_indexed_shas`` query (it routes only on ``"repo_branches" in str(stmt)``,
+    per its own docstring), so any test that reaches the advisory read without an
+    explicit override would call the REAL primitive against the fake engine and
+    fail. Returning two empty sets degrades to "everything is changed/new",
+    matching ``read_indexed_shas``' own behaviour for a never-indexed repo -- safe
+    in the correct direction and inert for every test that never exercises delta
+    embedding at all."""
+    return set(), set()
+
+
 class _RecordingReconcile:
     """Fake ``reconcile_retired_fn``/``reconcile_removed_fn`` pair, explicitly opted into.
 
@@ -373,6 +386,7 @@ def _run(
     engine: _FakeEngine | None = None,
     reconcile_retired_fn: Any = _noop_retired_fn,
     reconcile_removed_fn: Any = _noop_removed_fn,
+    shas_fn: Any = _noop_shas_fn,
 ) -> int:
     """Drive run() with a faked config read but a REAL resolve_repos.
 
@@ -382,6 +396,11 @@ def _run(
     against ``_FakeEngine``/``_FakeConn`` (neither implements ``conn.begin()``).
     Tests that assert on reconciliation itself pass an explicit
     :class:`_RecordingReconcile`'s bound methods.
+
+    ``shas_fn`` defaults to :func:`_noop_shas_fn` for the same reason: a
+    version-matching, sha-mismatching stamp with semantic indexing on would
+    otherwise reach the REAL ``read_indexed_shas`` against ``_FakeConn``, which
+    cannot answer it (see that fake's docstring).
     """
     wc = _FakeWorkspaceClient("tok")
     engine = engine if engine is not None else _FakeEngine()
@@ -402,6 +421,7 @@ def _run(
             config_loader=lambda _client, _path: config,
             reconcile_retired_fn=reconcile_retired_fn,
             reconcile_removed_fn=reconcile_removed_fn,
+            shas_fn=shas_fn,
         )
 
 
@@ -754,6 +774,326 @@ def test_unbuildable_embedder_does_not_abort_the_whole_run() -> None:
     assert code == 0
     assert idx.calls == ["acme/widgets"]
     assert idx.chunk_writer is None
+
+
+# --- file-level delta indexing: the chunk_writer covered-set guard (#104) ---
+
+
+@pytest.mark.unit
+def test_chunk_writer_covered_guard_skips_an_uncovered_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T14: a path outside _precompute_chunk_writer's own file list -> WARNING, and
+    chunk_writer issues NO statement at all (specifically no DELETE FROM chunks,
+    which write_chunks always opens with -- see indexer/chunk_store.py). This is
+    the defence-in-depth guard for a path the single-writer-per-repo invariant
+    says index_repo can never actually pass it; unreachable in production, but
+    the alternative (silently deleting an uncovered file's chunk rows) is worse
+    than a loud skip.
+    """
+    from indexer.job import _precompute_chunk_writer
+
+    pf = ParsedFile(path="ghost.py", lang="python", size=10, content="x = 1\n")
+    chunk_writer = _precompute_chunk_writer([], lambda texts: [[0.0] for _ in texts], 100)
+    conn = _FakeChunkConn()
+    with caplog.at_level(logging.WARNING, logger="indexer.job"):
+        chunk_writer(conn, 1, 99, pf)
+    assert conn.calls == []
+    assert any(
+        "no precomputed chunks for ghost.py" in r.getMessage()
+        for r in caplog.records
+        if r.name == "indexer.job"
+    )
+
+
+@pytest.mark.unit
+def test_chunk_writer_covers_every_embedded_path_including_zero_chunk_files() -> None:
+    """The covered set is `set(per_file)`, not `set(by_path)` -- a file that embeds
+    to zero chunks (e.g. an empty file) is still COVERED, so its chunk_writer call
+    reaches write_chunks([]) (the delete-only, zero-row-insert shape) rather than
+    the warn-and-skip guard above."""
+    from indexer.job import _precompute_chunk_writer
+
+    empty_pf = ParsedFile(path="empty.py", lang="python", size=0, content="")
+    chunk_writer = _precompute_chunk_writer([empty_pf], lambda texts: [[0.0] for _ in texts], 100)
+    conn = _FakeChunkConn()
+    chunk_writer(conn, 1, 99, empty_pf)
+    # write_chunks always issues its DELETE even for zero chunks (see
+    # indexer/chunk_store.py) -- so a real (non-warning) statement was issued.
+    assert len(conn.calls) >= 1
+
+
+# --- file-level delta indexing: the advisory shas_fn seam (#104) ------------
+# job.py's copy of indexer.store.read_repo_content_shas is ADVISORY -- it only
+# narrows what _precompute_chunk_writer embeds. index_repo's own read (behind
+# index_fn, unexercised by _RecordingIndex) is the authoritative classification;
+# these tests pin job.py's half of the contract only: when shas_fn is called,
+# with what, and what that narrows the embedder's input to. _DEFAULT_FILES is
+# {"main.py": b"def f():\n    return 1\n", "README.md": b"# hi\n"} (both text,
+# both chunked -- indexer.parse.iter_chunks has no language gate).
+
+_MAIN_SHA = content_sha("def f():\n    return 1\n")
+_README_SHA = content_sha("# hi\n")
+
+
+class _RecordingShas:
+    """Fake ``shas_fn``: records every ``(name, branch)`` call and returns a
+    scripted ``(carried, present)`` pair (``present`` is unused by job.py, which
+    only classifies "unchanged" from ``carried`` -- the provenance gate that
+    would also need ``present`` is index_repo's alone)."""
+
+    def __init__(
+        self,
+        *,
+        carried: set[tuple[str, str]] | None = None,
+        present: set[tuple[str, str]] | None = None,
+    ) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._carried = carried or set()
+        self._present = present or set()
+
+    def __call__(self, conn: Any, *, name: str, branch: str) -> tuple[set[Any], set[Any]]:
+        self.calls.append((name, branch))
+        return set(self._carried), set(self._present)
+
+
+@pytest.mark.unit
+def test_shas_fn_called_once_before_embedding_when_version_matches_and_sha_differs() -> None:
+    """T9: the gate is (stored version == current) AND (stored sha != HEAD) -- the
+    latter is implied by reaching this code at all (an exact stamp match skips the
+    branch entirely before any of this runs, see the Step 4 tests above)."""
+    order: list[str] = []
+    shas = _RecordingShas()
+
+    def _shas_fn(conn: Any, *, name: str, branch: str) -> tuple[set[Any], set[Any]]:
+        order.append("shas")
+        return shas(conn, name=name, branch=branch)
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        order.append("embed")
+        return [[0.0] for _ in texts]
+
+    engine = _FakeEngine(stamps={("acme/widgets", "main"): ("sha_old", INDEX_SEMANTICS_VERSION)})
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _RecordingIndex(),
+        cfg=cfg,
+        embed_fn=_embed,
+        engine=engine,
+        shas_fn=_shas_fn,
+    )
+    assert code == 0
+    assert shas.calls == [("acme/widgets", "main")]
+    assert order == ["shas", "embed"]
+
+
+@pytest.mark.unit
+def test_shas_fn_not_called_when_the_semantics_version_is_stale() -> None:
+    """T10: version mismatch -> the delta gate is closed, so job.py never issues the
+    advisory read either, and the embedder receives every file's chunk text."""
+    shas = _RecordingShas()
+    embed_calls: list[list[str]] = []
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        embed_calls.append(list(texts))
+        return [[0.0] for _ in texts]
+
+    engine = _FakeEngine(
+        stamps={("acme/widgets", "main"): ("sha_widgets", INDEX_SEMANTICS_VERSION - 1)}
+    )
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _RecordingIndex(),
+        cfg=cfg,
+        embed_fn=_embed,
+        engine=engine,
+        shas_fn=shas,
+    )
+    assert code == 0
+    assert shas.calls == []
+    assert len(embed_calls) == 1
+    # Both main.py's and README.md's chunk text are present -- nothing narrowed.
+    joined = "\n".join(embed_calls[0])
+    assert "def f" in joined
+    assert "# hi" in joined
+
+
+@pytest.mark.unit
+def test_shas_fn_not_called_for_a_never_indexed_repo() -> None:
+    """T10b: a missing stamp degrades to (None, None) -- version is None, never equal
+    to INDEX_SEMANTICS_VERSION, so this is the same gate-closed path as a stale
+    version, exercised separately because it is the far more common real case (a
+    repo's first index) than an explicit version regression."""
+    shas = _RecordingShas()
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _RecordingIndex(),
+        cfg=cfg,
+        embed_fn=lambda texts: [[0.0] for _ in texts],
+        shas_fn=shas,
+    )
+    assert code == 0
+    assert shas.calls == []
+
+
+@pytest.mark.unit
+def test_shas_fn_narrows_the_embed_set_to_not_unchanged_files() -> None:
+    """T11: README.md is reported unchanged (carried); main.py is not -- the embedder
+    must receive only main.py's chunk text."""
+    embed_calls: list[list[str]] = []
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        embed_calls.append(list(texts))
+        return [[0.0] for _ in texts]
+
+    shas_fn = _RecordingShas(carried={("README.md", _README_SHA)})
+    engine = _FakeEngine(stamps={("acme/widgets", "main"): ("sha_old", INDEX_SEMANTICS_VERSION)})
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        _RecordingIndex(),
+        cfg=cfg,
+        embed_fn=_embed,
+        engine=engine,
+        shas_fn=shas_fn,
+    )
+    assert code == 0
+    assert len(embed_calls) == 1
+    joined = "\n".join(embed_calls[0])
+    assert "def f" in joined
+    assert "# hi" not in joined
+
+
+@pytest.mark.unit
+def test_shas_fn_all_unchanged_calls_the_embedder_with_zero_texts() -> None:
+    """T12 (issue AC1): every file carried -> the embed list is empty, and
+    _precompute_chunk_writer's own `all_texts` guard means the embedder is not
+    even called (matching read_indexed_shas' safe-degrade convention: an unused
+    injection point is never exercised, not called with an empty list)."""
+    embed_calls: list[list[str]] = []
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        embed_calls.append(list(texts))
+        return [[0.0] for _ in texts]
+
+    shas_fn = _RecordingShas(
+        carried={("README.md", _README_SHA), ("main.py", _MAIN_SHA)},
+    )
+    engine = _FakeEngine(stamps={("acme/widgets", "main"): ("sha_old", INDEX_SEMANTICS_VERSION)})
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    idx = _RecordingIndex()
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        idx,
+        cfg=cfg,
+        embed_fn=_embed,
+        engine=engine,
+        shas_fn=shas_fn,
+    )
+    assert code == 0
+    assert embed_calls == []
+    # The core index still ran over BOTH files -- narrowing the embed set never
+    # narrows what index_fn (the store) sees; that is index_repo's classification
+    # to make, from its own authoritative read.
+    assert idx.counts == [IndexCounts(files=2, symbols=1, swept=0, edges=0)]
+    assert idx.chunk_writer is not None
+
+
+@pytest.mark.unit
+def test_indexed_summary_line_is_byte_identical_regardless_of_delta_narrowing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T13: the drain loop's `indexed name@branch: files=.. symbols=.. edges=.. swept=..`
+    line is IndexCounts' own format -- narrowing the embed set must not touch it."""
+    shas_fn = _RecordingShas(carried={("README.md", _README_SHA)})
+    engine = _FakeEngine(stamps={("acme/widgets", "main"): ("sha_old", INDEX_SEMANTICS_VERSION)})
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]),
+            _RecordingIndex(),
+            cfg=cfg,
+            embed_fn=lambda texts: [[0.0] for _ in texts],
+            engine=engine,
+            shas_fn=shas_fn,
+        )
+    assert code == 0
+    indexed_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "indexer.job" and r.getMessage().startswith("indexed ")
+    ]
+    assert indexed_lines == ["indexed acme/widgets@main: files=2 symbols=1 edges=0 swept=0"]
+
+
+# --- file-level delta indexing: degraded-semantics run summary (#104) -------
+
+
+@pytest.mark.unit
+def test_precompute_failure_marks_the_branch_outcome_degraded() -> None:
+    """A chunk-precompute failure marks the resulting BranchOutcome, not just the
+    per-branch WARNING already covered by
+    test_embedder_failure_degrades_but_still_indexes_the_core."""
+    from indexer.job import _index_one_branch
+
+    def _down(_texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("serving endpoint unavailable")
+
+    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+        outcome = _index_one_branch(
+            "acme/widgets",
+            org="acme",
+            repo="widgets",
+            branch="main",
+            is_default=True,
+            default_head_sha="sha_widgets",
+            http_client=client,
+            engine=_FakeEngine(),
+            index_fn=_RecordingIndex(),
+            cfg=Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100),
+            embed_fn=_down,
+            stamps={},
+            started=time.monotonic(),
+            max_chunks_per_repo=100,
+            shas_fn=_noop_shas_fn,
+        )
+    assert outcome.status == "indexed"
+    assert outcome.semantic_degraded is True
+
+
+@pytest.mark.unit
+def test_run_emits_one_aggregate_warning_naming_every_degraded_branch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The run-completion WARNING is the greppable record the runbook remedy
+    (clear the branch's semantics stamp) depends on -- the per-branch warning at
+    the precompute site is easy to miss in a large run's log."""
+
+    def _down(_texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("serving endpoint unavailable")
+
+    cfg = Settings(semantic_enabled=True)
+    with caplog.at_level(logging.WARNING, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _RecordingIndex(), cfg=cfg, embed_fn=_down)
+    assert code == 0
+    warnings = [r.getMessage() for r in caplog.records if r.name == "indexer.job"]
+    aggregate = [m for m in warnings if m.startswith("1 branch(es) finished with degraded")]
+    assert len(aggregate) == 1
+    assert "acme/widgets@main" in aggregate[0]
+
+
+@pytest.mark.unit
+def test_run_emits_no_aggregate_warning_when_nothing_degraded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="indexer.job"):
+        code = _run(_config(repos=["acme/widgets"]), _RecordingIndex())
+    assert code == 0
+    warnings = [r.getMessage() for r in caplog.records if r.name == "indexer.job"]
+    assert not any("degraded semantic coverage" in m for m in warnings)
 
 
 # --- config.yaml `semantic:` overlay onto cfg (config.yaml > env > default) --
@@ -1224,6 +1564,7 @@ def test_index_one_inner_reports_discovery_complete_for_a_normal_run() -> None:
             cfg=Settings(semantic_enabled=False),
             embed_fn=None,
             stamps={},
+            shas_fn=_noop_shas_fn,
         )
     assert outcome.name == "acme/widgets"
     assert outcome.discovery_complete is True
@@ -1250,6 +1591,7 @@ def test_index_one_inner_reports_discovery_incomplete_when_capped() -> None:
             cfg=Settings(semantic_enabled=False),
             embed_fn=None,
             stamps={},
+            shas_fn=_noop_shas_fn,
         )
     assert outcome.discovery_complete is False
     assert len(outcome.outcomes) == SOFT_BRANCH_CAP
@@ -1277,6 +1619,7 @@ def test_index_one_inner_default_flip_mirror_is_complete() -> None:
             cfg=Settings(semantic_enabled=False),
             embed_fn=None,
             stamps={},
+            shas_fn=_noop_shas_fn,
         )
     assert [o.branch for o in outcome.outcomes] == ["main"]
     assert outcome.discovery_complete is True
@@ -1584,6 +1927,7 @@ def test_repo_context_is_reset_even_when_the_repo_fails() -> None:
             cfg=Settings(semantic_enabled=False),
             embed_fn=None,
             stamps={},
+            shas_fn=_noop_shas_fn,
         )
     assert _repo_ctx.get() == "-"
 

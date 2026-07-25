@@ -79,6 +79,24 @@ and only a ``chunk_writer`` closure over the precomputed vectors is handed to
 loop as symbols. Flag-off: no chunking, no embedder, no import of ``app.embed``'s
 lazy ``databricks-sdk`` dependency.
 
+File-level delta indexing (issue #104) skips re-embedding a file this branch
+already carries unchanged, at ``(path, content_sha)``. Before building the
+embed list, this module calls the injected ``shas_fn`` (default
+:func:`indexer.store.read_indexed_shas`) -- but ONLY when this branch's stored
+``index_semantics_version`` already matches
+:data:`app.db.models.INDEX_SEMANTICS_VERSION`, the same gate
+``indexer.store.index_repo`` applies authoritatively inside its own
+transaction -- on a short-lived connection that closes before the embedder is
+called. ``index_repo``'s per-file classification (unchanged / membership-only /
+changed-new) is the one that actually decides what gets written; this module's
+copy is advisory only, used to decide what needs a vector. Both reads can only
+diverge if a second writer touched this repo between them, which the
+single-writer-per-repo invariant above forbids. A branch whose semantic
+precompute fails keeps whatever chunk coverage it already had -- see
+:func:`_precompute_chunk_writer` and ``indexer/store.py``'s module docstring
+for why that is no longer self-healing on the next run under delta indexing,
+and the aggregate run-completion WARNING this module emits for it.
+
 Every INDEXED branch also emits one ``phase timing`` line accounting for its whole
 wall clock -- resolve / download / extract / parse / embed / db / sweep, plus an
 ``other`` residual so no time is silently unattributed. The fields are fixed and
@@ -130,15 +148,18 @@ from indexer.fetch import (
     resolve_branch_head,
     resolve_ref,
 )
+from indexer.hashing import content_sha
 from indexer.languages import Chunk, FileExtraction, IndexCounts, ParsedFile
 from indexer.parse import iter_chunks, iter_source_files
 from indexer.repo_config import RepoConfig, effective_workers, load_config, normalize_repo
 from indexer.resolve import MAX_REPOS, RepoEntry, resolve_repos
 from indexer.store import (
     ChunkWriter,
+    ContentShaSets,
     ReconcileCounts,
     StaleIndexError,
     index_repo,
+    read_indexed_shas,
     reconcile_removed_repos,
     reconcile_retired_branches,
 )
@@ -166,11 +187,20 @@ class BranchOutcome:
     ``StaleIndexError`` maps to ``"conflict"`` and any other exception to
     ``"failed"``, caught INSIDE the per-branch loop so one branch's failure never
     stops its repo's other branches from being attempted.
+
+    ``semantic_degraded`` is ``True`` only for an ``"indexed"`` outcome whose
+    chunk precompute raised (a chunk-cap breach or an embedder failure) --
+    never for semantic-off, and never for a build-time embedder misconfiguration
+    (that degrades ``embed_fn`` to ``None`` before any branch starts, so no
+    per-branch precompute is ever attempted for it -- see ``_index_one_branch``).
+    ``run()`` aggregates every branch with this flag set into one
+    run-completion WARNING.
     """
 
     branch: str
     status: Literal["indexed", "skipped", "conflict", "failed"]
     counts: IndexCounts | None = None
+    semantic_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -276,6 +306,7 @@ def run(
     max_repos: int = MAX_REPOS,
     reconcile_retired_fn: Callable[..., ReconcileCounts] = reconcile_retired_branches,
     reconcile_removed_fn: Callable[..., list[str]] = reconcile_removed_repos,
+    shas_fn: Callable[..., ContentShaSets] = read_indexed_shas,
 ) -> int:
     """Index every configured repo and return a process exit code (0 = all ok).
 
@@ -414,6 +445,7 @@ def run(
     # -- and how a shrunken disk becomes visible before it becomes an outage.
     ok = skipped = conflicts = failures = 0
     repo_outcomes: list[RepoOutcome] = []
+    degraded_branches: list[str] = []
     reconciliation_attempted = False
     reconciliation_failed = False
     reconcile_skip_reason = ""
@@ -451,6 +483,7 @@ def run(
                     cfg=cfg,
                     embed_fn=embed_fn,
                     stamps=stamps,
+                    shas_fn=shas_fn,
                 ): entry
                 for entry in entries
             }
@@ -479,6 +512,8 @@ def run(
                     else:
                         ok += 1
                         assert outcome.counts is not None
+                        if outcome.semantic_degraded:
+                            degraded_branches.append(f"{entry.name}@{outcome.branch}")
                         logger.info(
                             "indexed %s@%s: files=%d symbols=%d edges=%d swept=%d",
                             entry.name,
@@ -547,6 +582,28 @@ def run(
     # Note this trades a paging signal for one run of staleness on that branch;
     # the WARNING logged at the conflict site is the record. It is NOT that the
     # work was redundant.
+
+    # One aggregate, greppable WARNING for every branch that finished "indexed"
+    # with degraded semantic coverage this run (its precompute failed -- a
+    # chunk-cap breach or an embedder outage -- so its core index is current but
+    # its chunks are not). Under file-level delta indexing this gap is NOT
+    # self-healing on the next run (see indexer/store.py's module docstring and
+    # docs/runbooks/indexing-parallelism.md §4): only a changed file re-embeds,
+    # so a branch that never changes again would carry stale/missing chunks
+    # forever unless an operator clears its semantics stamp. The per-branch
+    # WARNING already logged at the precompute site is easy to miss in a large
+    # run's log; this line exists so the condition is greppable after the fact.
+    # Deliberately does NOT fail the run -- see the per-branch warning site for
+    # why this is an additive-layer failure, not a core-index one.
+    if degraded_branches:
+        logger.warning(
+            "%d branch(es) finished with degraded semantic coverage this run (chunk precompute "
+            "failed; core index is current, chunks are not, and delta indexing will NOT catch "
+            "them up on their own -- clear their repo_branches.index_semantics_version stamp to "
+            "force a full re-embed, see docs/runbooks/indexing-parallelism.md §4): %s",
+            len(degraded_branches),
+            ", ".join(sorted(degraded_branches)),
+        )
 
     # Exactly one reconciliation summary line, always after "indexing complete".
     # The failure/withheld path already logged its own ERROR incident line
@@ -803,8 +860,21 @@ def _precompute_chunk_writer(
     embedder itself. Raises ``ValueError`` if the repo's total chunk count exceeds
     ``max_chunks_per_repo`` (the documented hard ceiling, not a streaming bound
     -- see ``app.config.semantic_max_chunks_per_repo``).
+
+    ``files`` is whatever the caller decided needs vectors -- under file-level
+    delta indexing (``_index_one_branch``) that is every file the advisory
+    ``shas_fn`` read did NOT classify as unchanged, not necessarily every parsed
+    file in the branch. The closure below therefore closes over ``covered =
+    set(per_file)`` -- every path THIS call embedded, including zero-chunk files
+    -- and refuses to write chunks for any other path. This is defence-in-depth
+    for a path the single-writer-per-repo invariant says is unreachable: `
+    `write_chunks`` deletes a file's chunk rows before inserting, so calling it
+    for a path this precompute never embedded would silently delete that file's
+    chunks rather than merely leave them stale. See ``indexer/store.py``'s
+    ``_union_membership`` for the authoritative-side analogue of this guard.
     """
     per_file: dict[str, list[Chunk]] = {pf.path: list(iter_chunks(pf)) for pf in files}
+    covered = set(per_file)
     total = sum(len(chunks) for chunks in per_file.values())
     if total > max_chunks_per_repo:
         raise ValueError(
@@ -834,6 +904,17 @@ def _precompute_chunk_writer(
         i += len(chunks)
 
     def chunk_writer(conn: Any, repo_id: int, file_id: int, pf: ParsedFile) -> None:
+        if pf.path not in covered:
+            # Unreachable while the single-writer invariant holds (see the
+            # docstring): index_repo only ever calls chunk_writer for a file this
+            # same precompute either embedded or classified membership-only (and
+            # index_repo's own _union_membership guards that case separately).
+            # Warn-and-skip rather than raise, matching this module's established
+            # additive-layer posture for the semantic path.
+            logger.warning(
+                "no precomputed chunks for %s; leaving its chunk rows untouched", pf.path
+            )
+            return
         write_chunks(conn, file_id=file_id, chunks=by_path.get(pf.path, []))
 
     return chunk_writer
@@ -848,6 +929,7 @@ def _index_one(
     cfg: Settings,
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
+    shas_fn: Callable[..., ContentShaSets],
 ) -> RepoOutcome:
     """Run the full fetch -> parse -> symbols -> store pipeline for every branch of one repo.
 
@@ -873,6 +955,7 @@ def _index_one(
             cfg=cfg,
             embed_fn=embed_fn,
             stamps=stamps,
+            shas_fn=shas_fn,
         )
     finally:
         _repo_ctx.reset(token)
@@ -888,6 +971,7 @@ def _index_one_inner(
     cfg: Settings,
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
+    shas_fn: Callable[..., ContentShaSets],
 ) -> RepoOutcome:
     """The body of :func:`_index_one`, run with the repo log context already set.
 
@@ -948,6 +1032,7 @@ def _index_one_inner(
             stamps=stamps,
             started=started,
             max_chunks_per_repo=max_chunks_per_repo,
+            shas_fn=shas_fn,
         )
         for branch in resolution.branches
     ]
@@ -1015,6 +1100,7 @@ def _index_one_branch(
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
     started: float,
     max_chunks_per_repo: int,
+    shas_fn: Callable[..., ContentShaSets],
 ) -> BranchOutcome:
     """Fetch, parse, and store ONE branch. Never raises -- every failure is classified.
 
@@ -1022,6 +1108,22 @@ def _index_one_branch(
     never indexed before) degrades to "index it", safe in the correct direction.
     A stored ``None`` version means the provenance of the stored index is
     unknown, so the branch is always re-indexed.
+
+    ``shas_fn`` is the ADVISORY copy of :func:`indexer.store.read_repo_content_shas`
+    (see that module's docstring for the authoritative one). It is called ONLY
+    when this branch's stored ``index_semantics_version`` already matches
+    :data:`app.db.models.INDEX_SEMANTICS_VERSION` -- the same gate ``index_repo``
+    applies inside its transaction, from data already in hand here -- and ONLY on
+    a separate, short-lived ``engine.connect()`` that closes before embedding
+    starts, never on a connection held across the embedder's network I/O. Its
+    result narrows the file list handed to ``_precompute_chunk_writer`` to every
+    file NOT already carried by this branch (changed/new *and* membership-only --
+    ``index_repo`` may reclassify a membership-only file as changed/new inside its
+    own transaction if the provenance gate fails there, so it must already have a
+    vector to attach). The two reads can only disagree if a second writer touched
+    this repo between them, which the single-writer-per-repo invariant (see the
+    module docstring) forbids; see ``indexer/store.py``'s ``_union_membership``
+    for the defence-in-depth guard on the authoritative side.
 
     ``max_chunks_per_repo`` is the caller's (``_index_one_inner``'s) already-resolved
     effective cap -- this repo's ``semantic_max_chunks_per_repo`` override if one
@@ -1083,6 +1185,7 @@ def _index_one_branch(
             timer.add("extract", timer.clock() - t0)
 
             chunk_writer: ChunkWriter | None = None
+            precompute_failed = False
             if cfg.semantic_enabled and embed_fn is not None:
                 # Chunking/embedding needs the full file list up front -- unlike
                 # the lazy items generator below, it cannot stream through
@@ -1100,17 +1203,42 @@ def _index_one_branch(
 
                 # In a `finally`, unlike every other phase wrap: the degrade path
                 # below still burned this time (a downed embedder can burn a lot
-                # of it before it gives up) and must still be reported.
+                # of it before it gives up) and must still be reported. The
+                # advisory shas_fn read is charged here too, deliberately NOT as
+                # its own timed phase: it exists solely to decide what this block
+                # embeds, and #103's `phase timing` line is pinned exhaustive
+                # (nine fixed fields, tests/unit/test_job.py) -- adding a tenth
+                # field is out of this change's scope.
                 t0 = timer.clock()
                 try:
-                    chunk_writer = _precompute_chunk_writer(files, embed_fn, max_chunks_per_repo)
+                    files_to_embed = files
+                    if stamps.get((name.casefold(), branch), (None, None))[1] == (
+                        INDEX_SEMANTICS_VERSION
+                    ):
+                        # Delta gate open (same test index_repo will apply
+                        # authoritatively, from data already in hand): narrow to
+                        # every file this branch does not already carry. A short-
+                        # lived connection, closed before embedding starts --
+                        # never held across the embedder's network I/O.
+                        with engine.connect() as shas_conn:
+                            carried, _present = shas_fn(shas_conn, name=name, branch=branch)
+                        files_to_embed = [
+                            pf for pf in files if (pf.path, content_sha(pf.content)) not in carried
+                        ]
+                    chunk_writer = _precompute_chunk_writer(
+                        files_to_embed, embed_fn, max_chunks_per_repo
+                    )
                 except Exception:
                     # The semantic layer is ADDITIVE: a chunk-ceiling breach, a downed embedder,
-                    # or a dim/count mismatch must not cost this branch its core index. Letting
-                    # it propagate would skip files/symbols AND the mark-and-sweep, silently
-                    # leaving the branch stale -- worse than stale chunks. Chunks catch up on
-                    # the next successful run; the failure is logged with a traceback, never
-                    # swallowed silently.
+                    # a dim/count mismatch, or a failure reading the advisory shas_fn projection
+                    # must not cost this branch its core index. Letting it propagate would skip
+                    # files/symbols AND the mark-and-sweep, silently leaving the branch stale --
+                    # worse than stale chunks. Under file-level delta indexing this is NOT
+                    # self-healing the way it was before: only a changed file re-embeds, so a
+                    # branch that never changes again carries this gap forever unless an
+                    # operator clears its semantics stamp (see run()'s aggregate WARNING and
+                    # docs/runbooks/indexing-parallelism.md §4). The failure is logged with a
+                    # traceback here too, never swallowed silently.
                     logger.warning(
                         "semantic precompute failed for %s@%s; indexing core corpus without chunks",
                         name,
@@ -1118,6 +1246,7 @@ def _index_one_branch(
                         exc_info=True,
                     )
                     chunk_writer = None
+                    precompute_failed = True
                 finally:
                     timer.add("embed", timer.clock() - t0)
                 items = ((pf, extract_file(pf)) for pf in files)
@@ -1198,7 +1327,9 @@ def _index_one_branch(
             )
         except Exception:
             logger.warning("phase timing unavailable for %s@%s", name, branch, exc_info=True)
-        return BranchOutcome(branch=branch, status="indexed", counts=counts)
+        return BranchOutcome(
+            branch=branch, status="indexed", counts=counts, semantic_degraded=precompute_failed
+        )
     except StaleIndexError as exc:
         # The repo_branches row for THIS branch changed under this worker, so
         # its whole transaction rolled back and THIS BRANCH IS NOT INDEXED.
