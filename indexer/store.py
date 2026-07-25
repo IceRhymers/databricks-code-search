@@ -112,7 +112,11 @@ def index_repo(
        set is empty** -- an empty seen-set would otherwise strip ``branch`` from
        every row in the repo; conservatively skipping is safer than wiping.
     5. CAS-stamp the ``repo_branches`` row for ``(repo_id, branch)`` against the
-       step-2 baseline (raises :class:`StaleIndexError` on mismatch).
+       step-2 baseline (raises :class:`StaleIndexError` on mismatch). A run whose
+       seen-set was EMPTY advances ``last_indexed_commit`` but leaves
+       ``index_semantics_version`` at the step-2 baseline -- it wrote nothing, so
+       it indexed nothing at the current semantics version. See
+       :func:`_stamp_repo_branch`.
 
     ``items`` may be a lazy generator; it is consumed inside the open
     transaction so memory stays bounded. ``chunk_writer`` defaults to ``None``,
@@ -269,6 +273,7 @@ def index_repo(
             head_sha=head_sha,
             baseline_commit=baseline_commit,
             baseline_version=baseline_version,
+            seen_any=bool(seen_paths),
         )
 
     return IndexCounts(files=file_count, symbols=symbol_count, swept=swept, edges=edge_count)
@@ -339,12 +344,43 @@ def _stamp_repo_branch(
     head_sha: str,
     baseline_commit: str | None,
     baseline_version: int | None,
+    seen_any: bool = True,
 ) -> None:
     """Compare-and-set the ``repo_branches`` stamp against the statement-2 baseline.
 
     Raises :class:`StaleIndexError` if the row no longer matches the baseline,
     which propagates out of ``index_repo``'s ``conn.begin()`` and rolls the whole
     ``(repo, branch)`` transaction back rather than regressing the index.
+
+    **``seen_any=False`` holds the semantics version at ``baseline_version``.**
+    A run that parsed zero indexable files (the transient case
+    ``_sweep_membership``'s empty-seen-set guard exists for) has written nothing,
+    so it has not indexed anything at the CURRENT semantics version and must not
+    claim to have. Without this the following is silent and terminal:
+
+    1. ``INDEX_SEMANTICS_VERSION`` goes 4 -> 5; branch ``b`` is stored at
+       ``(sha1, 4)``, so the skip seam forces a re-index.
+    2. That re-index parses zero files. Nothing is written -- but the stamp
+       advances to ``(sha2, 5)``.
+    3. The next run sees ``baseline_version == 5 == current``, opens the
+       file-level delta gate, and finds every row carrying ``b`` unchanged on
+       ``(path, content_sha)`` -- so it skips them all.
+    4. ``b`` serves v4-extracted rows under a v5 stamp, permanently.
+
+    ``last_indexed_commit`` still advances to ``head_sha``: the commit IS what
+    this run looked at. Leaving the version behind is what makes the branch
+    mismatch (and therefore re-index) on its next run -- self-healing, in the
+    safe direction. The statement shape, the CAS predicate, and
+    :class:`StaleIndexError` are untouched.
+
+    **Known, deliberate divergence:** ``index_repo``'s statement 1 writes the
+    DEPRECATED ``repos.index_semantics_version`` unconditionally on
+    ``is_default``, with no seen-set awareness. So a zero-parse default-branch
+    run leaves ``repos`` at the current version while ``repo_branches`` sits at
+    the old one. That is cosmetic -- no decision anywhere reads
+    ``repos.index_semantics_version`` (the three legacy columns are documented
+    deprecated in ``app/db/models.py``) -- and extending this fix to the legacy
+    stamp is scope this change deliberately does not take.
     """
     result = conn.execute(
         update(RepoBranch)
@@ -356,7 +392,7 @@ def _stamp_repo_branch(
         )
         .values(
             last_indexed_commit=head_sha,
-            index_semantics_version=INDEX_SEMANTICS_VERSION,
+            index_semantics_version=(INDEX_SEMANTICS_VERSION if seen_any else baseline_version),
             last_indexed_at=func.now(),
         )
     )
