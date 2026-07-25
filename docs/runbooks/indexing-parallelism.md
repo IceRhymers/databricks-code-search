@@ -427,8 +427,8 @@ no in-repo record of it.
 ## 5. Changing extraction semantics
 
 If you change **what** gets extracted — `indexer/symbols.py`,
-`indexer/parse.py`, `indexer/languages.py` — you **must** bump
-`INDEX_SEMANTICS_VERSION` in `app/db/models.py`.
+`indexer/parse.py`, `indexer/languages.py`, `indexer/ingest.py` — you **must**
+bump `INDEX_SEMANTICS_VERSION` in `app/db/models.py`.
 
 **The same obligation now extends past the tripwire's watched files (#104).**
 `indexer/parse.py`'s chunker is already a watched path, so a change to

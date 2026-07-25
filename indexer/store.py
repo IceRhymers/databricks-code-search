@@ -239,9 +239,12 @@ def index_repo(
     Two columns are deliberately NOT re-derived for a skipped file:
 
     * ``lang`` and ``size`` are pure functions of ``(path, content)`` via
-      ``indexer/parse.py`` + ``indexer/languages.py``, both watched by
-      ``tests/unit/test_semantics_version_tripwire.py`` -- so a change to either
-      derivation is MEANT to force a version bump, which closes this gate. That
+      ``indexer/ingest.py`` (the production file source) and
+      ``indexer/languages.py``'s ``EXT_TO_LANG`` (which it calls directly);
+      ``indexer/parse.py`` derives the same values in its retained role as
+      ``ingest.py``'s executable oracle. All three are watched by
+      ``tests/unit/test_semantics_version_tripwire.py`` -- so a change to any
+      of them is MEANT to force a version bump, which closes this gate. That
       tripwire is a local-developer guard rather than a CI one, so treat this as
       a strong convention backed by review, not a machine-enforced invariant.
     * ``files.commit`` goes staler. No production read path exists (every
