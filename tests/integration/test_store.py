@@ -32,6 +32,7 @@ from indexer.languages import (
     ParsedFile,
 )
 from indexer.store import StaleIndexError, _stamp_repo_branch, index_repo
+from indexer.timing import PhaseTimer, install_timer, reset_timer
 
 SCHEMA = "test_store"
 
@@ -176,6 +177,38 @@ def test_mark_and_sweep_removes_deleted_file(conn: Connection) -> None:
     assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 0  # cascade
     assert _count(conn, "files") == 1
     assert _count(conn, "files", "commit = 'sha_second'") == 1
+
+
+@pytest.mark.integration
+def test_index_repo_records_the_sweep_phase(conn: Connection) -> None:
+    """The sweep duration reaches ``indexer.job``'s per-branch line ambiently.
+
+    ``index_repo`` returns a frozen ``IndexCounts`` and takes no timer parameter --
+    the sweep's cost travels out through the ``indexer.timing`` ContextVar instead,
+    which is what keeps the ``index_fn`` seam (and every fake of it) unchanged.
+    ``tests/unit/test_job.py`` pins the arithmetic against a fake ``index_fn``;
+    this pins the real cross-module wiring against the real sweep and real SQL.
+    """
+    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
+    conn.rollback()
+
+    timer = PhaseTimer()
+    token = install_timer(timer)
+    try:
+        # Re-run without util.py at a new SHA: the same scenario as
+        # test_mark_and_sweep_removes_deleted_file, so the counts are unchanged.
+        counts = _index_default(
+            conn, name="acme/widgets", head_sha="sha_second", items=_items(MAIN)
+        )
+    finally:
+        reset_timer(token)
+
+    assert counts == IndexCounts(files=1, symbols=1, swept=1, edges=0)
+    assert timer.total("sweep") > 0.0
+    # index_repo measures the sweep and nothing else -- every other phase is
+    # job.py's to record.
+    assert timer.total("db") == 0.0
+    assert timer.total("parse") == 0.0
 
 
 @pytest.mark.integration

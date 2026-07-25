@@ -79,6 +79,18 @@ and only a ``chunk_writer`` closure over the precomputed vectors is handed to
 loop as symbols. Flag-off: no chunking, no embedder, no import of ``app.embed``'s
 lazy ``databricks-sdk`` dependency.
 
+Every INDEXED branch also emits one ``phase timing`` line accounting for its whole
+wall clock -- resolve / download / extract / parse / embed / db / sweep, plus an
+``other`` residual so no time is silently unattributed. The fields are fixed and
+unconditional (a phase that did not run prints ``0.00s``) so the line stays
+greppable whether or not semantic indexing is on. Skipped, failed, and conflicted
+branches emit no such line. ``sweep`` is measured inside ``indexer.store`` and
+reaches this module through the ambient timer in :mod:`indexer.timing` rather
+than through the ``index_fn`` seam, which keeps that seam's signature (and every
+fake of it) unchanged. The repo-level costs that sit outside every branch's
+total -- the default branch's HEAD resolve and the branch listing -- are reported
+as ``resolve=``/``list=`` on the per-repo ``finished`` line instead.
+
 Logging is INFO only. The GitHub token is read via an injected client and is never
 logged, and this module never lowers root/SDK/httpx log levels (see the redaction
 test + source-level tripwire).
@@ -93,7 +105,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -118,7 +130,7 @@ from indexer.fetch import (
     resolve_branch_head,
     resolve_ref,
 )
-from indexer.languages import Chunk, IndexCounts, ParsedFile
+from indexer.languages import Chunk, FileExtraction, IndexCounts, ParsedFile
 from indexer.parse import iter_chunks, iter_source_files
 from indexer.repo_config import RepoConfig, effective_workers, load_config, normalize_repo
 from indexer.resolve import MAX_REPOS, RepoEntry, resolve_repos
@@ -131,6 +143,7 @@ from indexer.store import (
     reconcile_retired_branches,
 )
 from indexer.symbols import extract_file
+from indexer.timing import PhaseTimer, install_timer, now, reset_timer
 
 logger = logging.getLogger("indexer.job")
 
@@ -887,7 +900,15 @@ def _index_one_inner(
     """
     name = normalize_repo(entry.name)
     org, repo = name.split("/", 1)
+    # Timed with two plain locals off the same clock the per-branch PhaseTimer
+    # reads -- no timer is installed here, because these costs are REPO-scoped
+    # and belong to no branch's total (they are reported on the `finished` line
+    # below instead). Without them the default branch's resolve would show as
+    # `resolve=0.00s` on its phase line, and a glob-configured monorepo's
+    # paginated branch listing would appear in no field on no line at all.
+    resolve_started = now()
     default_branch, default_head_sha = resolve_ref(http_client, org, repo)
+    resolve_elapsed = now() - resolve_started
 
     # An override matched to THIS repo by resolve_repos wins outright over the global
     # cap -- it is not a floor/ceiling blend, since a repo big enough to need one
@@ -904,7 +925,9 @@ def _index_one_inner(
     # The common case -- no branches: configured -- needs no GitHub branches API
     # call at all: resolve_branches ignores all_branches entirely when globs is
     # empty (it always resolves to just [default_branch]).
+    list_started = now()
     all_branches = list_branches(http_client, org, repo) if entry.branch_globs else []
+    list_elapsed = now() - list_started
     resolution = resolve_branches(
         default_branch, all_branches, sorted(entry.branch_globs), repo=name
     )
@@ -934,8 +957,46 @@ def _index_one_inner(
     # assertions, and a nonzero-by-construction timing field would break them.
     # This is the instrument the "throughput measured on the first production
     # run" promise depends on -- without it that promise is unfalsifiable.
-    logger.info("finished %s in %.2fs", name, time.monotonic() - started)
+    # `resolve=`/`list=` are the repo-scoped costs that appear in no branch's
+    # `phase timing` total. Printed unconditionally (`list=0.00s` whenever the
+    # repo has no `branches:` globs and the endpoint is never called) so the line
+    # never drifts in shape. The elapsed value keeps its own time.monotonic()
+    # reading -- it is not reconciled against the parenthesised numbers.
+    logger.info(
+        "finished %s in %.2fs (resolve=%.2fs list=%.2fs)",
+        name,
+        time.monotonic() - started,
+        resolve_elapsed,
+        list_elapsed,
+    )
     return RepoOutcome(name=name, discovery_complete=resolution.complete, outcomes=outcomes)
+
+
+def _timed_items(
+    items: Iterable[tuple[ParsedFile, FileExtraction]], timer: PhaseTimer
+) -> Iterator[tuple[ParsedFile, FileExtraction]]:
+    """Charge each item's PRODUCTION to ``parse``, leaving its consumption to ``db``.
+
+    ``items`` is consumed lazily inside ``index_repo``'s open transaction (the
+    bounded-memory invariant), so timing ``index_fn`` alone fuses parse and db
+    into one number, and materializing the generator to separate them would break
+    that invariant. This wrapper times only the ``next()`` calls -- the walk, the
+    read, the decode, and the tree-sitter extraction -- so the DML between them
+    stays attributable to ``db``. Never build a list here.
+
+    The post-``StopIteration`` charge is not bookkeeping pedantry: on the
+    non-semantic path the final ``next()`` is where the directory walk finishes.
+    """
+    it = iter(items)
+    while True:
+        t0 = timer.clock()
+        try:
+            item = next(it)
+        except StopIteration:
+            timer.add("parse", timer.clock() - t0)
+            return
+        timer.add("parse", timer.clock() - t0)
+        yield item
 
 
 def _index_one_branch(
@@ -967,11 +1028,30 @@ def _index_one_branch(
     matched, else ``cfg.semantic_max_chunks_per_repo``. Taken as a parameter rather
     than read from ``cfg`` directly so every branch of a repo enforces the SAME
     resolved cap without recomputing (or risking drift on) the override lookup.
+
+    Every phase of the indexed path is wall-clocked into ``timer`` and reported on
+    one ``phase timing`` line at the end (see the module docstring). ``timer`` is
+    also installed as the AMBIENT timer for the duration, which is how
+    ``indexer.store``'s sweep -- behind the ``index_fn`` seam, in another module --
+    lands in this branch's numbers without changing that seam's signature. The
+    ``finally: reset_timer(token)`` is mandatory for the same reason
+    ``_index_one``'s ``_repo_ctx`` reset is: ``ThreadPoolExecutor`` reuses worker
+    threads without resetting their context, so a leaked timer would attribute
+    this branch's sweep to the next task on this thread.
     """
+    # NOT the `started` parameter: that one is set once per REPO and passed
+    # unchanged to every branch, so reusing it would make branch 2+ of a
+    # glob-configured repo report a repo-cumulative total and silently inflate
+    # `other` by every preceding branch's wall clock.
+    timer = PhaseTimer()
+    branch_started = timer.clock()
+    timer_token = install_timer(timer)
     try:
+        t0 = timer.clock()
         head_sha = (
             default_head_sha if is_default else resolve_branch_head(http_client, org, repo, branch)
         )
+        timer.add("resolve", timer.clock() - t0)
 
         # The skip seam: after the immutable HEAD SHA is known, before anything
         # is downloaded. Both halves must match -- a stored NULL version never does.
@@ -993,15 +1073,35 @@ def _index_one_branch(
             # being written to) and BEFORE the first byte is downloaded. Raising
             # here is caught below, costing this branch alone.
             assert_disk_headroom(tmp_path, repo=f"{name}@{branch}")
+
+            t0 = timer.clock()
             tar_path = download_tarball(http_client, org, repo, head_sha, tmp_path)
+            timer.add("download", timer.clock() - t0)
+
+            t0 = timer.clock()
             root = extract_tarball(tar_path, tmp_path / "extracted")
+            timer.add("extract", timer.clock() - t0)
 
             chunk_writer: ChunkWriter | None = None
             if cfg.semantic_enabled and embed_fn is not None:
                 # Chunking/embedding needs the full file list up front -- unlike
                 # the lazy items generator below, it cannot stream through
                 # index_repo's open transaction.
+                #
+                # This walk is charged to `parse` explicitly: it is the same
+                # rglob + stat + read + decode work that _timed_items charges on
+                # the non-semantic path, and leaving it unwrapped would dump the
+                # entire file-walk cost of the PRODUCTION (semantic-on) path into
+                # `other`, which is exactly the number this instrumentation
+                # exists to route work by.
+                t0 = timer.clock()
                 files = list(iter_source_files(root))
+                timer.add("parse", timer.clock() - t0)
+
+                # In a `finally`, unlike every other phase wrap: the degrade path
+                # below still burned this time (a downed embedder can burn a lot
+                # of it before it gives up) and must still be reported.
+                t0 = timer.clock()
                 try:
                     chunk_writer = _precompute_chunk_writer(files, embed_fn, max_chunks_per_repo)
                 except Exception:
@@ -1018,11 +1118,23 @@ def _index_one_branch(
                         exc_info=True,
                     )
                     chunk_writer = None
+                finally:
+                    timer.add("embed", timer.clock() - t0)
                 items = ((pf, extract_file(pf)) for pf in files)
             else:
                 # Lazy generator: files stream through the open transaction (bounded memory).
                 items = ((pf, extract_file(pf)) for pf in iter_source_files(root))
 
+            # Parse time is INSIDE the db window (items are produced lazily as
+            # index_repo consumes them), so `db` subtracts only the parse accrued
+            # DURING that window -- never the phase total, which on the semantic
+            # path already holds the eager walk above. `sweep` is windowed the
+            # same way for the same reason (store.py records it from inside
+            # index_fn) -- kept symmetric with `parse` so a future sweep call
+            # site outside this window can't silently mis-window `db`.
+            parse_before = timer.total("parse")
+            sweep_before = timer.total("sweep")
+            t0 = timer.clock()
             with engine.connect() as conn:
                 counts = index_fn(
                     conn,
@@ -1030,9 +1142,62 @@ def _index_one_branch(
                     branch=branch,
                     is_default=is_default,
                     head_sha=head_sha,
-                    items=items,
+                    items=_timed_items(items, timer),
                     chunk_writer=chunk_writer,
                 )
+            db_wall = timer.clock() - t0
+
+        # Emitted HERE -- after the TemporaryDirectory teardown (an rm -rf of a
+        # possibly multi-GB extracted tree, which `other` must include) and from
+        # inside the worker, where _index_one's _repo_ctx still resolves the
+        # [%(repo)s] field. The drain loop on the main thread would render `[-]`.
+        #
+        # `index_fn` above already committed this branch's transaction -- `counts`
+        # is proof of that. This block is measurement ONLY, so it gets its own
+        # try/except: per timing.py's own principle ("instrumentation must never
+        # be able to fail the work it measures"), a bug here must degrade to a
+        # missing log line, never to reclassifying an already-committed branch as
+        # `failed` (which would also flip the run's exit code and gate off the
+        # post-fan-out reconciliation checkpoint, which requires zero failures).
+        try:
+            db = max(
+                0.0,
+                db_wall
+                - (timer.total("parse") - parse_before)
+                - (timer.total("sweep") - sweep_before),
+            )
+            total = timer.clock() - branch_started
+            other = max(
+                0.0,
+                total
+                - timer.total("resolve")
+                - timer.total("download")
+                - timer.total("extract")
+                - timer.total("parse")
+                - timer.total("embed")
+                - db
+                - timer.total("sweep"),
+            )
+            # One format string, no branches: a phase that did not run prints 0.00s
+            # rather than vanishing, so the line stays greppable and field-stable
+            # whether or not semantic indexing is on.
+            logger.info(
+                "phase timing %s@%s: total=%.2fs resolve=%.2fs download=%.2fs extract=%.2fs "
+                "parse=%.2fs embed=%.2fs db=%.2fs sweep=%.2fs other=%.2fs",
+                name,
+                branch,
+                total,
+                timer.total("resolve"),
+                timer.total("download"),
+                timer.total("extract"),
+                timer.total("parse"),
+                timer.total("embed"),
+                db,
+                timer.total("sweep"),
+                other,
+            )
+        except Exception:
+            logger.warning("phase timing unavailable for %s@%s", name, branch, exc_info=True)
         return BranchOutcome(branch=branch, status="indexed", counts=counts)
     except StaleIndexError as exc:
         # The repo_branches row for THIS branch changed under this worker, so
@@ -1065,6 +1230,12 @@ def _index_one_branch(
     except Exception:
         logger.exception("failed to index %s@%s", name, branch)
         return BranchOutcome(branch=branch, status="failed")
+    finally:
+        # Mandatory, exactly like _index_one's _repo_ctx reset: ThreadPoolExecutor
+        # reuses worker threads without resetting their context, so a leaked timer
+        # would attribute this branch's sweep to the NEXT branch (or repo) that
+        # lands on this thread -- silently wrong numbers, which is worse than none.
+        reset_timer(timer_token)
 
 
 def _positive_int(raw: str) -> int:

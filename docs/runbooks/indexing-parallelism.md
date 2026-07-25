@@ -116,8 +116,9 @@ loop, third-party libraries) carry `-`.
 ```
 INFO indexer.job [-]: local disk at /tmp: 41.2 GB free of 64.0 GB total; 4 worker(s) x 2.5 GB peak
 INFO indexer.fetch [acme/widgets]: ...
-INFO indexer.job [acme/widgets]: finished acme/widgets in 71.30s
-INFO indexer.job [acme/gadgets]: skipped acme/gadgets: already indexed at abc123 (semantics v1) in 0.41s
+INFO indexer.job [acme/widgets]: phase timing acme/widgets@main: total=213.32s resolve=0.00s download=12.10s extract=8.40s parse=31.00s embed=88.20s db=64.50s sweep=0.30s other=8.82s
+INFO indexer.job [acme/widgets]: finished acme/widgets in 213.74s (resolve=0.42s list=0.00s)
+INFO indexer.job [acme/gadgets]: skipped acme/gadgets@main: already indexed at abc123 (semantics v1) in 0.41s
 ```
 
 **To find the giant:** grep for `finished .* in` and sort by the elapsed number.
@@ -129,6 +130,59 @@ accept the duration.
 **To decide whether tuning is worth it:** compare the total on the completion
 line against the sum of the per-repo elapsed times. If the total is already
 close to the slowest single repo, the pool is not the bottleneck.
+
+### 2.1 Finding the dominant phase, not just the dominant repo
+
+Every **indexed** branch emits one `phase timing` line accounting for its entire
+wall clock. Skipped, failed, and conflicted branches emit none — there is nothing
+to attribute.
+
+```
+grep 'phase timing' run.log            # one line per indexed branch
+```
+
+The nine fields are fixed, always present, always in this order, always `%.2fs`.
+A phase that did not run prints `0.00s` rather than disappearing, so the line
+never changes shape between a semantic-on and a semantic-off run and every grep
+you write keeps working. Read the largest field; that is the branch's bottleneck.
+
+| Dominant phase | What it means | Which issue addresses it |
+|---|---|---|
+| `download` / `extract` | archive I/O bound | #106 (single-pass in-memory ingestion) |
+| `parse` | GIL-bound tree-sitter extraction | #108 (process-pool extraction) |
+| `embed` | serial AI Gateway round trips | #107 (concurrent embedding) |
+| `db` | per-file round trips | #105 (batched writes) |
+| any of the above, on **unchanged** content | redundant work | #104 (file-level delta indexing) |
+
+Four fields need interpretation before you act on them:
+
+- **`resolve=0.00s` on a default branch is expected, not a bug.** That branch's
+  HEAD SHA came from the repo-level resolve, which happens once per repo outside
+  every branch's total and is reported on the repo's `finished` line as
+  `resolve=`. The `list=` on the same line is the branch-listing API call, which
+  is `0.00s` unless the repo has `branches:` globs configured (it is not called
+  at all otherwise) and which is paginated — on a monorepo with hundreds of
+  branches it is a real, and otherwise invisible, cost. The elapsed value in
+  `finished … in Xs` is measured on its own clock and is deliberately not
+  reconciled against the parenthesised numbers.
+- **`other=` is the unattributed residual**, `total` minus every measured phase,
+  clamped at zero. It is dominated by the temp-dir teardown — an `rm -rf` of a
+  freshly extracted multi-GB tree — plus the pre-flight disk check. It exists so
+  the line has no silently missing time; a large `other` means something real is
+  happening outside every instrumented phase and is worth chasing.
+- **`embed=` covers chunking as well as the network.** It spans `iter_chunks`
+  (CPU/GIL-bound) *and* the serial AI Gateway round trips. #107 addresses only
+  the round trips, so before routing work there, confirm the phase is
+  network-bound rather than chunking-bound (a follow-up may split it into
+  `chunk=`/`embed=`).
+- **`db=` excludes parse and sweep, but the walk still happens inside the
+  transaction.** Files stream lazily through `index_repo`'s open transaction for
+  bounded memory, so file production is timed separately and subtracted from
+  `db`; the sweep is subtracted too. On the **non-semantic** path, though, the
+  directory walk itself materializes inside that open transaction (`parse.py`'s
+  `rglob`, on the first item). That is long-standing behavior which this
+  instrumentation merely makes visible for the first time — it is not a new
+  regression.
 
 ---
 
