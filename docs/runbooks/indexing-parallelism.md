@@ -380,8 +380,8 @@ Not a bug; see `app/config.py`'s `semantic_max_chunks_per_repo` comment.
 
 ### Who can run this — read before you need it
 
-`UPDATE` on `repos` is held by **the identity that deployed the schema**, which
-owns the tables. Concretely:
+`UPDATE` on `repo_branches` (and `repos`) is held by **the identity that deployed
+the schema**, which owns every table, `repo_branches` included. Concretely:
 
 - **dev:** the developer who ran `make migrate` / `scripts/deploy.sh`. Table
   ownership carries `UPDATE` implicitly; no explicit grant was ever issued for

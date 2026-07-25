@@ -1220,6 +1220,20 @@ def _index_one_branch(
                         # every file this branch does not already carry. A short-
                         # lived connection, closed before embedding starts --
                         # never held across the embedder's network I/O.
+                        #
+                        # `_present` is discarded -- this module only ever needs
+                        # `carried` (job.py cannot replicate index_repo's
+                        # provenance-gate check anyway, and doesn't need to: any
+                        # not-carried file gets embedded here regardless of
+                        # whether index_repo later classifies it membership-only
+                        # or changed/new). shas_fn still computes and returns the
+                        # full-repo `present` set -- read_repo_content_shas'
+                        # signature is deliberately ONE shared query pair with
+                        # index_repo's authoritative read (see its docstring), so
+                        # this module pays for a second full-repo Index Only Scan
+                        # it doesn't use rather than forking the query. That cost
+                        # rides inside `embed=` on the phase timing line (see the
+                        # comment above), not broken out separately.
                         with engine.connect() as shas_conn:
                             carried, _present = shas_fn(shas_conn, name=name, branch=branch)
                         files_to_embed = [

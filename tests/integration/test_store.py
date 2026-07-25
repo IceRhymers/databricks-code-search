@@ -312,8 +312,8 @@ def test_reindex_replaces_stale_edges_for_the_same_file(conn: Connection) -> Non
     index_semantics_version = NULL`` idiom as
     test_legacy_null_semantics_version_is_rewritten) is faithful to production,
     not a workaround. This is the "unconditional-delete guard" and it must keep
-    its ORIGINAL assertion, not a relaxed one -- see indexer/AGENTS.md /
-    the plan for issue #104, §2.6a.
+    its ORIGINAL assertion, not a relaxed one -- see the plan for issue #104,
+    §2.6a.
     """
     symbol = ExtractedSymbol("f", "function", 1, 3)
     content = "def f():\n    target()\n    return 1\n"
@@ -351,6 +351,15 @@ def test_reindex_replaces_stale_edges_for_the_same_file(conn: Connection) -> Non
 
 @pytest.mark.integration
 def test_reindex_with_identical_items_does_not_duplicate_edges(conn: Connection) -> None:
+    """The delete-before-insert idempotency of the edge writer, proven by forcing
+    the delta gate CLOSED (the same idiom as the two guard tests above) so the
+    second run genuinely re-executes the write path rather than classifying
+    main.py unchanged and skipping it -- which would make the `== 1` assertion
+    pass vacuously (nothing touched at all) rather than proving delete-then-
+    insert doesn't duplicate. Without this the first run's first-index-ever
+    baseline (version None) makes run 2's baseline INDEX_SEMANTICS_VERSION, and
+    the delta gate would otherwise open and skip main.py entirely.
+    """
     symbol = ExtractedSymbol("f", "function", 1, 3)
     item = (
         "main.py",
@@ -359,7 +368,8 @@ def test_reindex_with_identical_items_does_not_duplicate_edges(conn: Connection)
         [ExtractedEdge(kind="call", target="helper", line=2, enclosing=symbol)],
     )
     _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
-    conn.rollback()
+    conn.execute(text("UPDATE repo_branches SET index_semantics_version = NULL"))
+    conn.commit()
     _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
 
     file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()

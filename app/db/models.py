@@ -57,9 +57,10 @@ machine-enforced one. Before file-level delta indexing (issue #104) a missed
 bump here was self-limiting: the next HEAD move re-embedded a branch's whole
 corpus regardless. Under delta indexing only a CHANGED file re-embeds, so a
 missed bump now leaves every unchanged file's vectors silently stale forever
--- exactly the failure this version column exists to prevent, and precisely
-why version ``2`` was minted (turning semantic search on by default so
-``chunks`` backfills) is precedent, not a special case.
+-- exactly the failure this version column exists to prevent. This is not a
+new kind of case: version ``2`` was minted for precisely this reason (turning
+semantic search on by default, so every already-indexed branch had to
+re-index once for ``chunks`` to backfill).
 
 Migrations must never import this constant -- see
 ``app/alembic/versions/0002_index_semantics_version.py``.

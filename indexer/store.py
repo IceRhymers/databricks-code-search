@@ -332,7 +332,7 @@ def index_repo(
                 unchanged_count += 1
                 continue
 
-            if membership_ok and (pf.path, sha) in present:
+            if delta_on and membership_ok and (pf.path, sha) in present:
                 # Membership-only: the row exists (written by another branch) but
                 # does not carry this branch yet. Statement 4 has proven every
                 # branch of this repo is at the current semantics version, so its

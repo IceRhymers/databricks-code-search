@@ -402,10 +402,14 @@ def test_no_files_row_ever_has_an_empty_branches_array(conn: Connection) -> None
         items=_items(UTIL),
     )
     conn.rollback()
-    # 'a' drops both files -- util.py loses only 'a' (shared with 'b'), main.py
-    # loses its only branch and must be deleted outright.
+    # Empty-seen-set guard fires (see store.py's _sweep_membership): a NO-OP,
+    # not a drop. Included to prove the guard doesn't itself leave or create an
+    # empty-branches row.
     index_repo(conn, name="acme/widgets", branch="a", is_default=True, head_sha="sha_a2", items=[])
     conn.rollback()
+    # 'a' now genuinely drops both files (UTIL is the only file it still
+    # parses): util.py loses only 'a' (row survives, still shared with 'b');
+    # main.py loses its only remaining branch and is deleted outright.
     index_repo(
         conn,
         name="acme/widgets",
@@ -415,6 +419,7 @@ def test_no_files_row_ever_has_an_empty_branches_array(conn: Connection) -> None
         items=_items(UTIL),
     )
     conn.rollback()
+    # Empty-seen-set guard again, now that 'a' carries nothing -- still a no-op.
     index_repo(conn, name="acme/widgets", branch="a", is_default=True, head_sha="sha_a4", items=[])
 
     assert _count(conn, "files", "cardinality(branches) = 0") == 0
@@ -561,8 +566,11 @@ def _explain(
     """``EXPLAIN (FORMAT JSON)`` for ``sql`` with the seq-scan escape hatch disabled,
     scoped to a SAVEPOINT so the ``enable_seqscan`` GUC change never leaks past this
     call (clones ``tests/integration/test_query_compiler.py``'s ``_explain_plan``
-    idiom, per ``tests/integration/AGENTS.md``)."""
-    mode = "ANALYZE, FORMAT JSON" if analyze else "FORMAT JSON"
+    idiom). ``VERBOSE`` is load-bearing, not decoration: Postgres only emits each
+    node's ``Output`` column list under ``VERBOSE``, and the projected-columns
+    assertions below depend on that field actually being present rather than
+    silently absent (which would make them vacuously true)."""
+    mode = "VERBOSE, ANALYZE, FORMAT JSON" if analyze else "VERBOSE, FORMAT JSON"
     savepoint = conn.begin_nested()
     try:
         conn.execute(text("SET LOCAL enable_seqscan = off"))
@@ -572,6 +580,14 @@ def _explain(
     plan_list = json.loads(raw) if isinstance(raw, str) else raw
     plan: dict[str, Any] = plan_list[0]["Plan"]
     return plan
+
+
+def _projects_column(output: list[str] | None, column: str) -> bool:
+    """Does EXPLAIN VERBOSE's ``Output`` list include ``column``, exactly or
+    table-qualified (``files.content``)? A plain substring check would false-
+    positive on ``content_sha`` containing ``content`` -- this checks whole
+    output entries instead."""
+    return any(entry == column or entry.endswith(f".{column}") for entry in output or [])
 
 
 def _plan_nodes(plan: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -619,8 +635,7 @@ def test_the_delta_pre_read_is_index_served(conn: Connection) -> None:
     a_nodes = list(_plan_nodes(plan_a))
     assert any(n.get("Index Name") == "ix_files_branches_gin" for n in a_nodes), a_nodes
     assert not any(n.get("Node Type") == "Seq Scan" for n in a_nodes), a_nodes
-    a_output = " ".join(plan_a.get("Output") or [])
-    assert "content" not in a_output and "files.content" not in a_output, plan_a
+    assert not _projects_column(plan_a.get("Output"), "content"), plan_a
 
     plan_b = _explain(
         conn,
@@ -639,6 +654,5 @@ def test_the_delta_pre_read_is_index_served(conn: Connection) -> None:
     # is ever fetched -- content_sha/path/repo_id are the constraint's own
     # columns, so an Index Only Scan is fundamentally incapable of returning
     # anything else.
-    io_output = " ".join(io_scan.get("Output") or [])
-    assert "content" not in io_output
-    assert "branches" not in io_output
+    assert not _projects_column(io_scan.get("Output"), "content"), io_scan
+    assert not _projects_column(io_scan.get("Output"), "branches"), io_scan
