@@ -117,7 +117,7 @@ loop, third-party libraries) carry `-`.
 INFO indexer.job [-]: local disk at /tmp: 41.2 GB free of 64.0 GB total; 4 worker(s) x 2.5 GB peak
 INFO indexer.fetch [acme/widgets]: ...
 INFO indexer.job [acme/widgets]: phase timing acme/widgets@main: total=213.32s resolve=0.00s download=12.10s extract=8.40s parse=31.00s embed=88.20s db=64.50s sweep=0.30s other=8.82s
-INFO indexer.job [acme/widgets]: finished acme/widgets in 213.55s (resolve=0.42s list=0.00s)
+INFO indexer.job [acme/widgets]: finished acme/widgets in 213.74s (resolve=0.42s list=0.00s)
 INFO indexer.job [acme/gadgets]: skipped acme/gadgets@main: already indexed at abc123 (semantics v1) in 0.41s
 ```
 

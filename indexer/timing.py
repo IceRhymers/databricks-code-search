@@ -19,6 +19,15 @@ Two properties are load-bearing:
   always be paired with :func:`reset_timer` in a ``finally`` -- a leaked timer
   would silently attribute one branch's sweep to the next branch's line.
 
+The ``ContextVar`` does not cross a thread or process boundary: it isolates
+concurrent worker threads from each other (which is the property this module
+needs today), but a call to :func:`record` from a different thread or a
+``ProcessPoolExecutor`` worker than the one that called :func:`install_timer`
+reaches a *different* ambient timer (or none), not the installing thread's.
+Relevant if a future phase's work is moved off the indexing worker thread --
+e.g. issue #108's process-pool extraction, or issue #107's concurrent
+embedding.
+
 ``_CLOCK`` is the module's single clock source. Every interval that appears on
 an asserted log line reads it (via :func:`now`, or via
 :attr:`PhaseTimer.clock` which captures it at construction), never a bare

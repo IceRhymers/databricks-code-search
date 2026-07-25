@@ -2657,6 +2657,51 @@ def test_timings_do_not_leak_between_repos_on_a_reused_worker_thread(
 
 
 @pytest.mark.unit
+def test_timer_reset_fires_on_every_branch_exit_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Directly guards the `finally: reset_timer(token)` invariant itself.
+
+    T9/T10 assert branch totals aren't cumulative, but `_index_one_branch`
+    unconditionally does `install_timer(PhaseTimer())` at entry -- which
+    shadows a prior leaked timer regardless of whether `reset_timer` actually
+    ran. So T9/T10 pass identically whether or not the `finally` fires, and
+    cannot detect its removal. This test spies on `indexer.timing.reset_timer`
+    directly and asserts it is called exactly once per branch attempt,
+    including the failed and conflicted paths -- the actual invariant the
+    module docstring calls "mandatory".
+    """
+    import indexer.job as job
+    import indexer.timing as timing
+
+    calls = 0
+    real_reset = timing.reset_timer
+
+    def _spy_reset(token: Any) -> None:
+        nonlocal calls
+        calls += 1
+        real_reset(token)
+
+    monkeypatch.setattr(job, "reset_timer", _spy_reset)
+
+    def _ok(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        return IndexCounts(files=len(list(items)), symbols=0, swept=0, edges=0)
+
+    def _boom(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
+        raise RuntimeError("boom")
+
+    def _stale(conn: Any, *, name: str, branch: str, items: Any, **_: Any) -> IndexCounts:
+        raise StaleIndexError(f"repo_branches row for {name}@{branch} changed")
+
+    _run(_config(repos=["acme/widgets"]), _ok)
+    assert calls == 1
+
+    _run(_config(repos=["acme/widgets"]), _boom)
+    assert calls == 2
+
+    _run(_config(repos=["acme/widgets"]), _stale)
+    assert calls == 3
+
+
+@pytest.mark.unit
 def test_index_counts_fields_are_unchanged() -> None:
     """T11 (AC3): a tripwire that timing never leaks into the frozen return type.
 
