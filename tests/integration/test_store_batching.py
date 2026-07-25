@@ -117,7 +117,11 @@ def _fixture_items(branch: str) -> list[tuple[ParsedFile, FileExtraction]]:
         items.append((_pf(f"shared{i}.py", content), extraction))
 
     for i in range(2):
-        content = f"def divergent{i}():\n    return {hash((branch, i)) % 997}\n"
+        # A deterministic per-(branch, i) value -- NOT Python's hash(), which is
+        # randomized per-process (PYTHONHASHSEED) and would make this fixture's
+        # content non-reproducible across separate runs/processes.
+        magic = (sum(ord(c) for c in branch) * 31 + i) % 997
+        content = f"def divergent{i}():\n    return {magic}\n"
         extraction = FileExtraction(symbols=[_sym("divergent", i)], edges=[])
         items.append((_pf(f"divergent{i}.py", content), extraction))
 
