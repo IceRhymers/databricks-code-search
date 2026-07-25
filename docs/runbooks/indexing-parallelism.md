@@ -332,6 +332,21 @@ repo's chunks in memory (~0.5-0.8 GB per worker). The clamp is logged:
 INFO indexer.job [-]: semantic enabled: clamping index_concurrency 6 -> 2 (memory bound: ...)
 ```
 
+### Embedding concurrency (#107)
+
+`workers x concurrency` is the number that matters, not `concurrency` alone.
+Each of the (at most 2, semantic-clamped) workers dispatches up to
+`semantic.embedding_concurrency` embedding batches at once
+(`app/embed.py:databricks_embedder`, order-preserving `ThreadPoolExecutor.map`):
+2 x 4 = 8 in-flight gateway requests at the default, 2 x 8 = 16 at the
+config.yaml-enforced ceiling of 8 (the `CODE_SEARCH_SEMANTIC_EMBEDDING_CONCURRENCY`
+env var carries no ceiling, mirroring `semantic_embedding_batch_size`'s own
+unbounded env surface -- config.yaml is the job's real surface regardless), both
+under the SDK's 20-connection pool.
+`embedding_concurrency: 1` is the rollback switch — fully serial embedding, no
+thread pool spawned. See `docs/runbooks/semantic-enablement.md` §4 for the full
+in-flight/memory arithmetic and the 429 posture.
+
 ### The connection pool follows the workers
 
 Each worker holds exactly one connection, so the engine is built with

@@ -164,6 +164,46 @@ repo it names.
 `indexer/job.py` now applies to every index run by default (each worker materialises a
 whole repo's chunks) — see `docs/runbooks/indexing-parallelism.md`.
 
+**Concurrent embedding requests (#107):** each worker's `embed()` call
+(`app/embed.py`) dispatches up to `semantic.embedding_concurrency` batches at once
+via a `ThreadPoolExecutor`, using `.map()` — never `as_completed()` — so vectors
+always come back in submission order regardless of which request finishes first.
+Total in-flight gateway requests for the job is `effective_workers x concurrency`:
+2 x 4 = 8 at the default `embedding_concurrency: 4`, 2 x 8 = 16 at the config's
+`le=8` ceiling, both under the SDK's 20-connection pool
+(`HTTPAdapter(pool_connections=20, pool_maxsize=20, pool_block=True)` —
+`pool_block=True` means exceeding the pool **silently serializes** requests rather
+than raising, so staying under 20 is the load-bearing bound, not a nice-to-have).
+The only new per-in-flight-batch memory cost is transient request/response
+buffers (~3.5 MB each: ~2.1 MB parsed vectors + ~1.3 MB raw JSON response + a
+small request body) — ~28 MB at the default, ~56 MB at the ceiling, negligible
+beside the ~0.5–0.8 GB/worker baseline above. `embedding_concurrency: 1` restores
+today's fully serial embedding and spawns no thread pool at all (the rollback
+switch).
+
+429s from the AI Gateway are absorbed entirely by the `databricks-sdk`'s own
+`Retry-After`-honouring backoff (`_RetryAfterCustomizer`, defaulting to 1s when
+the header is absent) before `_query_batch`'s own bounded retry ever sees them —
+`app/embed.py` does not add a third retry layer. That absorption is invisible at
+the job's normal INFO log level: the SDK logs each throttle at DEBUG
+(`databricks.sdk.retries`). If you suspect throttling during a manual run, set
+`logging.getLogger("databricks.sdk.retries").setLevel(logging.DEBUG)` for that
+run only — never raise the root logger or the `databricks.sdk` parent logger,
+which would also re-enable a request/response body dump (the embedding request
+body is repo source code). This is an operator step for a one-off diagnostic
+run, never a code change (`tests/unit/test_job_redaction.py` tripwires
+`indexer/*.py` against exactly that).
+
+**Failure-path latency under concurrency:** when one batch raises, the pool's
+`__exit__` still waits for every other in-flight request in that worker's pool
+to finish before the exception propagates (there is no way to abort an
+in-flight HTTP call). A batch-0 failure that returned instantly under serial
+dispatch can now wait up to `concurrency - 1` requests' worth of time, each
+bounded by `semantic_embedding_timeout_s` (default 20s) plus the SDK's own
+retry budget. This is bounded and per-branch, not per-run: a sustained-outage
+branch still degrades to a core index without chunks (semantic is additive),
+just after a somewhat longer wait than serial dispatch's instant fail-fast.
+
 ## 5. Rollback note
 
 `0004`'s `downgrade()` drops the BM25/ANN indexes and the `chunks` table, but **does
@@ -192,6 +232,7 @@ semantic:
   embedding_model: system.ai.gte-large-en
   embedding_batch_size: 64
   embedding_timeout_s: 20.0
+  embedding_concurrency: 4         # -> Settings.semantic_embedding_concurrency (#107); 1 = serial
 ```
 
 Every field is optional; an omitted field falls through to the env value / default, and

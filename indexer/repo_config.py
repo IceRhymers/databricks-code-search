@@ -150,6 +150,14 @@ class SemanticOverrides(BaseModel):
     block only moves the second operand. Setting both is coherent: raise the floor
     for the whole corpus here, spot-override the outliers in the map.
 
+    ``embedding_concurrency`` (#107) bounds in-flight embedding requests per
+    worker; ``databricks_embedder`` clamps it to the batch count, so a value
+    larger than the number of batches a repo produces degrades to that count
+    rather than spawning a thread per batch. The ``le=8`` ceiling here matches
+    the existing ``index_concurrency`` bounded-field pattern -- see
+    ``app.config.Settings.semantic_embedding_concurrency`` for the in-flight
+    arithmetic against the SDK's 20-connection pool.
+
     Two ``Settings`` semantic knobs are deliberately absent, because exposing them
     would be a lie or a footgun: ``semantic_embedding_dim`` is pinned to
     ``SEMANTIC_EMBEDDING_DIM`` (the ``chunks.embedding`` column type and the 0004
@@ -180,6 +188,7 @@ class SemanticOverrides(BaseModel):
     embedding_model: str | None = Field(default=None, min_length=1)
     embedding_batch_size: int | None = Field(default=None, ge=1)
     embedding_timeout_s: float | None = Field(default=None, gt=0)
+    embedding_concurrency: int | None = Field(default=None, ge=1, le=8)
 
     @field_validator("embedding_endpoint")
     @classmethod
@@ -232,6 +241,7 @@ class SemanticOverrides(BaseModel):
             "embedding_model": "semantic_embedding_model",
             "embedding_batch_size": "semantic_embedding_batch_size",
             "embedding_timeout_s": "semantic_embedding_timeout_s",
+            "embedding_concurrency": "semantic_embedding_concurrency",
         }
         return {
             settings_field: value
