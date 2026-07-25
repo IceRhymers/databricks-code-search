@@ -21,12 +21,15 @@ seam takes no ``repo_id`` parameter.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 from sqlalchemy import ARRAY, BigInteger, Connection, any_, bindparam, delete
 
 from app.db.semantic import chunks as chunks_table
 from indexer.bulk import CHUNK_PARAM_BUDGET, insert_rows
+
+logger = logging.getLogger("indexer.chunk_store")
 
 # One (chunk_index, content, start_line, end_line, embedding) tuple per chunk,
 # in the shape the line-aligned chunker produces.
@@ -46,11 +49,33 @@ def write_chunks_batch(
     including files with zero chunk rows, since delete-on-zero-chunks is
     load-bearing (a file that shrank to zero chunks must still lose its stale
     rows) -- then one param-budgeted bulk insert via :func:`indexer.bulk.insert_rows`.
+
+    **Dedup guard, keyed on ``file_id``, keeping the LAST occurrence** (mirrors
+    ``indexer.store._flush_file_batch``'s ``(path, content_sha)`` guard).
+    Mandatory here too: two rows for the same ``file_id`` would insert two
+    conflicting ``(file_id, chunk_index)`` tuples, violating
+    ``uq_chunks_file_id_chunk_index`` and poisoning the transaction. Callers
+    are expected not to duplicate a ``file_id`` in one call, but this is a
+    shared primitive reachable from more than one caller (``indexer/job.py``'s
+    changed/new-path closure, and ``indexer/store.py``'s ``_union_membership``,
+    which has no dedup guard of its own on its injected ``items`` seam), so the
+    guard lives here rather than being duplicated at every call site.
     """
     if not rows:
         return 0
 
-    ids = [file_id for file_id, _chunks in rows]
+    deduped: dict[int, Sequence[ChunkRow]] = {}
+    for file_id, chunks in rows:
+        if file_id in deduped:
+            logger.warning(
+                "duplicate file_id %r within one write_chunks_batch call; "
+                "keeping the last occurrence",
+                file_id,
+            )
+        deduped[file_id] = chunks
+    entries = list(deduped.items())
+
+    ids = [file_id for file_id, _chunks in entries]
     conn.execute(
         delete(chunks_table).where(
             chunks_table.c.file_id == any_(bindparam("ids", type_=ARRAY(BigInteger)))
@@ -67,7 +92,7 @@ def write_chunks_batch(
             "end_line": end_line,
             "embedding": embedding,
         }
-        for file_id, chunks in rows
+        for file_id, chunks in entries
         for chunk_index, content, start_line, end_line, embedding in chunks
     ]
     insert_rows(conn, chunks_table, insert_dicts, param_budget=CHUNK_PARAM_BUDGET)

@@ -24,7 +24,7 @@ from app.config import SEMANTIC_EMBEDDING_DIM, Settings
 from app.db.client import create_db_engine
 from app.db.grants import build_job_grants
 from app.db.models import Base
-from indexer.chunk_store import write_chunks
+from indexer.chunk_store import write_chunks_batch
 from indexer.languages import ExtractedSymbol, FileExtraction, ParsedFile
 from indexer.store import (
     ReconcileCounts,
@@ -101,12 +101,15 @@ _STUB_VECTOR = [0.1] * SEMANTIC_EMBEDDING_DIM
 def _stub_chunk_writer(
     conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
 ) -> None:
-    # #105 reshaped the seam to one call per BATCH -- Lakebase-deferred, this
+    # One write_chunks_batch call for the whole batch, matching indexer/job.py's
+    # real closure and #105's reshaped per-BATCH seam -- Lakebase-deferred, this
     # module cannot run locally (needs lakebase_vector), so this update is
     # reasoned through against indexer/store.py's ChunkWriter alias, never
     # locally verified.
-    for file_id, pf in pairs:
-        write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
+    write_chunks_batch(
+        conn,
+        rows=[(file_id, [(0, pf.content, 1, 2, _STUB_VECTOR)]) for file_id, pf in pairs],
+    )
 
 
 def _count(conn: Connection, table: str, where: str = "") -> int:

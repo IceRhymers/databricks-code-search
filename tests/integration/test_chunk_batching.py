@@ -168,6 +168,105 @@ def test_batch_write_deletes_zero_chunk_covered_files_and_leaves_uncovered_untou
 # --- Test 21: FK cascade still removes chunks when the sweep deletes a file -
 
 
+# --- membership-only + real chunks: the case tests/integration/test_store_chunk_writer.py
+# cannot exercise locally (Lakebase-deferred), covered here since this module's
+# bare-`vector` fixture actually runs against codesearch-pg. -----------------
+
+
+@pytest.mark.integration
+def test_membership_only_acquisition_writes_chunks_for_the_acquiring_branch(
+    conn: Connection,
+) -> None:
+    """Branch 'b' acquires MAIN's content already stored under branch 'a' via
+    the membership-only path (``indexer.store._union_membership``) -- no
+    symbol/edge rewrite, but chunks ARE written for the acquiring branch via
+    the same ``write_chunks_batch`` this module otherwise tests.
+    """
+    index_repo(
+        conn,
+        name="acme/widgets",
+        branch="a",
+        is_default=True,
+        head_sha="sha_a1",
+        items=_items(MAIN),
+        chunk_writer=_stub_chunk_writer,
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/widgets",
+        branch="b",
+        is_default=False,
+        head_sha="sha_b1",
+        items=_items(UTIL),
+        chunk_writer=_stub_chunk_writer,
+    )
+    conn.rollback()
+
+    index_repo(
+        conn,
+        name="acme/widgets",
+        branch="b",
+        is_default=False,
+        head_sha="sha_b2",
+        items=_items(MAIN, UTIL),
+        chunk_writer=_stub_chunk_writer,
+    )
+    main_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert _chunk_count(conn, main_file_id) == 1
+
+
+@pytest.mark.integration
+def test_membership_only_duplicate_item_does_not_poison_the_chunk_insert(
+    conn: Connection,
+) -> None:
+    """A duplicated ``(path, content_sha)`` entry in ``items`` landing in the
+    membership-only class must not raise a UNIQUE VIOLATION against
+    ``uq_chunks_file_id_chunk_index``. ``write_chunks_batch``'s dedup guard
+    (mirroring ``indexer.store._flush_file_batch``'s own guard) is what
+    prevents it -- without it, ``_union_membership`` would hand the same
+    ``file_id`` to ``chunk_writer`` twice, and the batch insert would attempt
+    two rows with the same ``(file_id, chunk_index)``.
+
+    ``items`` is an injected seam (this module, ``tests/integration/test_reconcile.py``,
+    and any other direct caller can feed it a duplicate) even though the
+    production source (``indexer/ingest.py``'s ``iter_tar_source_files``) never
+    does.
+    """
+    index_repo(
+        conn,
+        name="acme/widgets",
+        branch="a",
+        is_default=True,
+        head_sha="sha_a1",
+        items=_items(MAIN),
+        chunk_writer=_stub_chunk_writer,
+    )
+    conn.rollback()
+    index_repo(
+        conn,
+        name="acme/widgets",
+        branch="b",
+        is_default=False,
+        head_sha="sha_b1",
+        items=_items(UTIL),
+        chunk_writer=_stub_chunk_writer,
+    )
+    conn.rollback()
+
+    index_repo(
+        conn,
+        name="acme/widgets",
+        branch="b",
+        is_default=False,
+        head_sha="sha_b2",
+        items=_items(MAIN, MAIN, UTIL),
+        chunk_writer=_stub_chunk_writer,
+    )
+    main_file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
+    assert _chunk_count(conn, main_file_id) == 1
+
+
 @pytest.mark.integration
 def test_fk_cascade_removes_chunk_rows_when_sweep_deletes_an_emptied_file(
     conn: Connection,

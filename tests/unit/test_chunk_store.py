@@ -121,6 +121,36 @@ def test_write_chunks_batch_deletes_every_id_including_zero_chunk_files() -> Non
 
 
 @pytest.mark.unit
+def test_write_chunks_batch_duplicate_file_id_keeps_the_last_occurrence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A duplicated file_id must not reach the insert twice.
+
+    Two rows for the same chunks_table.file_id would insert two conflicting
+    (file_id, chunk_index) tuples -- a real UNIQUE VIOLATION against Postgres,
+    not just a wasted statement -- so the dedup guard is mandatory, mirroring
+    indexer.store._flush_file_batch's (path, content_sha) guard.
+    """
+    conn = _FakeConn()
+    with caplog.at_level("WARNING"):
+        written = write_chunks_batch(
+            conn,
+            rows=[
+                (7, [(0, "first", 1, 1, [0.1])]),
+                (7, [(0, "second", 2, 2, [0.2])]),
+            ],
+        )
+    assert written == 1
+    delete_params = conn.calls[0][1]
+    assert delete_params == {"ids": [7]}
+    insert_stmt = conn.calls[1][0]
+    rows = insert_stmt._multi_values[0]
+    assert len(rows) == 1
+    assert rows[0]["content"] == "second"
+    assert any("duplicate file_id" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
 def test_write_chunks_and_write_chunks_batch_issue_identical_statements() -> None:
     conn_a = _FakeConn()
     write_chunks(conn_a, file_id=42, chunks=[(0, "x", 1, 1, [0.0])])

@@ -35,7 +35,7 @@ from sqlalchemy import Connection, text
 from app.config import SEMANTIC_EMBEDDING_DIM
 from app.db.client import create_db_engine
 from app.db.models import Base
-from indexer.chunk_store import write_chunks
+from indexer.chunk_store import write_chunks_batch
 from indexer.languages import ExtractedSymbol, FileExtraction, IndexCounts, ParsedFile
 from indexer.store import index_repo
 
@@ -92,11 +92,16 @@ def _stub_chunk_writer(
     conn: Connection, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]
 ) -> None:
     # A fixed, precomputed 1-chunk-per-file "embedding" -- proves the seam without
-    # needing a real embedder (chunk_writer never calls one). #105 reshaped this
-    # seam to one call per BATCH -- Lakebase-deferred (this module needs
-    # lakebase_vector, unavailable locally), so reasoned through, not verified.
-    for file_id, pf in pairs:
-        write_chunks(conn, file_id=file_id, chunks=[(0, pf.content, 1, 2, _STUB_VECTOR)])
+    # needing a real embedder (chunk_writer never calls one). One write_chunks_batch
+    # call for the whole batch, matching indexer/job.py's real closure and #105's
+    # reshaped per-BATCH seam (tests/integration/test_chunk_batching.py exercises
+    # write_chunks_batch directly; this module still can't run locally --
+    # lakebase_vector, see the module docstring -- so this only fixes what a
+    # future Lakebase run would exercise, it does not itself verify anything here).
+    write_chunks_batch(
+        conn,
+        rows=[(file_id, [(0, pf.content, 1, 2, _STUB_VECTOR)]) for file_id, pf in pairs],
+    )
 
 
 def _count(conn: Connection, table: str, where: str = "") -> int:
