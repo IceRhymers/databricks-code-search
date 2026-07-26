@@ -81,7 +81,7 @@ semantic:
 ```
 
 which makes the job a true semantic no-op (no embedder built, no chunking, the
-2-worker clamp not applied) — no bundle/env change and no redeploy of the job's
+4-worker clamp not applied) — no bundle/env change and no redeploy of the job's
 environment. Precedence for the job is `config.yaml > CODE_SEARCH_* env > default`, so
 `semantic.enabled: false` wins even if the env says enabled.
 
@@ -141,45 +141,58 @@ buffered chunks, and that `semantic_max_chunks_per_repo` (`app/config.py`, defau
 silently truncating if a repo exceeds the ceiling.
 
 That default is deliberately conservative: the buffered vectors are Python float lists
-costing ~32 B per element, so at `dim=1024` each chunk is ~32 KB and 8000 chunks is
-~260 MB resident, held for the duration of the repo's write transaction. Raising it
-scales memory linearly (50000 would be ~1.6 GB and would OOM a typical job container
-*before* the loud ceiling check could fire, which defeats the purpose of the ceiling).
-If a repo legitimately needs more, prefer the temp-table staging path (follow-up) over
-raising this number.
+costing ~32 B per element structural, but ~40.1 KB/chunk RESIDENT once measured (issue
+#109 -- pymalloc overhead/fragmentation; use this figure for headroom arithmetic), so at
+`dim=1024` 8000 chunks is ~313 MiB resident, held for the duration of the repo's write
+transaction. Raising it scales memory roughly linearly (50000 would be ~1.9 GiB). Issue
+#109 derived a full per-worker chunk-cap ceiling from the container-memory model: ~73,300
+chunks at the pinned N=2 semantic-worker count the derivation is evaluated at (methodology
+only -- breaks a circularity in the model), ~36,700 at the shipped N=4 (see
+`docs/perf/issue-109-measurements.md` §12) -- the current 8000 default uses well under a
+quarter of either budget. A ceiling well past that derived bound (e.g. 50k) risks OOMing
+the job container *before* the loud ceiling check could fire, which defeats the purpose of
+the ceiling. If a repo legitimately needs more, prefer the temp-table staging path
+(follow-up) over raising this number.
 
 **Per-repo override, without moving the global default:** `config.yaml`'s top-level
 `semantic_max_chunks_per_repo` map (`indexer/repo_config.py`) lets one outsized repo
 get its own cap — `indexer/resolve.py` carries the matched override onto that repo's
 `RepoEntry`, and `indexer/job.py` uses it in place of `cfg.semantic_max_chunks_per_repo`
 for that repo only (an active override is logged at INFO). It does not relax the
-2-worker semantic clamp above, so a large override still multiplies whichever of the
-(at most 2) concurrent workers happens to be indexing that repo — do the same ~32
-KB/chunk math against the override value, not just the global default, before setting
-one. To move the **global** cap for the whole job instead of one repo, set
+4-worker semantic clamp above (issue #109 raised this from 2), so a large override
+still multiplies whichever of the (at most 4) concurrent workers happens to be
+indexing that repo — do the same ~32 KB structural / ~40.1 KB resident per-chunk math
+against the override value, not just the global default, before setting one. To move
+the **global** cap for the whole job instead of one repo, set
 `semantic.max_chunks_per_repo` (a single int, section 6) — the map still wins for a
 repo it names.
 
-**Parallelism:** with semantic on by default, the `effective_workers` clamp to 2 in
-`indexer/job.py` now applies to every index run by default (each worker materialises a
-whole repo's chunks) — see `docs/runbooks/indexing-parallelism.md`.
+**Parallelism:** with semantic on by default, the `effective_workers` clamp to 4
+(issue #109; previously 2) in `indexer/job.py` now applies to every index run by
+default (each worker materialises a whole repo's chunks) — see
+`docs/runbooks/indexing-parallelism.md`.
 
 **Concurrent embedding requests (#107):** each worker's `embed()` call
 (`app/embed.py`) dispatches up to `semantic.embedding_concurrency` batches at once
 via a `ThreadPoolExecutor`, using `.map()` — never `as_completed()` — so vectors
 always come back in submission order regardless of which request finishes first.
 Total in-flight gateway requests for the job is `effective_workers x concurrency`:
-2 x 4 = 8 at the default `embedding_concurrency: 4`, 2 x 8 = 16 at the config's
-`le=8` ceiling, both under the SDK's 20-connection pool
+4 x 4 = 16 at the default `embedding_concurrency: 4`, **4 x 8 = 32 at the config's
+`le=8` ceiling — this now EXCEEDS the SDK's 20-connection pool** (issue #109 raised
+`effective_workers` from 2 to 4; 2 x 8 = 16 stayed under the pool before)
 (`HTTPAdapter(pool_connections=20, pool_maxsize=20, pool_block=True)` —
 `pool_block=True` means exceeding the pool **silently serializes** requests rather
-than raising, so staying under 20 is the load-bearing bound, not a nice-to-have).
+than raising, so staying under 20 is the load-bearing bound, not a nice-to-have — a
+run at the ceiling of both knobs still completes, just with less real concurrency
+than configured). Lower `embedding_concurrency` if raising it alongside a
+near-ceiling `index_concurrency`.
 The only new per-in-flight-batch memory cost is transient request/response
 buffers (~3.5 MB each: ~2.1 MB parsed vectors + ~1.3 MB raw JSON response + a
-small request body) — ~28 MB at the default, ~56 MB at the ceiling, negligible
-beside the ~0.5–0.8 GB/worker baseline above. `embedding_concurrency: 1` restores
-today's fully serial embedding and spawns no thread pool at all (the rollback
-switch).
+small request body) — ~56 MB at the default (4 workers x 4), ~112 MB at the
+ceiling, negligible beside the ~313 MiB/worker vector baseline above (8000
+chunks at the resident 40.1 KB/chunk figure). `embedding_concurrency: 1`
+restores today's fully serial embedding and spawns no thread pool at all (the
+rollback switch).
 
 429s from the AI Gateway are absorbed entirely by the `databricks-sdk`'s own
 `Retry-After`-honouring backoff (`_RetryAfterCustomizer`, defaulting to 1s when

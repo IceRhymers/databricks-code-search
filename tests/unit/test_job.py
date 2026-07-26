@@ -1187,11 +1187,11 @@ def test_config_yaml_semantic_enabled_beats_env_disabled() -> None:
 def test_config_yaml_semantic_enabled_applies_the_worker_clamp(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The enable overlay also re-arms the 2-worker memory clamp.
+    """The enable overlay also re-arms the 4-worker memory clamp (issue #109).
 
     cfg says disabled (which would leave the pool at index_concurrency=6), but
     config.yaml's ``semantic.enabled: true`` overlays before effective_workers, so
-    the clamp fires: pool 6 -> 2, with the clamp log line -- the pool-side mirror
+    the clamp fires: pool 6 -> 4, with the clamp log line -- the pool-side mirror
     of the disable test.
     """
     with caplog.at_level(logging.INFO, logger="indexer.job"):
@@ -1200,8 +1200,8 @@ def test_config_yaml_semantic_enabled_applies_the_worker_clamp(
             monkeypatch,
             cfg=Settings(semantic_enabled=False),
         )
-    assert kwargs["pool_size"] == 2  # clamped
-    assert "clamping index_concurrency 6 -> 2" in caplog.text
+    assert kwargs["pool_size"] == 4  # clamped
+    assert "clamping index_concurrency 6 -> 4" in caplog.text
 
 
 @pytest.mark.unit
@@ -2096,10 +2096,10 @@ def test_pool_size_follows_the_semantic_clamp_not_the_raw_config(
 ) -> None:
     """The pool must track the EFFECTIVE workers, not index_concurrency.
 
-    With semantic on, effective_workers clamps 6 -> 2; a pool of 6 would then
-    over-provision Lakebase connections that no worker can ever use. The clamp
-    is also logged, because a run silently doing a third of the requested
-    concurrency is otherwise invisible.
+    With semantic on, effective_workers clamps 6 -> 4 (issue #109); a pool of 6
+    would then over-provision Lakebase connections that no worker can ever use.
+    The clamp is also logged, because a run silently doing two-thirds of the
+    requested concurrency is otherwise invisible.
     """
     with caplog.at_level(logging.INFO, logger="indexer.job"):
         kwargs = _engine_kwargs(
@@ -2107,9 +2107,9 @@ def test_pool_size_follows_the_semantic_clamp_not_the_raw_config(
             monkeypatch,
             cfg=Settings(semantic_enabled=True),
         )
-    assert kwargs["pool_size"] == 2
+    assert kwargs["pool_size"] == 4
     assert kwargs["max_overflow"] == 0
-    assert "clamping index_concurrency 6 -> 2" in caplog.text
+    assert "clamping index_concurrency 6 -> 4" in caplog.text
 
 
 @pytest.mark.unit
@@ -2118,7 +2118,7 @@ def test_config_yaml_semantic_disabled_removes_the_worker_clamp(
 ) -> None:
     """The overlay runs BEFORE effective_workers, so config.yaml can lift the clamp.
 
-    cfg says semantic enabled (which would clamp 6 -> 2), but config.yaml's
+    cfg says semantic enabled (which would clamp 6 -> 4), but config.yaml's
     ``semantic.enabled: false`` overlays first -- effective_workers then sees a
     disabled flag and leaves the pool at the full index_concurrency, with no clamp
     log line. This is the pool-side proof that the overlay precedes both the clamp
@@ -2130,8 +2130,110 @@ def test_config_yaml_semantic_disabled_removes_the_worker_clamp(
             monkeypatch,
             cfg=Settings(semantic_enabled=True),
         )
-    assert kwargs["pool_size"] == 6  # not clamped to 2
+    assert kwargs["pool_size"] == 6  # not clamped to 4
     assert "clamping index_concurrency" not in caplog.text
+
+
+@pytest.mark.unit
+def test_no_clamp_line_at_the_shipped_default(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At `index_concurrency=4` (the shipped default) the clamp is a no-op.
+
+    `effective_workers` returns `min(index_concurrency, 4)`, and the clamp log
+    line only fires when it actually reduces the value (`workers !=
+    config.index_concurrency`, job.py). So a default-configured, semantic-on run
+    emits NO clamp line at all -- issue #109's runbook update explicitly documents
+    this as confirmed on the live dev job's Arm B runs; this pins it in a unit
+    test too.
+    """
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        kwargs = _engine_kwargs(
+            _config(repos=["acme/widgets"], index_concurrency=4),
+            monkeypatch,
+            cfg=Settings(semantic_enabled=True),
+        )
+    assert kwargs["pool_size"] == 4
+    assert "clamping index_concurrency" not in caplog.text
+
+
+@pytest.mark.unit
+def test_shas_fn_connection_closes_before_embedding_starts() -> None:
+    """E7 (issue #109): the advisory ``shas_fn`` connection is short-lived.
+
+    ``pool_size == workers`` (the tests above) only holds because each worker
+    opens at most ONE connection at a time -- by sequencing, not by
+    construction. On the delta-gate-open path a worker opens a SECOND,
+    short-lived connection (``with engine.connect() as shas_conn:``,
+    ``indexer/job.py``) for ``shas_fn``, which must close before
+    ``_precompute_chunk_writer``/embedding starts -- otherwise a single worker
+    could hold 2 connections at once and pool_size==workers would
+    under-provision. Wraps the fake engine's own ``connect()`` to count
+    currently-open connections and samples that count from inside ``shas_fn``
+    and ``embed_fn`` -- extending
+    ``test_shas_fn_called_once_before_embedding_when_version_matches_and_sha_differs``'s
+    pattern one step further.
+    """
+    open_count = 0
+    open_during: dict[str, int] = {}
+
+    engine = _FakeEngine(stamps={("acme/widgets", "main"): ("sha_old", INDEX_SEMANTICS_VERSION)})
+    real_connect = engine.connect
+
+    class _TrackingConn:
+        def __init__(self, inner: _FakeConn) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> _TrackingConn:
+            nonlocal open_count
+            open_count += 1
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            nonlocal open_count
+            open_count -= 1
+            return self._inner.__exit__(*exc)
+
+        def execute(self, stmt: Any) -> Any:
+            return self._inner.execute(stmt)
+
+        def rollback(self) -> None:
+            self._inner.rollback()
+
+    def _tracking_connect() -> _TrackingConn:
+        return _TrackingConn(real_connect())
+
+    engine.connect = _tracking_connect  # type: ignore[method-assign]
+
+    def _shas_fn(conn: Any, *, name: str, branch: str) -> tuple[set[Any], set[Any]]:
+        open_during["shas"] = open_count
+        return set(), set()
+
+    def _embed(texts: list[str]) -> list[list[float]]:
+        open_during["embed"] = open_count
+        return [[0.0] for _ in texts]
+
+    cfg = Settings(semantic_enabled=True, semantic_max_chunks_per_repo=100)
+    idx = _RecordingIndex()
+    code = _run(
+        _config(repos=["acme/widgets"]),
+        idx,
+        cfg=cfg,
+        embed_fn=_embed,
+        engine=engine,
+        shas_fn=_shas_fn,
+    )
+    assert code == 0
+    # Guards against a vacuous pass: job.py swallows any semantic-precompute
+    # failure and still returns 0 (the semantic layer is additive), which would
+    # let a degraded run satisfy the connection-count assertion below without
+    # ever really reaching the embed step it's supposed to pin.
+    assert idx.chunk_writer is not None, "semantic precompute must have succeeded, not degraded"
+    assert open_during == {"shas": 1, "embed": 0}, (
+        "shas_fn's own connection must be open exactly while it runs, and fully "
+        f"closed again before embedding starts (got {open_during!r})"
+    )
 
 
 @pytest.mark.unit

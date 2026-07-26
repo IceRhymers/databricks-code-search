@@ -324,9 +324,20 @@ Only the first of the two byte caps is a **disk** cap. Since #106 the tarball is
 streamed once, in memory, and is never extracted, so `MAX_EXTRACTED_BYTES` is a
 **work** cap — a decompression-bomb guard on how much content one branch may pull
 out of its archive — and it lives in `indexer/ingest.py`, beside its only
-consumer, rather than in `indexer/fetch.py`. The two therefore no longer sum:
-the compressed tarball is the only artifact on disk, so peak local disk is
-`index_concurrency` × 500 MB:
+consumer, rather than in `indexer/fetch.py`. #109 re-derived both this and
+`semantic_max_chunks_per_repo`'s global default as **memory** limits (pinned at
+the N=2 operating point, to avoid the circularity of solving for `B` from a
+model whose dominant term is `B`): a derived breach-regime ceiling of ~880 MiB
+(vs. the current 2 GB) and a derived chunk-cap ceiling of ~73,300 chunks (vs.
+the current 8000). **Neither was changed**: no repo in the #109 measurement
+corpus approached either the current or the derived byte ceiling (largest
+observed branch: ~31.5 MiB, ~3.6% of the derived bound), so this run gives no
+empirical signal either way, and lowering `MAX_EXTRACTED_BYTES` closes the
+whole run's reconciliation checkpoint on breach — too large a blast radius to
+change on an untested corpus. Both derived values are recorded here and in
+`docs/perf/issue-109-measurements.md` for the next time this needs re-deriving.
+The two therefore no longer sum: the compressed tarball is the only artifact on
+disk, so peak local disk is `index_concurrency` × 500 MB:
 
 | `index_concurrency` | Peak local disk |
 |---|---|
@@ -345,27 +356,68 @@ Raise `index_concurrency` only for repo-level (disk-bound) fan-out; raise
 `extract_processes` for CPU-bound extraction throughput. The 4 GB disk figure
 above is still a hard, linear, unavoidable cost of `index_concurrency` alone.
 (#106 lowered these numbers by 5x but deliberately did **not** move the default
-of 4; re-deriving it is #109's job.)
+of 4; #109 re-derived it and left it at 4 -- see next.)
 
-**Semantic indexing clamps the pool to 2**, regardless of `index_concurrency`.
-That clamp is a *memory* bound, not a CPU one: embedding materialises a whole
-repo's chunks in memory (~0.5-0.8 GB per worker). The clamp is logged:
+**The `index_concurrency` default itself stays 4 (#109 measured, did not just
+inherit, this).** The per-thread ingest pass added by #106
+(`iter_tar_source_files`) mixes GIL-bound Python (the `tf.next()` walk,
+`fh.read()`, the NUL-strip, `str.decode` -- which does **not** release the GIL)
+with one GIL-releasing step (`zlib.decompress`). Measured thread-scaling on this
+pass: **1.15-1.20x at 4 concurrent threads**, both idle and with the extraction
+pool live -- short of the 2.0x threshold this repo's measurements use to call
+something "parallelizes", and consistent with a mostly GIL-held pass rather
+than a genuinely parallel one. No default change is warranted on CPU grounds;
+the semantic clamp raise to 4 (above) happens to make `effective_workers` equal
+`index_concurrency` at the default with zero separate change needed.
+
+**Semantic indexing clamps the pool to 4**, regardless of `index_concurrency`
+(issue #109 raised this from 2). That clamp is a *memory* bound, not a CPU one:
+embedding materialises a whole repo's chunks in memory (~32 KB/chunk structural,
+~40.1 KB/chunk resident, measured). **The clamp gates `index_concurrency`
+itself: raising the configured default above 4 is a no-op on the semantic path
+until the clamp moves too** (`effective_workers` is `min(index_concurrency,
+clamp)`) — this is why #109 could not treat the two knobs independently. The
+clamp is logged only when it actually reduces the configured value:
 
 ```
-INFO indexer.job [-]: semantic enabled: clamping index_concurrency 6 -> 2 (memory bound: ...)
+INFO indexer.job [-]: semantic enabled: clamping index_concurrency 6 -> 4 (memory bound: ...)
 ```
+
+At `index_concurrency <= 4` (the shipped default) the clamp is a no-op and this
+line does not appear at all — confirmed on the live dev job at `index_concurrency:
+4`, clamp 4: no clamp line, `4 worker(s)` on the disk line instead.
+
+**Re-derivation (#109).** A measured model —
+`P_worst(N) = N * max((alpha+gamma)*B_breach, (alpha+gamma)*(d*C) + V_cap*C) +
+extract_processes*R_proc + P_fixed`, coefficients measured across 4 corpora
+(`alpha+gamma` up to 4.64 bytes-materialized per source byte, `d` up to 3748
+bytes/chunk, `V_cap` 40.1 KB/chunk resident), against a measured container
+memory ceiling (`M`, read from cgroup + an allocate-until-failure bracket) —
+showed N=4 clears 70% of `M` with a large margin at the standard 8000-chunk
+global cap, and empirical confirmation on the real dev job agreed: two runs each
+at N=2 and N=4 measured `peak rss: self=... children=...` (issue #109's new
+instrumentation, `RUSAGE_SELF`/`RUSAGE_CHILDREN` at the end of `run()`) — N=2
+averaged ~90% of the 0.7*M budget, N=4 ~83%, both safely under, N=4 with *more*
+margin. See `docs/perf/issue-109-measurements.md` for the full derivation,
+every coefficient's provenance, and the two derived byte limits
+(`MAX_EXTRACTED_BYTES` and the chunk cap `C`) this same model yields.
 
 ### Embedding concurrency (#107)
 
 `workers x concurrency` is the number that matters, not `concurrency` alone.
-Each of the (at most 2, semantic-clamped) workers dispatches up to
-`semantic.embedding_concurrency` embedding batches at once
+Each of the (at most 4, semantic-clamped -- #109 raised this from 2) workers
+dispatches up to `semantic.embedding_concurrency` embedding batches at once
 (`app/embed.py:databricks_embedder`, order-preserving `ThreadPoolExecutor.map`):
-2 x 4 = 8 in-flight gateway requests at the default, 2 x 8 = 16 at the
-config.yaml-enforced ceiling of 8 (the `CODE_SEARCH_SEMANTIC_EMBEDDING_CONCURRENCY`
-env var carries no ceiling, mirroring `semantic_embedding_batch_size`'s own
-unbounded env surface -- config.yaml is the job's real surface regardless), both
-under the SDK's 20-connection pool.
+4 x 4 = 16 in-flight gateway requests at the default, **4 x 8 = 32 at the
+config.yaml-enforced ceiling of 8 — this now EXCEEDS the SDK's 20-connection
+pool** (the `CODE_SEARCH_SEMANTIC_EMBEDDING_CONCURRENCY` env var carries no
+ceiling, mirroring `semantic_embedding_batch_size`'s own unbounded env surface
+-- config.yaml is the job's real surface regardless). This combination was not
+reachable before #109 (2 x 8 = 16 stayed under the pool); it is now, and is
+flagged here rather than gated in code, matching this repo's "guardrail
+constants with config-level fixes, not override flags" convention -- lower
+`embedding_concurrency` if raising it alongside a near-ceiling
+`index_concurrency`.
 `embedding_concurrency: 1` is the rollback switch — fully serial embedding, no
 thread pool spawned. See `docs/runbooks/semantic-enablement.md` §4 for the full
 in-flight/memory arithmetic and the 429 posture.
@@ -408,7 +460,7 @@ or because the pool degraded. Three WARNING shapes to recognize:
 - **`... rebuilt the pool (generation N, rebuild M/3)`** — a worker died
   (`BrokenProcessPool`, e.g. a native crash in a grammar, an OOM kill). The
   branch(es) in flight at that moment failed (up to `index_concurrency`
-  branches, semantic-clamped to 2 — **not just one**: the pool is shared, so a
+  branches, semantic-clamped to 4 — **not just one**: the pool is shared, so a
   break can surface on every repo worker holding a future at that instant).
   Each failed branch re-indexes on its next run (it never got a stamp — the
   same self-healing property §1 describes). The pool is rebuilt and later
@@ -450,13 +502,31 @@ retention (#105, §2.3) for the same in-flight branch.
 
 ### The connection pool follows the workers
 
-Each worker holds exactly one connection, so the engine is built with
+Each worker holds exactly one connection AT A TIME, so the engine is built with
 `pool_size == effective workers`, `max_overflow=0`, `pool_timeout=30`. There is
 deliberately **zero headroom**: a connection leak stalls loudly for 30 seconds
 and then raises, rather than growing the pool silently. If you see a
 `QueuePool limit ... connection timed out` from the indexer, suspect a leaked
 connection, not an undersized pool — the pool is sized to the workers by
 construction.
+
+**"One connection at a time" holds by sequencing, not by construction (#104,
+verified by #109).** On the delta-gate-open semantic path a worker opens a
+*second*, short-lived connection (`indexer/job.py`'s `with engine.connect() as
+shas_conn:`, for the advisory `shas_fn` read) before its main `index_fn`
+connection — but that second connection is closed before embedding/`index_fn`
+starts, so at most one is ever open per worker at once. `pool_size ==
+effective_workers` (raised to 4 by #109 — see §3 above) stays correct only
+because of that ordering; a future change that opened both connections
+concurrently would silently under-provision the pool. Pinned by
+`tests/unit/test_job.py::test_shas_fn_connection_closes_before_embedding_starts`.
+
+**Since #109 raised the semantic clamp from 2 to 4, the Lakebase connection
+ceiling doubles on the semantic path too** — 4 concurrent connections at the
+new default vs. 2 before. Not observed to be a bottleneck in either Arm B run
+(no `QueuePool` timeouts, no degraded coverage), but worth knowing if a future
+Lakebase compute-size change is on the table alongside a semantic-path
+concurrency change.
 
 The app/serving pool is separate and unaffected (5, paired with a matching
 `CapacityLimiter`).
