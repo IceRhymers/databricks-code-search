@@ -213,6 +213,41 @@ def test_index_concurrency_out_of_range_raises_config_error(value: int) -> None:
     assert "index_concurrency" in str(excinfo.value)
 
 
+# --- extract_processes (#108) -------------------------------------------------
+
+
+@pytest.mark.unit
+def test_extract_processes_defaults_to_none() -> None:
+    """None means "derive from the runtime" (indexer.extract_pool.derive_process_count) --
+    omitting the field is the supported shape, since it predates #108."""
+    assert parse_config(_MINIMAL, source="cfg").extract_processes is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [1, 4, 8])
+def test_extract_processes_accepts_in_range(value: int) -> None:
+    raw = b"version: 1\nconnections:\n  - type: github\n    users: [u]\nextract_processes: %d\n" % (
+        value
+    )
+
+    assert parse_config(raw, source="cfg").extract_processes == value
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [0, 9])
+def test_extract_processes_out_of_range_raises_config_error(value: int) -> None:
+    """Matches index_concurrency's `1..8` ceiling -- every parallelism knob in this
+    repo shares it, and the pool's own sizing derivation already clamps to 8."""
+    raw = b"version: 1\nconnections:\n  - type: github\n    users: [u]\nextract_processes: %d\n" % (
+        value
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+
+    assert "extract_processes" in str(excinfo.value)
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("configured", "semantic_enabled", "expected"),

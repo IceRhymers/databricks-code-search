@@ -141,6 +141,7 @@ from app.db.models import INDEX_SEMANTICS_VERSION, Repo, RepoBranch
 from app.embed import EmbeddingCountMismatchError, EmbedFn, get_embedder
 from indexer.branches import resolve_branches
 from indexer.chunk_store import write_chunks_batch
+from indexer.extract_pool import ExtractionPool, build_extraction_pool
 from indexer.fetch import (
     REQUIRED_FREE_BYTES,
     assert_disk_headroom,
@@ -165,7 +166,6 @@ from indexer.store import (
     reconcile_removed_repos,
     reconcile_retired_branches,
 )
-from indexer.symbols import extract_file
 from indexer.timing import PhaseTimer, install_timer, now, reset_timer
 
 logger = logging.getLogger("indexer.job")
@@ -309,19 +309,23 @@ def run(
     reconcile_retired_fn: Callable[..., ReconcileCounts] = reconcile_retired_branches,
     reconcile_removed_fn: Callable[..., list[str]] = reconcile_removed_repos,
     shas_fn: Callable[..., ContentShaSets] = read_indexed_shas,
+    extraction_pool: ExtractionPool | None = None,
 ) -> int:
     """Index every configured repo and return a process exit code (0 = all ok).
 
     Boundaries are injectable for tests: ``workspace_client`` (secret + config
     read), ``http_client`` (GitHub HTTP), ``engine`` (DB), ``index_fn`` (the
     store), ``embed_fn`` (semantic chunking), ``config_loader`` (so orchestration
-    tests need no SDK fake), and ``reconcile_retired_fn`` / ``reconcile_removed_fn``
+    tests need no SDK fake), ``reconcile_retired_fn`` / ``reconcile_removed_fn``
     (the storage primitives the post-fan-out checkpoint below invokes -- mirroring
-    ``index_fn``'s injection so reconciliation tests need no real Postgres either).
-    ``cfg`` defaults to the process-cached :func:`app.config.get_settings`, then any
-    ``semantic:`` fields in config.yaml are overlaid onto it before the worker clamp
-    and embedder build (config.yaml > env > default -- config.yaml is the job's
-    semantic-config surface; see :class:`indexer.repo_config.SemanticOverrides`).
+    ``index_fn``'s injection so reconciliation tests need no real Postgres either),
+    and ``extraction_pool`` (issue #108's shared symbol/edge-extraction pool --
+    mirroring ``owns_engine``/``owns_http``, a caller-supplied pool is never
+    shut down here). ``cfg`` defaults to the process-cached
+    :func:`app.config.get_settings`, then any ``semantic:`` fields in config.yaml
+    are overlaid onto it before the worker clamp and embedder build (config.yaml >
+    env > default -- config.yaml is the job's semantic-config surface; see
+    :class:`indexer.repo_config.SemanticOverrides`).
 
     ``resolve_repos`` is deliberately **not** injectable: the existing
     ``httpx.MockTransport`` seam already lets tests drive enumeration outcomes
@@ -452,6 +456,10 @@ def run(
     reconciliation_failed = False
     reconcile_skip_reason = ""
     progress = ReconcileProgress()
+    # Computed BEFORE the try below (from the parameter, not the built value) so
+    # it stays defined even if disk_usage or pool construction never runs -- the
+    # finally block reads it unconditionally.
+    owns_pool = extraction_pool is None
     try:
         # Inside the try for the same reason as the stamp read below: shutil
         # .disk_usage raises if tmp is missing or unmounted, and above the try
@@ -466,6 +474,27 @@ def run(
             workers,
             REQUIRED_FREE_BYTES / 1e9,
         )
+
+        # Built once per run, shared across every repo worker below (issue
+        # #108). Wrapped in a bare `except Exception`, not a type list:
+        # NOTHING about this pool may ever fail the run -- build_extraction_pool
+        # already degrades its own internal failures (a bad preflight probe, an
+        # unavailable sandbox) to a WARNING plus an in-process pool, so this
+        # guard exists only for a truly unexpected failure in that derivation
+        # itself. `run()` has no handler around the disk-headroom block above
+        # either, so an uncaught escape here would propagate out of `run()` and
+        # fail the wheel task after the `finally` below -- this is what prevents
+        # that.
+        if extraction_pool is None:
+            try:
+                extraction_pool = build_extraction_pool(config)
+            except Exception:
+                logger.warning(
+                    "failed to build the shared extraction pool; indexing will "
+                    "run in-process for this run",
+                    exc_info=True,
+                )
+                extraction_pool = ExtractionPool(n_processes=0)
 
         # One batched read for the whole run, BEFORE fan-out. Inside the try so a
         # failure here still closes the http client and disposes the engine.
@@ -486,6 +515,7 @@ def run(
                     embed_fn=embed_fn,
                     stamps=stamps,
                     shas_fn=shas_fn,
+                    extraction_pool=extraction_pool,
                 ): entry
                 for entry in entries
             }
@@ -564,6 +594,13 @@ def run(
                 entries=entries,
             )
     finally:
+        # Shut down BEFORE the http client/engine below, and only ours: an
+        # injected pool is the caller's to manage (mirrors owns_engine/owns_http).
+        # By this point the ThreadPoolExecutor `with` block above has already
+        # exited (every repo worker joined), so no branch holds a future against
+        # this pool -- the condition that makes shutdown(wait=True) safe.
+        if owns_pool and extraction_pool is not None:
+            extraction_pool.shutdown()
         if owns_http:
             http_client.close()
         if owns_engine:
@@ -942,6 +979,7 @@ def _index_one(
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
     shas_fn: Callable[..., ContentShaSets],
+    extraction_pool: ExtractionPool,
 ) -> RepoOutcome:
     """Run the full fetch -> parse -> symbols -> store pipeline for every branch of one repo.
 
@@ -968,6 +1006,7 @@ def _index_one(
             embed_fn=embed_fn,
             stamps=stamps,
             shas_fn=shas_fn,
+            extraction_pool=extraction_pool,
         )
     finally:
         _repo_ctx.reset(token)
@@ -984,6 +1023,7 @@ def _index_one_inner(
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
     shas_fn: Callable[..., ContentShaSets],
+    extraction_pool: ExtractionPool,
 ) -> RepoOutcome:
     """The body of :func:`_index_one`, run with the repo log context already set.
 
@@ -1045,6 +1085,7 @@ def _index_one_inner(
             started=started,
             max_chunks_per_repo=max_chunks_per_repo,
             shas_fn=shas_fn,
+            extraction_pool=extraction_pool,
         )
         for branch in resolution.branches
     ]
@@ -1113,6 +1154,7 @@ def _index_one_branch(
     started: float,
     max_chunks_per_repo: int,
     shas_fn: Callable[..., ContentShaSets],
+    extraction_pool: ExtractionPool,
 ) -> BranchOutcome:
     """Fetch, parse, and store ONE branch. Never raises -- every failure is classified.
 
@@ -1152,6 +1194,15 @@ def _index_one_branch(
     ``_index_one``'s ``_repo_ctx`` reset is: ``ThreadPoolExecutor`` reuses worker
     threads without resetting their context, so a leaked timer would attribute
     this branch's sweep to the next task on this thread.
+
+    ``extraction_pool`` (issue #108) is the run-shared, ``spawn``-based process
+    pool ``indexer.extract_pool`` extraction runs through; both ``items``
+    expressions below call ``extraction_pool.stream(...)`` rather than
+    ``extract_file`` directly. A worker death raises
+    ``indexer.extract_pool.ExtractionPoolError`` out of that stream -- caught by
+    THIS function's existing broad ``except Exception`` below like any other
+    extraction failure, with no new ``except`` branch: legibility comes from
+    ``ExtractionPoolError``'s own message, not from special-casing it here.
     """
     # NOT the `started` parameter: that one is set once per REPO and passed
     # unchanged to every branch, so reusing it would make branch 2+ of a
@@ -1273,10 +1324,12 @@ def _index_one_branch(
                     precompute_failed = True
                 finally:
                     timer.add("embed", timer.clock() - t0)
-                items = ((pf, extract_file(pf)) for pf in files)
+                items = extraction_pool.stream(files)
             else:
                 # Lazy generator: files stream through the open transaction (bounded memory).
-                items = ((pf, extract_file(pf)) for pf in iter_tar_source_files(tar_path))
+                # extraction_pool.stream() is itself pull-driven and single-consumer, so this
+                # stays lazy end to end -- no full materialization on the semantic-off path.
+                items = extraction_pool.stream(iter_tar_source_files(tar_path))
 
             # Parse time is INSIDE the db window (items are produced lazily as
             # index_repo consumes them), so `db` subtracts only the parse accrued

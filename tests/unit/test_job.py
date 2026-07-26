@@ -25,6 +25,7 @@ import sys
 import tarfile
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -33,6 +34,7 @@ import pytest
 
 from app.config import Settings
 from app.db.models import INDEX_SEMANTICS_VERSION
+from indexer.extract_pool import ExtractionPool, ExtractionPoolError
 from indexer.hashing import content_sha
 from indexer.job import (
     BranchOutcome,
@@ -43,7 +45,7 @@ from indexer.job import (
     read_github_token,
     run,
 )
-from indexer.languages import ExtractedSymbol, IndexCounts, ParsedFile
+from indexer.languages import ExtractedSymbol, FileExtraction, IndexCounts, ParsedFile
 from indexer.repo_config import ConfigError, RepoConfig, load_config
 from indexer.resolve import RepoEntry
 from indexer.store import (
@@ -191,6 +193,7 @@ def _repo_meta(full_name: str, **overrides: Any) -> dict[str, Any]:
 def _config(
     *,
     index_concurrency: int | None = None,
+    extract_processes: int | None = 1,
     semantic_max_chunks_per_repo: dict[str, int] | None = None,
     semantic: dict[str, Any] | None = None,
     **connection: Any,
@@ -201,10 +204,21 @@ def _config(
     job-side semantic-config surface), mirroring the ``semantic_max_chunks_per_repo``
     per-repo-map kwarg above -- the two are distinct config surfaces (global INT vs
     per-repo MAP) and either can be set independently.
+
+    ``extract_processes`` (#108) defaults to ``1`` -- the pool KILL SWITCH --
+    deliberately, not to the schema's own ``None`` default. Left at ``None``, every
+    one of the ~150 ``run()`` tests below would run the preflight probe and spawn
+    real worker processes on every call, each re-importing
+    ``tree_sitter_language_pack``: minutes slower and flaky on a constrained CI
+    runner. Only the pool-specific tests in ``tests/unit/test_extract_pool.py``
+    (and the dedicated pool-lifecycle tests here) opt into a real pool by passing
+    ``extract_processes=`` explicitly.
     """
     doc: dict[str, Any] = {"version": 1, "connections": [{"type": "github", **connection}]}
     if index_concurrency is not None:
         doc["index_concurrency"] = index_concurrency
+    if extract_processes is not None:
+        doc["extract_processes"] = extract_processes
     if semantic_max_chunks_per_repo is not None:
         doc["semantic_max_chunks_per_repo"] = semantic_max_chunks_per_repo
     if semantic is not None:
@@ -395,6 +409,7 @@ def _run(
     reconcile_retired_fn: Any = _noop_retired_fn,
     reconcile_removed_fn: Any = _noop_removed_fn,
     shas_fn: Any = _noop_shas_fn,
+    extraction_pool: Any = None,
 ) -> int:
     """Drive run() with a faked config read but a REAL resolve_repos.
 
@@ -409,6 +424,11 @@ def _run(
     version-matching, sha-mismatching stamp with semantic indexing on would
     otherwise reach the REAL ``read_indexed_shas`` against ``_FakeConn``, which
     cannot answer it (see that fake's docstring).
+
+    ``extraction_pool`` (#108) defaults to ``None``, in which case ``run()``
+    builds its own from ``config.extract_processes`` (pinned to ``1``, the kill
+    switch, by ``_config``'s own default -- see T9). Pass an explicit fake/real
+    :class:`~indexer.extract_pool.ExtractionPool` to test the pool seam itself.
     """
     wc = _FakeWorkspaceClient("tok")
     engine = engine if engine is not None else _FakeEngine()
@@ -430,6 +450,7 @@ def _run(
             reconcile_retired_fn=reconcile_retired_fn,
             reconcile_removed_fn=reconcile_removed_fn,
             shas_fn=shas_fn,
+            extraction_pool=extraction_pool,
         )
 
 
@@ -1070,6 +1091,7 @@ def test_precompute_failure_marks_the_branch_outcome_degraded() -> None:
             started=time.monotonic(),
             max_chunks_per_repo=100,
             shas_fn=_noop_shas_fn,
+            extraction_pool=ExtractionPool(n_processes=0),
         )
     assert outcome.status == "indexed"
     assert outcome.semantic_degraded is True
@@ -1576,6 +1598,7 @@ def test_index_one_inner_reports_discovery_complete_for_a_normal_run() -> None:
             embed_fn=None,
             stamps={},
             shas_fn=_noop_shas_fn,
+            extraction_pool=ExtractionPool(n_processes=0),
         )
     assert outcome.name == "acme/widgets"
     assert outcome.discovery_complete is True
@@ -1603,6 +1626,7 @@ def test_index_one_inner_reports_discovery_incomplete_when_capped() -> None:
             embed_fn=None,
             stamps={},
             shas_fn=_noop_shas_fn,
+            extraction_pool=ExtractionPool(n_processes=0),
         )
     assert outcome.discovery_complete is False
     assert len(outcome.outcomes) == SOFT_BRANCH_CAP
@@ -1631,6 +1655,7 @@ def test_index_one_inner_default_flip_mirror_is_complete() -> None:
             embed_fn=None,
             stamps={},
             shas_fn=_noop_shas_fn,
+            extraction_pool=ExtractionPool(n_processes=0),
         )
     assert [o.branch for o in outcome.outcomes] == ["main"]
     assert outcome.discovery_complete is True
@@ -1708,7 +1733,9 @@ def test_two_repos_are_indexed_concurrently_at_concurrency_two() -> None:
 
     NOTE this proves CONCURRENCY, not throughput. It would pass identically in a
     world where fan-out delivers zero speedup — symbol extraction itself measured
-    0.95x on 4 threads. Throughput is measured on the first production run, via
+    0.95x on 4 THREADS, which is exactly why extraction now runs in a shared
+    process pool instead (#108) rather than leaning on this thread-level
+    fan-out for it. Throughput is measured on the first production run, via
     the duration log lines asserted below.
     """
     idx = _BarrierIndex(parties=2)
@@ -1939,6 +1966,7 @@ def test_repo_context_is_reset_even_when_the_repo_fails() -> None:
             embed_fn=None,
             stamps={},
             shas_fn=_noop_shas_fn,
+            extraction_pool=ExtractionPool(n_processes=0),
         )
     assert _repo_ctx.get() == "-"
 
@@ -2933,17 +2961,24 @@ def test_parse_time_is_excluded_from_db_time(
 ) -> None:
     """T5: items are produced lazily INSIDE index_repo's transaction, so a naive
     "time index_fn" would report parse and db fused. _timed_items charges only the
-    production of each item to parse, leaving the DML between them to db."""
-    import indexer.job as job
+    production of each item to parse, leaving the DML between them to db.
+
+    Patches ``indexer.extract_pool.extract_file`` (#108 moved the in-process
+    extraction call site there from ``indexer.job``) -- with the kill switch
+    pinned by ``_config``'s default, ``ExtractionPool.stream()`` degrades to
+    calling exactly that name per file, so this still measures the real
+    ``_timed_items`` wrap around the pool's in-process path.
+    """
+    import indexer.extract_pool as extract_pool
 
     clock = _install_fake_clock(monkeypatch)
-    real_extract_file = job.extract_file
+    real_extract_file = extract_pool.extract_file
 
     def _slow_extract(pf: ParsedFile) -> Any:
         clock.advance(2.0)
         return real_extract_file(pf)
 
-    monkeypatch.setattr(job, "extract_file", _slow_extract)
+    monkeypatch.setattr(extract_pool, "extract_file", _slow_extract)
 
     def _index(conn: Any, *, items: Any, **_: Any) -> IndexCounts:
         consumed = list(items)
@@ -3482,3 +3517,200 @@ def test_other_is_the_exact_unattributed_residual(
         "sweep": 64.0,
         "other": 9.0,
     }
+
+
+# --- process-pool extraction (#108) -------------------------------------------
+
+
+@pytest.mark.unit
+def test_default_helper_config_creates_no_extraction_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9: the shared _config()/_run() helper pair pins extract_processes=1, so
+    the ~150 run() tests in this file spawn no worker processes and run no
+    preflight probe. Without this pin every one of them would spawn up to 8
+    workers, each re-importing tree_sitter_language_pack -- minutes slower and
+    flaky under CI load."""
+    probe_calls = {"n": 0}
+
+    def _tracking_probe(*args: Any, **kwargs: Any) -> bool:
+        probe_calls["n"] += 1
+        return True
+
+    monkeypatch.setattr("indexer.extract_pool._run_preflight_probe", _tracking_probe)
+
+    code = _run(_config(repos=["acme/widgets"]), _RecordingIndex())
+    assert code == 0
+    assert probe_calls["n"] == 0
+
+
+@pytest.mark.unit
+def test_pool_engaged_attributes_stream_production_to_parse(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T10: phase-timing attribution survives the pool. The pool is built in
+    run(), OUTSIDE branch_started, so it contributes nothing to any branch's
+    total by itself; only the per-item production _timed_items wraps is
+    charged, and it still lands on `parse`, never `other`."""
+    clock = _install_fake_clock(monkeypatch)
+
+    class _ClockAdvancingExecutor:
+        """Advances the fake clock once per submitted batch, proportional to
+        its file count -- mirrors this file's other `_slow_*` timing fakes,
+        just at the pool's own submit() seam instead of a direct function
+        patch."""
+
+        def submit(self, fn: Any, *args: Any) -> "Future[list[FileExtraction]]":
+            batch = args[0]
+            clock.advance(1.5 * len(batch))
+            fut: "Future[list[FileExtraction]]" = Future()
+            fut.set_result(fn(*args))
+            return fut
+
+    pool = ExtractionPool(n_processes=0, batch_bytes=10_000_000)  # one big batch
+    pool._n_processes = 2
+    pool._executor = _ClockAdvancingExecutor()  # type: ignore[assignment]
+
+    idx = _RecordingIndex()
+    cfg = Settings(semantic_enabled=False)
+    # Both files must be a recognized language (unlike _DEFAULT_FILES' README.md,
+    # `lang=None`) so BOTH qualify for the pool and land in the SAME one-file-
+    # exceeds-nothing batch -- otherwise D5's local short-circuit answers one of
+    # them without ever reaching the executor, undercounting this assertion.
+    github = _GitHub(
+        files={"a.py": b"def f():\n    return 1\n", "b.py": b"def g():\n    return 2\n"}
+    )
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(
+            _config(repos=["acme/widgets"]), idx, cfg=cfg, github=github, extraction_pool=pool
+        )
+    assert code == 0
+
+    phases = _only_phases(caplog)
+    assert list(phases) == [
+        "total",
+        "resolve",
+        "download",
+        "parse",
+        "embed",
+        "db",
+        "sweep",
+        "other",
+    ]
+    assert phases["parse"] == 3.0  # a.py + b.py (the github= override above) x 1.5s, one batch
+    assert phases["other"] == 0.0
+    assert phases["db"] == 0.0
+    assert phases["total"] == 3.0
+
+
+@pytest.mark.unit
+def test_extraction_pool_is_shut_down_even_when_fan_out_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pool lifecycle: built once per run, shut down in the `finally` even when
+    something inside the fan-out block raises before any branch runs."""
+    import indexer.job as job
+
+    shutdown_calls = {"n": 0}
+
+    class _FakePool:
+        def shutdown(self) -> None:
+            shutdown_calls["n"] += 1
+
+    monkeypatch.setattr(job, "build_extraction_pool", lambda config: _FakePool())
+
+    def _boom_stamps(engine: Any, entries: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(job, "_read_stamps", _boom_stamps)
+
+    with pytest.raises(RuntimeError):
+        _run(_config(repos=["acme/widgets"]), _RecordingIndex())
+
+    assert shutdown_calls["n"] == 1
+
+
+@pytest.mark.unit
+def test_pool_is_built_before_the_first_db_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2 (§10.3 of the plan): the preflight probe is the first process spawn in
+    run(), and it MUST precede any database read or write. A re-entrant
+    python_wheel_task child under an unguarded __main__ inherits the parent's
+    sys.argv and would otherwise become a second corpus writer; the probe's
+    unguarded-__main__ crash (reproduced: RuntimeError from
+    multiprocessing.spawn._check_not_importing_main) only bounds that risk if
+    it runs before the child could touch the database. This pins the ordering
+    directly so a future refactor (e.g. "only build the pool if a branch needs
+    it") cannot silently move the pool build after _read_stamps without a test
+    failing -- do not "fix" a failure here by reordering the assertion."""
+    import indexer.job as job
+
+    calls: list[str] = []
+
+    def _tracking_build(config: Any) -> Any:
+        calls.append("pool")
+        return ExtractionPool(n_processes=0)
+
+    real_read_stamps = job._read_stamps
+
+    def _tracking_read_stamps(*args: Any, **kwargs: Any) -> Any:
+        calls.append("stamps")
+        return real_read_stamps(*args, **kwargs)
+
+    monkeypatch.setattr(job, "build_extraction_pool", _tracking_build)
+    monkeypatch.setattr(job, "_read_stamps", _tracking_read_stamps)
+
+    code = _run(_config(repos=["acme/widgets"]), _RecordingIndex())
+    assert code == 0
+    assert calls == ["pool", "stamps"]
+
+
+@pytest.mark.unit
+def test_injected_extraction_pool_is_never_shut_down_by_run() -> None:
+    """Mirrors owns_engine/owns_http: a CALLER-supplied pool is the caller's to
+    manage, never torn down inside run()."""
+    shutdown_calls = {"n": 0}
+
+    class _FakePool:
+        def stream(self, files: Any) -> Any:
+            return ((pf, FileExtraction(symbols=[], edges=[])) for pf in files)
+
+        def shutdown(self) -> None:
+            shutdown_calls["n"] += 1
+
+    code = _run(_config(repos=["acme/widgets"]), _RecordingIndex(), extraction_pool=_FakePool())
+    assert code == 0
+    assert shutdown_calls["n"] == 0
+
+
+@pytest.mark.unit
+def test_broken_pool_fails_only_the_in_flight_branch_next_branch_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC3: a shared pool's break fails the branch it broke under; the run
+    continues and the NEXT branch of the same repo indexes normally -- the
+    per-branch classification this design maps ExtractionPoolError onto."""
+    call_count = {"n": 0}
+
+    class _FlakyPool:
+        def stream(self, files: Any) -> Any:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ExtractionPoolError("simulated pool break (generation 0)")
+            return ((pf, FileExtraction(symbols=[], edges=[])) for pf in files)
+
+        def shutdown(self) -> None:
+            pass
+
+    idx = _RecordingIndex()
+    github = _GitHub(branches={"acme/widgets": ["main", "feature"]})
+    # Default branch ("main") is always first and always included -- see
+    # indexer.branches.resolve_branches -- so "main" is the branch that breaks
+    # and "feature" is the one that recovers.
+    config = _config(repos=["acme/widgets"], branches=["feature"], index_concurrency=1)
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = _run(config, idx, github=github, extraction_pool=_FlakyPool())
+
+    assert code == 1  # the run continues but is not clean
+    assert "failed to index acme/widgets@main" in caplog.text
+    assert idx.calls == ["acme/widgets"]  # only "feature" reached index_repo

@@ -264,9 +264,11 @@ class RepoConfig(BaseModel):
     numbers 5x but deliberately left the default alone; #109 re-derives it.)
 
     **Returns at the ceiling are sublinear.** Symbol extraction does not
-    parallelise (measured at 0.95x on 4 threads), so Amdahl's law caps the
-    speedup well below 8x while the disk cost stays a hard linear 4 GB. Raise
-    it only knowing that trade.
+    parallelise across THREADS (measured at 0.95x on 4 threads -- the tree walk
+    is GIL-serialized) -- which is exactly why extraction now runs in a shared
+    process pool instead (``extract_processes``, below); that pool is decoupled
+    from ``index_concurrency`` entirely. Raise ``index_concurrency`` only
+    knowing you are buying disk-bound repo fan-out, not extraction throughput.
 
     When semantic indexing is on, the effective worker count is clamped to 2 by
     :func:`effective_workers`. That clamp is a **memory** bound, not a CPU one:
@@ -286,11 +288,25 @@ class RepoConfig(BaseModel):
     the job resolves ``entry.semantic_max_chunks or cfg.semantic_max_chunks_per_repo``
     and the ``semantic:`` block only supplies the second operand -- see
     :class:`SemanticOverrides`.
+
+    ``extract_processes`` (#108) sizes the shared, ``spawn``-based process pool
+    ``indexer.extract_pool`` runs symbol/edge extraction through -- one pool per
+    run, shared across every ``index_concurrency`` repo worker, so a single
+    giant repo's files parse on every available core rather than one thread's
+    worth. It is a CPU knob, entirely independent of ``index_concurrency``'s
+    disk bound above. ``None`` (the default) derives from the runtime:
+    affinity/cgroup-aware CPU count, clamped to 8 -- matching every other
+    parallelism knob in this repo (``index_concurrency``,
+    ``SemanticOverrides.embedding_concurrency``). Setting this to ``1`` restores
+    fully serial, in-process extraction and spawns no process pool at all --
+    the rollback switch, exercised the same way #107's
+    ``embedding_concurrency: 1`` is.
     """
 
     version: Literal[1]
     connections: list[Connection] = Field(min_length=1)
     index_concurrency: int = Field(default=4, ge=1, le=8)
+    extract_processes: int | None = Field(default=None, ge=1, le=8)
 
     # Per-repo override of Settings.semantic_max_chunks_per_repo (app/config.py, default
     # 8000), keyed by repo. Absent (the default) -> no repo gets an override, and
