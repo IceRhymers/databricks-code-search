@@ -8,12 +8,22 @@ version: 1
 # disk. That is the only on-disk artifact — the archive is streamed in memory and
 # never extracted — so budget 0.5 GB per worker: 2 GB at the default 4, 4 GB at
 # the ceiling of 8.
-# Returns at the ceiling are sublinear: symbol extraction does not parallelise
-# (measured 0.95x on 4 threads), so you buy far less than 8x for a hard linear
-# 4 GB of disk. Raise it knowing that.
+# Symbol extraction does not parallelise across THREADS (measured 0.95x on 4
+# threads — the tree walk is GIL-serialized), which is why extraction now runs
+# in its own shared process pool instead — see extract_processes below. Raising
+# this knob buys disk-bound repo fan-out, not extraction throughput.
 # With semantic indexing enabled this is clamped to 2 — a MEMORY bound, since
 # embedding materialises a whole repo's chunks (~0.5-0.8 GB per worker).
 # index_concurrency: 4
+
+# How many worker PROCESSES the job uses to extract symbols/edges (issue #108).
+# Independent of index_concurrency above: this is a CPU knob (a shared, spawn-
+# based process pool decoupled from the per-repo worker threads), not a disk or
+# memory one. Default (unset) derives from the runtime's affinity/cgroup-aware
+# CPU count, clamped to 8. Setting this to 1 restores fully serial, in-process
+# extraction and spawns no process pool at all — the rollback switch if the
+# pool ever misbehaves in this runtime.
+# extract_processes: 4
 
 connections:
   - type: github

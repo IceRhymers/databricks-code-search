@@ -125,7 +125,11 @@ INFO indexer.job [acme/gadgets]: skipped acme/gadgets@main: already indexed at a
 Wall-clock for the whole run is bounded below by the single slowest repo, so if
 one repo dominates, raising `index_concurrency` will not help — that is Amdahl's
 law asserting itself at the repo level, and the fix is to exclude the repo or
-accept the duration.
+accept the duration. **Still true for `index_concurrency` specifically** — but
+since #108 a single dominant repo is no longer bounded by one thread's `parse`
+time: its files parse on every `extract_processes` core via the shared
+extraction pool (§3), so raising *that* knob can move the giant's own duration,
+even though raising `index_concurrency` cannot.
 
 **To decide whether tuning is worth it:** compare the total on the completion
 line against the sum of the per-repo elapsed times. If the total is already
@@ -163,15 +167,29 @@ promise that the field set never changes across releases.)
 `#104` narrows the **db** and **embed** costs to a branch's actual delta, not
 its size — but it does NOT touch `parse`: extraction still runs on every
 file every run (tree-sitter must produce a `FileExtraction` before
-`index_repo` can classify it), so an all-unchanged branch on a large repo
-still pays its full `download`+`parse` cost. See `indexer.store`'s
-`delta write set …` line (below) to tell "this branch is genuinely mostly-new"
-from "this branch is mostly-unchanged but still parsing everything" — the
-latter is exactly the case `#108` (process-pool extraction) or a future
-extraction-skip step would address next.
+`index_repo` can classify it, and `index_repo`'s classification happens
+*downstream* of extraction — the `FileExtraction` for an unchanged file is
+computed and then discarded), so an all-unchanged branch on a large repo still
+pays its full `download`+`parse` cost. `#108` (process-pool extraction) makes
+that cost cheaper by spreading it across cores — it does NOT skip it: every
+file is still parsed every run, including the unchanged ones. See
+`indexer.store`'s `delta write set …` line (below) to tell "this branch is
+genuinely mostly-new" from "this branch is mostly-unchanged but still parsing
+everything on every core" — deferring extraction past classification for the
+unchanged fraction is a real, larger follow-up win, deliberately left out of
+`#108`'s scope (it would change `index_repo`'s `items` contract).
 
-Four fields need interpretation before you act on them:
+Five fields need interpretation before you act on them:
 
+- **`parse=` can RISE on a single branch after #108, even though the RUN's
+  total wall clock falls.** The shared extraction pool (§3) is shared across
+  every `index_concurrency` repo worker, so time a branch spends blocked in
+  `ExtractionPool.stream()` now includes queueing behind OTHER branches'
+  batches, not just this branch's own extraction. Reading one branch's `parse=`
+  in isolation and comparing it to a pre-#108 run will therefore sometimes look
+  like a regression when it is not — compare **run totals and the dominant
+  repo** instead (see `docs/perf/issue-108-measurements.md` for the shape of
+  that comparison).
 - **`resolve=0.00s` on a default branch is expected, not a bug.** That branch's
   HEAD SHA came from the repo-level resolve, which happens once per repo outside
   every branch's total and is reported on the repo's `finished` line as
@@ -300,6 +318,7 @@ source edit and redeploy, never a 2am incident-response lever.
 | `index_concurrency` | 1..8, default **4** | Repos in flight |
 | `MAX_TARBALL_BYTES` | 500 MB | The compressed download, per worker |
 | `MAX_EXTRACTED_BYTES` | 2 GB | The streamed uncompressed content, per branch |
+| `extract_processes` (#108) | 1..8, default: derived (affinity/cgroup, capped 8) | Symbol/edge extraction worker processes, shared across ALL `index_concurrency` repo workers |
 
 Only the first of the two byte caps is a **disk** cap. Since #106 the tarball is
 streamed once, in memory, and is never extracted, so `MAX_EXTRACTED_BYTES` is a
@@ -316,13 +335,17 @@ the compressed tarball is the only artifact on disk, so peak local disk is
 | **4 (default)** | **2 GB** |
 | 8 (ceiling) | 4 GB |
 
-**Returns at the ceiling are sublinear; the disk cost is not.** Symbol
-extraction was measured at **0.95x on 4 threads** — the tree walk is
-GIL-serialized and is ~56% of extraction time, so Amdahl's law caps the speedup
-well below 8x. Meanwhile the 4 GB is a hard, linear, unavoidable cost. Raise
-`index_concurrency` to 8 only knowing you are buying a fraction of a speedup
-with a doubling of disk. (#106 lowered these numbers by 5x but deliberately did
-**not** move the default of 4; re-deriving it is #109's job.)
+**`index_concurrency` no longer bounds extraction throughput; the disk cost is
+still linear.** Symbol extraction was measured at **0.95x on 4 threads** — the
+tree walk is GIL-serialized, so raising `index_concurrency` never bought
+extraction speedup, only more repos in flight at once. That measurement is
+exactly *why* extraction now runs in its own shared **process** pool instead
+(`extract_processes`, below) — decoupled from `index_concurrency` entirely.
+Raise `index_concurrency` only for repo-level (disk-bound) fan-out; raise
+`extract_processes` for CPU-bound extraction throughput. The 4 GB disk figure
+above is still a hard, linear, unavoidable cost of `index_concurrency` alone.
+(#106 lowered these numbers by 5x but deliberately did **not** move the default
+of 4; re-deriving it is #109's job.)
 
 **Semantic indexing clamps the pool to 2**, regardless of `index_concurrency`.
 That clamp is a *memory* bound, not a CPU one: embedding materialises a whole
@@ -346,6 +369,84 @@ under the SDK's 20-connection pool.
 `embedding_concurrency: 1` is the rollback switch — fully serial embedding, no
 thread pool spawned. See `docs/runbooks/semantic-enablement.md` §4 for the full
 in-flight/memory arithmetic and the 429 posture.
+
+### Extraction process pool (#108)
+
+Symbol/edge extraction runs in a **shared, `spawn`-based process pool** — one
+pool per run, built once and shared across every `index_concurrency` repo
+worker, so a single dominant repo's files parse on every available core instead
+of being bound to one thread. This is a **CPU** knob, entirely independent of
+`index_concurrency`'s disk bound and the semantic clamp above: it adds no new
+corpus writer and does not change per-branch/per-repo sequencing (see §1.1) —
+"process pool" reads like a concurrency change to anyone who has internalized
+this runbook's §1.1, and it is not one.
+
+`extract_processes` (unset, the default) derives from the runtime:
+affinity/cgroup-aware CPU count, capped at 8 — the same ceiling as every other
+parallelism knob here. **Set it to `1` to disable the pool entirely** — fully
+serial, in-process extraction, no worker processes spawned at all — mirroring
+`embedding_concurrency: 1`'s rollback shape above. This is the 2am escape
+hatch if the pool ever misbehaves in this runtime; it is config-only, needs no
+redeploy, no migration, and no re-index.
+
+**How to tell whether the pool engaged**, once per run beside the disk line:
+
+```
+INFO indexer.extract_pool [-]: symbol extraction: 4 process(es) (spawn); pool preflight ok
+```
+
+Absent that line (or a `WARNING` in its place, also from the `indexer.extract_pool`
+logger), extraction ran in-process — either by config (`extract_processes: 1`)
+or because the pool degraded. Three WARNING shapes to recognize:
+
+- **`extraction pool preflight failed: ...`** — the pool never engaged for this
+  run at all (a bad sandbox, `/dev/shm` too small, an unguarded `__main__`
+  under `spawn`). The run proceeds at today's (pre-#108) speed. (A killed probe
+  worker may also print a stderr line like `resource_tracker: There appear to
+  be 1 leaked semaphore objects to clean up at shutdown` — harmless noise from
+  the kill path, not a separate problem.)
+- **`... rebuilt the pool (generation N, rebuild M/3)`** — a worker died
+  (`BrokenProcessPool`, e.g. a native crash in a grammar, an OOM kill). The
+  branch(es) in flight at that moment failed (up to `index_concurrency`
+  branches, semantic-clamped to 2 — **not just one**: the pool is shared, so a
+  break can surface on every repo worker holding a future at that instant).
+  Each failed branch re-indexes on its next run (it never got a stamp — the
+  same self-healing property §1 describes). The pool is rebuilt and later
+  branches run normally.
+- **`... rebuild budget (3) exhausted; latching to in-process extraction`** — a
+  deterministically poisoned file re-broke the pool three times running. The
+  rest of THIS run finishes in-process (slower, but correct and complete); the
+  next run gets a fresh pool.
+
+**Small repos engage fewer workers than `extract_processes` requests, and that
+is not a bug.** Batching is by 2 MB of aggregate qualifying-file content, not
+file count — a repo with less than `extract_processes x 2 MB` of parseable
+content never fills every worker. Such repos are fast regardless; watching one
+show fewer active workers than configured does not mean the pool "isn't
+working".
+
+**Ingestion stays serial — the pool cannot parallelize it.** Since #106 the tar
+stream is decompressed, decoded, and filtered in ONE pass on the repo-worker
+thread (`indexer.ingest.iter_tar_source_files`); the pool only parallelizes
+`extract_file` itself. On a real measured corpus this serial pass was ~11% of
+the pre-#108 serial total — small, but by Amdahl's law it is a hard ceiling on
+the *combined* (ingest + extract) speedup this pool can ever deliver, however
+many processes `extract_processes` uses. See
+`docs/perf/issue-108-measurements.md` for the full measurement and why it means
+AC1's "≥3x on 4+ cores" bar is met at 8 processes but not at 4 on that corpus —
+a real, structural finding, not a defect in the pool's own parallel efficiency
+(extraction alone scales at ~86% efficiency at 4 processes; the ceiling is the
+serial ingest pass, not the pool).
+
+**Memory**, added to the peak-usage arithmetic #109 inherits: each extraction
+worker process peaks at roughly 121 MB RSS (measured, all 7 grammars touched),
+so the pool adds `extract_processes x ~121 MB` on top of everything above —
+~484 MB at the default-derived 4, ~1.0 GB at the ceiling of 8. The pool's own
+bounded look-ahead window (scaled by `2 x extract_processes`: up to 2 MB of
+aggregate content per repo worker, plus a file-count backstop for near-zero-
+byte files) adds a few tens of MB per in-flight branch on top of that, and
+sits alongside (not instead of) the batched-write consumer's own up-to-8-MiB
+retention (#105, §2.3) for the same in-flight branch.
 
 ### The connection pool follows the workers
 
