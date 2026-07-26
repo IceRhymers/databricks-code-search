@@ -126,6 +126,18 @@ logger = logging.getLogger("indexer.ingest")
 #     bounds members of ANY type. Regular-file accounting alone would let an
 #     archive of a million directory or link headers decompress unbounded --
 #     they carry no data, so `streamed` never moves.
+#
+# issue #109 re-derived this as a MEMORY limit (previously undirected): at the
+# pinned N=2 operating point, against a measured container ceiling and the
+# semantic path's measured bytes-materialized-per-source-byte coefficients, the
+# breach-regime peak stays under 0.7x that ceiling only for a per-branch source
+# total <= ~880 MiB (vs this 2 GB). NOT changed here: no branch in the
+# measurement corpus approached either value (largest observed: ~31.5 MiB, ~3.6%
+# of the derived bound), so there is no empirical signal to justify lowering a
+# constant whose breach fails the branch and closes the whole run's
+# reconciliation checkpoint (job.py's `_decide_reconciliation` requires
+# `failures == 0`). See docs/perf/issue-109-measurements.md for the full
+# derivation.
 MAX_EXTRACTED_BYTES = 2_000_000_000
 
 

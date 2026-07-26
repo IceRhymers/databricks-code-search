@@ -270,16 +270,25 @@ class RepoConfig(BaseModel):
     from ``index_concurrency`` entirely. Raise ``index_concurrency`` only
     knowing you are buying disk-bound repo fan-out, not extraction throughput.
 
-    When semantic indexing is on, the effective worker count is clamped to 2 by
-    :func:`effective_workers`. That clamp is a **memory** bound, not a CPU one:
-    embedding materialises a whole repo's chunks in memory (~0.5-0.8 GB per
-    worker; 260 MB of vectors alone at the 8000-chunk ceiling).
+    When semantic indexing is on, the effective worker count is clamped to 4 by
+    :func:`effective_workers` (issue #109 re-derived this from 2: a measured
+    ``P_worst`` model -- ``(alpha+gamma)`` bytes-materialized-per-source-byte
+    coefficients, measured resident vector cost, #108's per-process RSS, and a
+    measured container memory ceiling -- showed N=4 clears 0.7x the container
+    budget with margin, and two live-job runs at N=4 confirmed it empirically:
+    peak self+children RSS landed at ~83% of budget, actually MORE comfortable
+    than N=2's own ~90%. See docs/perf/issue-109-measurements.md). That clamp is
+    still a **memory** bound, not a CPU one: embedding materialises a whole
+    repo's chunks in memory. Per-chunk vector cost is ~32 KB structural (dim=1024
+    Python float-list storage) but ~40.1 KB RESIDENT (measured; pymalloc
+    overhead/fragmentation) -- use the resident figure for headroom arithmetic --
+    so 313 MiB of vectors alone at the 8000-chunk ceiling.
 
     ``semantic_max_chunks_per_repo`` (the per-repo MAP) overrides that global
     8000-chunk ceiling for individual repos named here, without moving the global
-    default. It does NOT relax the 2-worker semantic clamp above -- a large
+    default. It does NOT relax the 4-worker semantic clamp above -- a large
     override still multiplies the per-worker memory cost of whichever of the (at
-    most 2) concurrent semantic workers happens to be indexing that repo.
+    most 4) concurrent semantic workers happens to be indexing that repo.
 
     The similarly-named ``semantic.max_chunks_per_repo`` (inside the ``semantic:``
     block, a single INT) moves that GLOBAL ceiling itself for the whole job. The
@@ -354,11 +363,17 @@ class RepoConfig(BaseModel):
 def effective_workers(config: RepoConfig, *, semantic_enabled: bool) -> int:
     """Worker-pool size for a run, applying the semantic memory clamp.
 
+    The clamp is 4 (issue #109; previously 2 -- see :class:`RepoConfig`'s
+    docstring for the re-derivation and empirical Arm A/B confirmation). It is a
+    ceiling, never a floor: an ``index_concurrency`` below the clamp passes
+    through unchanged, so N=3 (or any other legal value) is a real, reachable
+    ``effective_workers`` outcome, not just N in {1, 2, 4}.
+
     Takes a plain ``bool`` rather than ``Settings`` so this module keeps its
     import-light property (see the module docstring).
     """
     if semantic_enabled:
-        return min(config.index_concurrency, 2)
+        return min(config.index_concurrency, 4)
     return config.index_concurrency
 
 

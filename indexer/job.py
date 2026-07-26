@@ -121,6 +121,7 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import resource
 import shutil
 import sys
 import tempfile
@@ -410,10 +411,16 @@ def run(
     owns_engine = engine is None
     if engine is None:
         # The pool is DERIVED from the worker count, not a constant: each worker
-        # holds exactly one connection (one engine.connect() per repo, and the
-        # embed/chunk precompute happens before it), so pool_size == workers is
-        # exactly enough and max_overflow=0 turns a connection leak into a loud
-        # stall instead of silent pool growth. pool_timeout is SQLAlchemy's own
+        # holds at most ONE connection AT A TIME -- by sequencing, not by
+        # construction (issue #109 E7). On the delta-gate-open semantic path a
+        # worker opens a second, short-lived connection for the advisory
+        # shas_fn read (below), but closes it before the embed/chunk precompute
+        # and its own index_fn connection open -- see
+        # tests/unit/test_job.py::test_shas_fn_connection_closes_before_embedding_starts.
+        # So pool_size == workers is exactly enough and max_overflow=0 turns a
+        # connection leak into a loud stall instead of silent pool growth (a
+        # future change that opened both connections concurrently would need a
+        # bigger pool). pool_timeout is SQLAlchemy's own
         # default, spelled out HERE because max_overflow=0 is what makes it
         # observable -- a reader seeing the overflow ban must not have to go look
         # up how long the resulting stall lasts. Passing pool_size explicitly is
@@ -615,6 +622,16 @@ def run(
         failures,
         len(entries),
         time.monotonic() - run_started,
+    )
+    # issue #109 AC3: peak RSS for this run, self (the main process, every repo
+    # worker thread) and children (the #108 extraction pool's worker processes,
+    # otherwise invisible from here) -- ru_maxrss is a high-water mark, in KB on
+    # Linux, so no delta/baseline subtraction is needed the way a local
+    # measurement script needs one against its own import-time baseline.
+    logger.info(
+        "peak rss: self=%d KB children=%d KB",
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
     )
     # Conflicts do NOT fail the run because they SELF-HEAL -- the stamp that
     # displaced them makes the next run re-index that branch unconditionally.

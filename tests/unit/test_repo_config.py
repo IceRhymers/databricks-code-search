@@ -253,8 +253,11 @@ def test_extract_processes_out_of_range_raises_config_error(value: int) -> None:
     ("configured", "semantic_enabled", "expected"),
     [
         (8, False, 8),
-        (8, True, 2),
-        (4, True, 2),
+        (8, True, 4),  # issue #109: clamp raised from 2 to 4, re-derived + Arm B-confirmed
+        (5, True, 4),
+        (4, True, 4),
+        (3, True, 3),  # below the clamp -- passthrough, N=3 is a legal (unclamped) value too
+        (2, True, 2),
         (1, True, 1),  # the clamp is a ceiling, never a floor
         (1, False, 1),
     ],
