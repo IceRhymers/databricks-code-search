@@ -93,17 +93,37 @@ class Settings(BaseSettings):
     # in-process memory rather than a DB lock; exceeding it fails loudly.
     #
     # Sized against the ACTUAL buffer cost, not a round number: the vectors are held as
-    # Python float lists, ~32 B per element (24 B float object + 8 B list pointer), so at
-    # dim=1024 each chunk costs ~32 KB -- 8000 chunks is ~260 MB of vectors plus ~16 MB of
-    # chunk text. A larger ceiling (e.g. 50k -> ~1.6 GB) would OOM the job container before
-    # this loud check could ever fire, which would defeat the point of having a ceiling.
-    # A repo that legitimately exceeds this needs a temp-table staging path, not a bigger
-    # buffer.
+    # Python float lists, ~32 B per element (24 B float object + 8 B list pointer) structural,
+    # but ~40.1 KB/chunk RESIDENT once measured (issue #109; pymalloc overhead/fragmentation --
+    # use this figure for headroom arithmetic) -- 8000 chunks is ~313 MiB of vectors resident
+    # plus ~16 MB of chunk text. #109 also derived a per-worker chunk-cap ceiling from a full
+    # container-memory model (~73,300 chunks at the pinned N=2 semantic-worker count this cap
+    # is evaluated at, ~36,700 at the shipped N=4 -- see docs/perf/issue-109-measurements.md
+    # §12): a larger ceiling well past that (e.g. 50k, ~1.9 GiB resident) risks OOMing the job
+    # container before this loud check could ever fire, which would defeat the point of having
+    # a ceiling. A repo that legitimately exceeds this needs a temp-table staging path, not a
+    # bigger buffer.
+    #
+    # Scope note (#104): under file-level delta indexing this cap is enforced against
+    # whatever ONE RUN embeds (changed/new + membership-only files), not a branch's whole
+    # corpus -- a branch can legitimately drift above this number between full reindexes
+    # (a semantics bump, or its first index), re-enforced in full at each of those. This is
+    # a deliberate, accepted trade-off (see indexer/job.py's module docstring and
+    # docs/runbooks/indexing-parallelism.md §4.1), not a bug; the constant is unchanged.
     semantic_max_chunks_per_repo: int = 8000
 
     # Chunk size bound (tokens) fed to the embedding model. Distinct from MAX_FILE_BYTES,
     # which bounds file ingestion, not embedding-chunk granularity.
     semantic_chunk_max_tokens: int = 512
+
+    # In-flight embedding requests per worker (#107). The indexer clamps to 4 workers when
+    # semantic is on (indexer/repo_config.py:effective_workers -- issue #109 raised this from
+    # 2), so total in-flight gateway requests are workers x concurrency: 4 x 4 = 16 at this
+    # default, 4 x 8 = 32 at the config.yaml-enforced ceiling of 8 -- the latter now EXCEEDS
+    # the SDK's 20-connection pool (pool_block=True, so exceeding it silently serializes
+    # rather than erroring, so this is a real-concurrency cap, not a correctness one). Setting
+    # this to 1 restores today's fully serial embed() and spawns no thread pool.
+    semantic_embedding_concurrency: int = 4
 
 
 @lru_cache(maxsize=1)

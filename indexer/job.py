@@ -10,7 +10,9 @@ opening a database connection.
 Orchestrates, per resolved repo: resolve the default branch's HEAD -> resolve the
 repo's concrete branch list from the config globs -> for each branch,
 SEQUENTIALLY: resolve its HEAD SHA -> download the tarball by that immutable SHA
--> extract -> parse text files -> extract symbols -> atomic upsert + mark-and-sweep
+-> stream text files straight out of that archive (:func:`indexer.ingest.
+iter_tar_source_files`, one pass, nothing extracted to disk) -> extract symbols
+-> atomic upsert + mark-and-sweep
 via :func:`indexer.store.index_repo`. Branches within one repo are sequential
 (never concurrent) -- that is the invariant that keeps ``store.py``'s per-branch
 sweep sound without an advisory lock. Each BRANCH is isolated: one branch's
@@ -79,6 +81,36 @@ and only a ``chunk_writer`` closure over the precomputed vectors is handed to
 loop as symbols. Flag-off: no chunking, no embedder, no import of ``app.embed``'s
 lazy ``databricks-sdk`` dependency.
 
+File-level delta indexing (issue #104) skips re-embedding a file this branch
+already carries unchanged, at ``(path, content_sha)``. Before building the
+embed list, this module calls the injected ``shas_fn`` (default
+:func:`indexer.store.read_indexed_shas`) -- but ONLY when this branch's stored
+``index_semantics_version`` already matches
+:data:`app.db.models.INDEX_SEMANTICS_VERSION`, the same gate
+``indexer.store.index_repo`` applies authoritatively inside its own
+transaction -- on a short-lived connection that closes before the embedder is
+called. ``index_repo``'s per-file classification (unchanged / membership-only /
+changed-new) is the one that actually decides what gets written; this module's
+copy is advisory only, used to decide what needs a vector. Both reads can only
+diverge if a second writer touched this repo between them, which the
+single-writer-per-repo invariant above forbids. A branch whose semantic
+precompute fails keeps whatever chunk coverage it already had -- see
+:func:`_precompute_chunk_writer` and ``indexer/store.py``'s module docstring
+for why that is no longer self-healing on the next run under delta indexing,
+and the aggregate run-completion WARNING this module emits for it.
+
+Every INDEXED branch also emits one ``phase timing`` line accounting for its whole
+wall clock -- resolve / download / parse / embed / db / sweep, plus an
+``other`` residual so no time is silently unattributed. The fields are fixed and
+unconditional (a phase that did not run prints ``0.00s``) so the line stays
+greppable whether or not semantic indexing is on. Skipped, failed, and conflicted
+branches emit no such line. ``sweep`` is measured inside ``indexer.store`` and
+reaches this module through the ambient timer in :mod:`indexer.timing` rather
+than through the ``index_fn`` seam, which keeps that seam's signature (and every
+fake of it) unchanged. The repo-level costs that sit outside every branch's
+total -- the default branch's HEAD resolve and the branch listing -- are reported
+as ``resolve=``/``list=`` on the per-repo ``finished`` line instead.
+
 Logging is INFO only. The GitHub token is read via an injected client and is never
 logged, and this module never lowers root/SDK/httpx log levels (see the redaction
 test + source-level tripwire).
@@ -89,11 +121,12 @@ from __future__ import annotations
 import argparse
 import base64
 import logging
+import resource
 import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -108,29 +141,33 @@ from app.db.client import create_db_engine
 from app.db.models import INDEX_SEMANTICS_VERSION, Repo, RepoBranch
 from app.embed import EmbeddingCountMismatchError, EmbedFn, get_embedder
 from indexer.branches import resolve_branches
-from indexer.chunk_store import write_chunks
+from indexer.chunk_store import write_chunks_batch
+from indexer.extract_pool import ExtractionPool, build_extraction_pool
 from indexer.fetch import (
     REQUIRED_FREE_BYTES,
     assert_disk_headroom,
     download_tarball,
-    extract_tarball,
     list_branches,
     resolve_branch_head,
     resolve_ref,
 )
-from indexer.languages import Chunk, IndexCounts, ParsedFile
-from indexer.parse import iter_chunks, iter_source_files
+from indexer.hashing import content_sha
+from indexer.ingest import iter_tar_source_files
+from indexer.languages import Chunk, FileExtraction, IndexCounts, ParsedFile
+from indexer.parse import iter_chunks
 from indexer.repo_config import RepoConfig, effective_workers, load_config, normalize_repo
 from indexer.resolve import MAX_REPOS, RepoEntry, resolve_repos
 from indexer.store import (
     ChunkWriter,
+    ContentShaSets,
     ReconcileCounts,
     StaleIndexError,
     index_repo,
+    read_indexed_shas,
     reconcile_removed_repos,
     reconcile_retired_branches,
 )
-from indexer.symbols import extract_file
+from indexer.timing import PhaseTimer, install_timer, now, reset_timer
 
 logger = logging.getLogger("indexer.job")
 
@@ -153,11 +190,20 @@ class BranchOutcome:
     ``StaleIndexError`` maps to ``"conflict"`` and any other exception to
     ``"failed"``, caught INSIDE the per-branch loop so one branch's failure never
     stops its repo's other branches from being attempted.
+
+    ``semantic_degraded`` is ``True`` only for an ``"indexed"`` outcome whose
+    chunk precompute raised (a chunk-cap breach or an embedder failure) --
+    never for semantic-off, and never for a build-time embedder misconfiguration
+    (that degrades ``embed_fn`` to ``None`` before any branch starts, so no
+    per-branch precompute is ever attempted for it -- see ``_index_one_branch``).
+    ``run()`` aggregates every branch with this flag set into one
+    run-completion WARNING.
     """
 
     branch: str
     status: Literal["indexed", "skipped", "conflict", "failed"]
     counts: IndexCounts | None = None
+    semantic_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,19 +309,24 @@ def run(
     max_repos: int = MAX_REPOS,
     reconcile_retired_fn: Callable[..., ReconcileCounts] = reconcile_retired_branches,
     reconcile_removed_fn: Callable[..., list[str]] = reconcile_removed_repos,
+    shas_fn: Callable[..., ContentShaSets] = read_indexed_shas,
+    extraction_pool: ExtractionPool | None = None,
 ) -> int:
     """Index every configured repo and return a process exit code (0 = all ok).
 
     Boundaries are injectable for tests: ``workspace_client`` (secret + config
     read), ``http_client`` (GitHub HTTP), ``engine`` (DB), ``index_fn`` (the
     store), ``embed_fn`` (semantic chunking), ``config_loader`` (so orchestration
-    tests need no SDK fake), and ``reconcile_retired_fn`` / ``reconcile_removed_fn``
+    tests need no SDK fake), ``reconcile_retired_fn`` / ``reconcile_removed_fn``
     (the storage primitives the post-fan-out checkpoint below invokes -- mirroring
-    ``index_fn``'s injection so reconciliation tests need no real Postgres either).
-    ``cfg`` defaults to the process-cached :func:`app.config.get_settings`, then any
-    ``semantic:`` fields in config.yaml are overlaid onto it before the worker clamp
-    and embedder build (config.yaml > env > default -- config.yaml is the job's
-    semantic-config surface; see :class:`indexer.repo_config.SemanticOverrides`).
+    ``index_fn``'s injection so reconciliation tests need no real Postgres either),
+    and ``extraction_pool`` (issue #108's shared symbol/edge-extraction pool --
+    mirroring ``owns_engine``/``owns_http``, a caller-supplied pool is never
+    shut down here). ``cfg`` defaults to the process-cached
+    :func:`app.config.get_settings`, then any ``semantic:`` fields in config.yaml
+    are overlaid onto it before the worker clamp and embedder build (config.yaml >
+    env > default -- config.yaml is the job's semantic-config surface; see
+    :class:`indexer.repo_config.SemanticOverrides`).
 
     ``resolve_repos`` is deliberately **not** injectable: the existing
     ``httpx.MockTransport`` seam already lets tests drive enumeration outcomes
@@ -360,10 +411,16 @@ def run(
     owns_engine = engine is None
     if engine is None:
         # The pool is DERIVED from the worker count, not a constant: each worker
-        # holds exactly one connection (one engine.connect() per repo, and the
-        # embed/chunk precompute happens before it), so pool_size == workers is
-        # exactly enough and max_overflow=0 turns a connection leak into a loud
-        # stall instead of silent pool growth. pool_timeout is SQLAlchemy's own
+        # holds at most ONE connection AT A TIME -- by sequencing, not by
+        # construction (issue #109 E7). On the delta-gate-open semantic path a
+        # worker opens a second, short-lived connection for the advisory
+        # shas_fn read (below), but closes it before the embed/chunk precompute
+        # and its own index_fn connection open -- see
+        # tests/unit/test_job.py::test_shas_fn_connection_closes_before_embedding_starts.
+        # So pool_size == workers is exactly enough and max_overflow=0 turns a
+        # connection leak into a loud stall instead of silent pool growth (a
+        # future change that opened both connections concurrently would need a
+        # bigger pool). pool_timeout is SQLAlchemy's own
         # default, spelled out HERE because max_overflow=0 is what makes it
         # observable -- a reader seeing the overflow ban must not have to go look
         # up how long the resulting stall lasts. Passing pool_size explicitly is
@@ -401,10 +458,15 @@ def run(
     # -- and how a shrunken disk becomes visible before it becomes an outage.
     ok = skipped = conflicts = failures = 0
     repo_outcomes: list[RepoOutcome] = []
+    degraded_branches: list[str] = []
     reconciliation_attempted = False
     reconciliation_failed = False
     reconcile_skip_reason = ""
     progress = ReconcileProgress()
+    # Computed BEFORE the try below (from the parameter, not the built value) so
+    # it stays defined even if disk_usage or pool construction never runs -- the
+    # finally block reads it unconditionally.
+    owns_pool = extraction_pool is None
     try:
         # Inside the try for the same reason as the stamp read below: shutil
         # .disk_usage raises if tmp is missing or unmounted, and above the try
@@ -419,6 +481,27 @@ def run(
             workers,
             REQUIRED_FREE_BYTES / 1e9,
         )
+
+        # Built once per run, shared across every repo worker below (issue
+        # #108). Wrapped in a bare `except Exception`, not a type list:
+        # NOTHING about this pool may ever fail the run -- build_extraction_pool
+        # already degrades its own internal failures (a bad preflight probe, an
+        # unavailable sandbox) to a WARNING plus an in-process pool, so this
+        # guard exists only for a truly unexpected failure in that derivation
+        # itself. `run()` has no handler around the disk-headroom block above
+        # either, so an uncaught escape here would propagate out of `run()` and
+        # fail the wheel task after the `finally` below -- this is what prevents
+        # that.
+        if extraction_pool is None:
+            try:
+                extraction_pool = build_extraction_pool(config)
+            except Exception:
+                logger.warning(
+                    "failed to build the shared extraction pool; indexing will "
+                    "run in-process for this run",
+                    exc_info=True,
+                )
+                extraction_pool = ExtractionPool(n_processes=0)
 
         # One batched read for the whole run, BEFORE fan-out. Inside the try so a
         # failure here still closes the http client and disposes the engine.
@@ -438,6 +521,8 @@ def run(
                     cfg=cfg,
                     embed_fn=embed_fn,
                     stamps=stamps,
+                    shas_fn=shas_fn,
+                    extraction_pool=extraction_pool,
                 ): entry
                 for entry in entries
             }
@@ -466,6 +551,8 @@ def run(
                     else:
                         ok += 1
                         assert outcome.counts is not None
+                        if outcome.semantic_degraded:
+                            degraded_branches.append(f"{entry.name}@{outcome.branch}")
                         logger.info(
                             "indexed %s@%s: files=%d symbols=%d edges=%d swept=%d",
                             entry.name,
@@ -514,6 +601,13 @@ def run(
                 entries=entries,
             )
     finally:
+        # Shut down BEFORE the http client/engine below, and only ours: an
+        # injected pool is the caller's to manage (mirrors owns_engine/owns_http).
+        # By this point the ThreadPoolExecutor `with` block above has already
+        # exited (every repo worker joined), so no branch holds a future against
+        # this pool -- the condition that makes shutdown(wait=True) safe.
+        if owns_pool and extraction_pool is not None:
+            extraction_pool.shutdown()
         if owns_http:
             http_client.close()
         if owns_engine:
@@ -529,11 +623,43 @@ def run(
         len(entries),
         time.monotonic() - run_started,
     )
+    # issue #109 AC3: peak RSS for this run, self (the main process, every repo
+    # worker thread) and children (the #108 extraction pool's worker processes,
+    # otherwise invisible from here) -- ru_maxrss is a high-water mark, in KB on
+    # Linux, so no delta/baseline subtraction is needed the way a local
+    # measurement script needs one against its own import-time baseline.
+    logger.info(
+        "peak rss: self=%d KB children=%d KB",
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+    )
     # Conflicts do NOT fail the run because they SELF-HEAL -- the stamp that
     # displaced them makes the next run re-index that branch unconditionally.
     # Note this trades a paging signal for one run of staleness on that branch;
     # the WARNING logged at the conflict site is the record. It is NOT that the
     # work was redundant.
+
+    # One aggregate, greppable WARNING for every branch that finished "indexed"
+    # with degraded semantic coverage this run (its precompute failed -- a
+    # chunk-cap breach or an embedder outage -- so its core index is current but
+    # its chunks are not). Under file-level delta indexing this gap is NOT
+    # self-healing on the next run (see indexer/store.py's module docstring and
+    # docs/runbooks/indexing-parallelism.md §4): only a changed file re-embeds,
+    # so a branch that never changes again would carry stale/missing chunks
+    # forever unless an operator clears its semantics stamp. The per-branch
+    # WARNING already logged at the precompute site is easy to miss in a large
+    # run's log; this line exists so the condition is greppable after the fact.
+    # Deliberately does NOT fail the run -- see the per-branch warning site for
+    # why this is an additive-layer failure, not a core-index one.
+    if degraded_branches:
+        logger.warning(
+            "%d branch(es) finished with degraded semantic coverage this run (chunk precompute "
+            "failed; core index is current, chunks are not, and delta indexing will NOT catch "
+            "them up on their own -- clear their repo_branches.index_semantics_version stamp to "
+            "force a full re-embed, see docs/runbooks/indexing-parallelism.md §4): %s",
+            len(degraded_branches),
+            ", ".join(sorted(degraded_branches)),
+        )
 
     # Exactly one reconciliation summary line, always after "indexing complete".
     # The failure/withheld path already logged its own ERROR incident line
@@ -790,8 +916,27 @@ def _precompute_chunk_writer(
     embedder itself. Raises ``ValueError`` if the repo's total chunk count exceeds
     ``max_chunks_per_repo`` (the documented hard ceiling, not a streaming bound
     -- see ``app.config.semantic_max_chunks_per_repo``).
+
+    ``files`` is whatever the caller decided needs vectors -- under file-level
+    delta indexing (``_index_one_branch``) that is every file the advisory
+    ``shas_fn`` read did NOT classify as unchanged, not necessarily every parsed
+    file in the branch. The closure below therefore closes over ``covered =
+    set(per_file)`` -- every path THIS call embedded, including zero-chunk files
+    -- and refuses to write chunks for any other path. This is defence-in-depth
+    for a path the single-writer-per-repo invariant says is unreachable:
+    ``write_chunks_batch`` deletes a file's chunk rows before inserting, so
+    calling it for a path this precompute never embedded would silently delete
+    that file's chunks rather than merely leave them stale. See
+    ``indexer/store.py``'s ``_union_membership`` for the authoritative-side
+    analogue of this guard.
+
+    The returned closure is called once per BATCH of files (a sequence of
+    ``(file_id, pf)`` pairs, per :data:`indexer.store.ChunkWriter`) -- the
+    ``covered`` guard is applied per pair, filtering the batch before one
+    :func:`indexer.chunk_store.write_chunks_batch` call for whatever survives.
     """
     per_file: dict[str, list[Chunk]] = {pf.path: list(iter_chunks(pf)) for pf in files}
+    covered = set(per_file)
     total = sum(len(chunks) for chunks in per_file.values())
     if total > max_chunks_per_repo:
         raise ValueError(
@@ -820,8 +965,23 @@ def _precompute_chunk_writer(
         ]
         i += len(chunks)
 
-    def chunk_writer(conn: Any, repo_id: int, file_id: int, pf: ParsedFile) -> None:
-        write_chunks(conn, file_id=file_id, chunks=by_path.get(pf.path, []))
+    def chunk_writer(conn: Any, repo_id: int, pairs: Sequence[tuple[int, ParsedFile]]) -> None:
+        rows: list[tuple[int, list[tuple[int, str, int, int, list[float]]]]] = []
+        for file_id, pf in pairs:
+            if pf.path not in covered:
+                # Unreachable while the single-writer invariant holds (see the
+                # docstring): index_repo only ever calls chunk_writer for a file
+                # this same precompute either embedded or classified
+                # membership-only (and index_repo's own _union_membership guards
+                # that case separately). Warn-and-skip rather than raise,
+                # matching this module's established additive-layer posture for
+                # the semantic path.
+                logger.warning(
+                    "no precomputed chunks for %s; leaving its chunk rows untouched", pf.path
+                )
+                continue
+            rows.append((file_id, by_path.get(pf.path, [])))
+        write_chunks_batch(conn, rows=rows)
 
     return chunk_writer
 
@@ -835,6 +995,8 @@ def _index_one(
     cfg: Settings,
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
+    shas_fn: Callable[..., ContentShaSets],
+    extraction_pool: ExtractionPool,
 ) -> RepoOutcome:
     """Run the full fetch -> parse -> symbols -> store pipeline for every branch of one repo.
 
@@ -860,6 +1022,8 @@ def _index_one(
             cfg=cfg,
             embed_fn=embed_fn,
             stamps=stamps,
+            shas_fn=shas_fn,
+            extraction_pool=extraction_pool,
         )
     finally:
         _repo_ctx.reset(token)
@@ -875,6 +1039,8 @@ def _index_one_inner(
     cfg: Settings,
     embed_fn: EmbedFn | None,
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
+    shas_fn: Callable[..., ContentShaSets],
+    extraction_pool: ExtractionPool,
 ) -> RepoOutcome:
     """The body of :func:`_index_one`, run with the repo log context already set.
 
@@ -887,7 +1053,15 @@ def _index_one_inner(
     """
     name = normalize_repo(entry.name)
     org, repo = name.split("/", 1)
+    # Timed with two plain locals off the same clock the per-branch PhaseTimer
+    # reads -- no timer is installed here, because these costs are REPO-scoped
+    # and belong to no branch's total (they are reported on the `finished` line
+    # below instead). Without them the default branch's resolve would show as
+    # `resolve=0.00s` on its phase line, and a glob-configured monorepo's
+    # paginated branch listing would appear in no field on no line at all.
+    resolve_started = now()
     default_branch, default_head_sha = resolve_ref(http_client, org, repo)
+    resolve_elapsed = now() - resolve_started
 
     # An override matched to THIS repo by resolve_repos wins outright over the global
     # cap -- it is not a floor/ceiling blend, since a repo big enough to need one
@@ -904,7 +1078,9 @@ def _index_one_inner(
     # The common case -- no branches: configured -- needs no GitHub branches API
     # call at all: resolve_branches ignores all_branches entirely when globs is
     # empty (it always resolves to just [default_branch]).
+    list_started = now()
     all_branches = list_branches(http_client, org, repo) if entry.branch_globs else []
+    list_elapsed = now() - list_started
     resolution = resolve_branches(
         default_branch, all_branches, sorted(entry.branch_globs), repo=name
     )
@@ -925,6 +1101,8 @@ def _index_one_inner(
             stamps=stamps,
             started=started,
             max_chunks_per_repo=max_chunks_per_repo,
+            shas_fn=shas_fn,
+            extraction_pool=extraction_pool,
         )
         for branch in resolution.branches
     ]
@@ -934,8 +1112,46 @@ def _index_one_inner(
     # assertions, and a nonzero-by-construction timing field would break them.
     # This is the instrument the "throughput measured on the first production
     # run" promise depends on -- without it that promise is unfalsifiable.
-    logger.info("finished %s in %.2fs", name, time.monotonic() - started)
+    # `resolve=`/`list=` are the repo-scoped costs that appear in no branch's
+    # `phase timing` total. Printed unconditionally (`list=0.00s` whenever the
+    # repo has no `branches:` globs and the endpoint is never called) so the line
+    # never drifts in shape. The elapsed value keeps its own time.monotonic()
+    # reading -- it is not reconciled against the parenthesised numbers.
+    logger.info(
+        "finished %s in %.2fs (resolve=%.2fs list=%.2fs)",
+        name,
+        time.monotonic() - started,
+        resolve_elapsed,
+        list_elapsed,
+    )
     return RepoOutcome(name=name, discovery_complete=resolution.complete, outcomes=outcomes)
+
+
+def _timed_items(
+    items: Iterable[tuple[ParsedFile, FileExtraction]], timer: PhaseTimer
+) -> Iterator[tuple[ParsedFile, FileExtraction]]:
+    """Charge each item's PRODUCTION to ``parse``, leaving its consumption to ``db``.
+
+    ``items`` is consumed lazily inside ``index_repo``'s open transaction (the
+    bounded-memory invariant), so timing ``index_fn`` alone fuses parse and db
+    into one number, and materializing the generator to separate them would break
+    that invariant. This wrapper times only the ``next()`` calls -- the walk, the
+    read, the decode, and the tree-sitter extraction -- so the DML between them
+    stays attributable to ``db``. Never build a list here.
+
+    The post-``StopIteration`` charge is not bookkeeping pedantry: on the
+    non-semantic path the final ``next()`` is where the directory walk finishes.
+    """
+    it = iter(items)
+    while True:
+        t0 = timer.clock()
+        try:
+            item = next(it)
+        except StopIteration:
+            timer.add("parse", timer.clock() - t0)
+            return
+        timer.add("parse", timer.clock() - t0)
+        yield item
 
 
 def _index_one_branch(
@@ -954,6 +1170,8 @@ def _index_one_branch(
     stamps: dict[tuple[str, str], tuple[str | None, int | None]],
     started: float,
     max_chunks_per_repo: int,
+    shas_fn: Callable[..., ContentShaSets],
+    extraction_pool: ExtractionPool,
 ) -> BranchOutcome:
     """Fetch, parse, and store ONE branch. Never raises -- every failure is classified.
 
@@ -962,16 +1180,60 @@ def _index_one_branch(
     A stored ``None`` version means the provenance of the stored index is
     unknown, so the branch is always re-indexed.
 
+    ``shas_fn`` is the ADVISORY copy of :func:`indexer.store.read_repo_content_shas`
+    (see that module's docstring for the authoritative one). It is called ONLY
+    when this branch's stored ``index_semantics_version`` already matches
+    :data:`app.db.models.INDEX_SEMANTICS_VERSION` -- the same gate ``index_repo``
+    applies inside its transaction, from data already in hand here -- and ONLY on
+    a separate, short-lived ``engine.connect()`` that closes before embedding
+    starts, never on a connection held across the embedder's network I/O. Its
+    result narrows the file list handed to ``_precompute_chunk_writer`` to every
+    file NOT already carried by this branch (changed/new *and* membership-only --
+    ``index_repo`` may reclassify a membership-only file as changed/new inside its
+    own transaction if the provenance gate fails there, so it must already have a
+    vector to attach). The two reads can only disagree if a second writer touched
+    this repo between them, which the single-writer-per-repo invariant (see the
+    module docstring) forbids; see ``indexer/store.py``'s ``_union_membership``
+    for the defence-in-depth guard on the authoritative side.
+
     ``max_chunks_per_repo`` is the caller's (``_index_one_inner``'s) already-resolved
     effective cap -- this repo's ``semantic_max_chunks_per_repo`` override if one
     matched, else ``cfg.semantic_max_chunks_per_repo``. Taken as a parameter rather
     than read from ``cfg`` directly so every branch of a repo enforces the SAME
     resolved cap without recomputing (or risking drift on) the override lookup.
+
+    Every phase of the indexed path is wall-clocked into ``timer`` and reported on
+    one ``phase timing`` line at the end (see the module docstring). ``timer`` is
+    also installed as the AMBIENT timer for the duration, which is how
+    ``indexer.store``'s sweep -- behind the ``index_fn`` seam, in another module --
+    lands in this branch's numbers without changing that seam's signature. The
+    ``finally: reset_timer(token)`` is mandatory for the same reason
+    ``_index_one``'s ``_repo_ctx`` reset is: ``ThreadPoolExecutor`` reuses worker
+    threads without resetting their context, so a leaked timer would attribute
+    this branch's sweep to the next task on this thread.
+
+    ``extraction_pool`` (issue #108) is the run-shared, ``spawn``-based process
+    pool ``indexer.extract_pool`` extraction runs through; both ``items``
+    expressions below call ``extraction_pool.stream(...)`` rather than
+    ``extract_file`` directly. A worker death raises
+    ``indexer.extract_pool.ExtractionPoolError`` out of that stream -- caught by
+    THIS function's existing broad ``except Exception`` below like any other
+    extraction failure, with no new ``except`` branch: legibility comes from
+    ``ExtractionPoolError``'s own message, not from special-casing it here.
     """
+    # NOT the `started` parameter: that one is set once per REPO and passed
+    # unchanged to every branch, so reusing it would make branch 2+ of a
+    # glob-configured repo report a repo-cumulative total and silently inflate
+    # `other` by every preceding branch's wall clock.
+    timer = PhaseTimer()
+    branch_started = timer.clock()
+    timer_token = install_timer(timer)
     try:
+        t0 = timer.clock()
         head_sha = (
             default_head_sha if is_default else resolve_branch_head(http_client, org, repo, branch)
         )
+        timer.add("resolve", timer.clock() - t0)
 
         # The skip seam: after the immutable HEAD SHA is known, before anything
         # is downloaded. Both halves must match -- a stored NULL version never does.
@@ -993,24 +1255,82 @@ def _index_one_branch(
             # being written to) and BEFORE the first byte is downloaded. Raising
             # here is caught below, costing this branch alone.
             assert_disk_headroom(tmp_path, repo=f"{name}@{branch}")
+
+            t0 = timer.clock()
             tar_path = download_tarball(http_client, org, repo, head_sha, tmp_path)
-            root = extract_tarball(tar_path, tmp_path / "extracted")
+            timer.add("download", timer.clock() - t0)
 
             chunk_writer: ChunkWriter | None = None
+            precompute_failed = False
             if cfg.semantic_enabled and embed_fn is not None:
                 # Chunking/embedding needs the full file list up front -- unlike
                 # the lazy items generator below, it cannot stream through
                 # index_repo's open transaction.
-                files = list(iter_source_files(root))
+                #
+                # This walk is charged to `parse` explicitly: it is the same
+                # stream + decompress + decode work that _timed_items charges on
+                # the non-semantic path, and leaving it unwrapped would dump the
+                # entire file-walk cost of the PRODUCTION (semantic-on) path into
+                # `other`, which is exactly the number this instrumentation
+                # exists to route work by. Since #106 it also carries the gzip
+                # decompression that used to be reported as its own `extract`
+                # phase -- there is no separate extraction step any more.
+                t0 = timer.clock()
+                files = list(iter_tar_source_files(tar_path))
+                timer.add("parse", timer.clock() - t0)
+
+                # In a `finally`, unlike every other phase wrap: the degrade path
+                # below still burned this time (a downed embedder can burn a lot
+                # of it before it gives up) and must still be reported. The
+                # advisory shas_fn read is charged here too, deliberately NOT as
+                # its own timed phase: it exists solely to decide what this block
+                # embeds, and #103's `phase timing` line is pinned exhaustive
+                # (eight fixed fields, tests/unit/test_job.py) -- adding a ninth
+                # field is out of this change's scope.
+                t0 = timer.clock()
                 try:
-                    chunk_writer = _precompute_chunk_writer(files, embed_fn, max_chunks_per_repo)
+                    files_to_embed = files
+                    if stamps.get((name.casefold(), branch), (None, None))[1] == (
+                        INDEX_SEMANTICS_VERSION
+                    ):
+                        # Delta gate open (same test index_repo will apply
+                        # authoritatively, from data already in hand): narrow to
+                        # every file this branch does not already carry. A short-
+                        # lived connection, closed before embedding starts --
+                        # never held across the embedder's network I/O.
+                        #
+                        # `_present` is discarded -- this module only ever needs
+                        # `carried` (job.py cannot replicate index_repo's
+                        # provenance-gate check anyway, and doesn't need to: any
+                        # not-carried file gets embedded here regardless of
+                        # whether index_repo later classifies it membership-only
+                        # or changed/new). shas_fn still computes and returns the
+                        # full-repo `present` set -- read_repo_content_shas'
+                        # signature is deliberately ONE shared query pair with
+                        # index_repo's authoritative read (see its docstring), so
+                        # this module pays for a second full-repo Index Only Scan
+                        # it doesn't use rather than forking the query. That cost
+                        # rides inside `embed=` on the phase timing line (see the
+                        # comment above), not broken out separately.
+                        with engine.connect() as shas_conn:
+                            carried, _present = shas_fn(shas_conn, name=name, branch=branch)
+                        files_to_embed = [
+                            pf for pf in files if (pf.path, content_sha(pf.content)) not in carried
+                        ]
+                    chunk_writer = _precompute_chunk_writer(
+                        files_to_embed, embed_fn, max_chunks_per_repo
+                    )
                 except Exception:
                     # The semantic layer is ADDITIVE: a chunk-ceiling breach, a downed embedder,
-                    # or a dim/count mismatch must not cost this branch its core index. Letting
-                    # it propagate would skip files/symbols AND the mark-and-sweep, silently
-                    # leaving the branch stale -- worse than stale chunks. Chunks catch up on
-                    # the next successful run; the failure is logged with a traceback, never
-                    # swallowed silently.
+                    # a dim/count mismatch, or a failure reading the advisory shas_fn projection
+                    # must not cost this branch its core index. Letting it propagate would skip
+                    # files/symbols AND the mark-and-sweep, silently leaving the branch stale --
+                    # worse than stale chunks. Under file-level delta indexing this is NOT
+                    # self-healing the way it was before: only a changed file re-embeds, so a
+                    # branch that never changes again carries this gap forever unless an
+                    # operator clears its semantics stamp (see run()'s aggregate WARNING and
+                    # docs/runbooks/indexing-parallelism.md §4). The failure is logged with a
+                    # traceback here too, never swallowed silently.
                     logger.warning(
                         "semantic precompute failed for %s@%s; indexing core corpus without chunks",
                         name,
@@ -1018,11 +1338,26 @@ def _index_one_branch(
                         exc_info=True,
                     )
                     chunk_writer = None
-                items = ((pf, extract_file(pf)) for pf in files)
+                    precompute_failed = True
+                finally:
+                    timer.add("embed", timer.clock() - t0)
+                items = extraction_pool.stream(files)
             else:
                 # Lazy generator: files stream through the open transaction (bounded memory).
-                items = ((pf, extract_file(pf)) for pf in iter_source_files(root))
+                # extraction_pool.stream() is itself pull-driven and single-consumer, so this
+                # stays lazy end to end -- no full materialization on the semantic-off path.
+                items = extraction_pool.stream(iter_tar_source_files(tar_path))
 
+            # Parse time is INSIDE the db window (items are produced lazily as
+            # index_repo consumes them), so `db` subtracts only the parse accrued
+            # DURING that window -- never the phase total, which on the semantic
+            # path already holds the eager walk above. `sweep` is windowed the
+            # same way for the same reason (store.py records it from inside
+            # index_fn) -- kept symmetric with `parse` so a future sweep call
+            # site outside this window can't silently mis-window `db`.
+            parse_before = timer.total("parse")
+            sweep_before = timer.total("sweep")
+            t0 = timer.clock()
             with engine.connect() as conn:
                 counts = index_fn(
                     conn,
@@ -1030,10 +1365,69 @@ def _index_one_branch(
                     branch=branch,
                     is_default=is_default,
                     head_sha=head_sha,
-                    items=items,
+                    items=_timed_items(items, timer),
                     chunk_writer=chunk_writer,
                 )
-        return BranchOutcome(branch=branch, status="indexed", counts=counts)
+            db_wall = timer.clock() - t0
+
+        # Emitted HERE -- after the TemporaryDirectory teardown (since #106 an
+        # rm -rf of one compressed tarball rather than a multi-GB extracted
+        # tree, but still time `other` must include) and from
+        # inside the worker, where _index_one's _repo_ctx still resolves the
+        # [%(repo)s] field. The drain loop on the main thread would render `[-]`.
+        #
+        # `index_fn` above already committed this branch's transaction -- `counts`
+        # is proof of that. This block is measurement ONLY, so it gets its own
+        # try/except: per timing.py's own principle ("instrumentation must never
+        # be able to fail the work it measures"), a bug here must degrade to a
+        # missing log line, never to reclassifying an already-committed branch as
+        # `failed` (which would also flip the run's exit code and gate off the
+        # post-fan-out reconciliation checkpoint, which requires zero failures).
+        try:
+            db = max(
+                0.0,
+                db_wall
+                - (timer.total("parse") - parse_before)
+                - (timer.total("sweep") - sweep_before),
+            )
+            total = timer.clock() - branch_started
+            other = max(
+                0.0,
+                total
+                - timer.total("resolve")
+                - timer.total("download")
+                - timer.total("parse")
+                - timer.total("embed")
+                - db
+                - timer.total("sweep"),
+            )
+            # One format string, no branches: a phase that did not run prints 0.00s
+            # rather than vanishing, so the line stays greppable and field-stable
+            # whether or not semantic indexing is on. That is a promise about one
+            # build's runs, NOT that the field set is immutable across releases:
+            # #106 removed `extract=` because the phase ceased to exist (the
+            # archive is streamed, never extracted), not because it could read
+            # zero. A field that can never be non-zero is dead weight that sends
+            # an operator hunting for a phase that is not there.
+            logger.info(
+                "phase timing %s@%s: total=%.2fs resolve=%.2fs download=%.2fs "
+                "parse=%.2fs embed=%.2fs db=%.2fs sweep=%.2fs other=%.2fs",
+                name,
+                branch,
+                total,
+                timer.total("resolve"),
+                timer.total("download"),
+                timer.total("parse"),
+                timer.total("embed"),
+                db,
+                timer.total("sweep"),
+                other,
+            )
+        except Exception:
+            logger.warning("phase timing unavailable for %s@%s", name, branch, exc_info=True)
+        return BranchOutcome(
+            branch=branch, status="indexed", counts=counts, semantic_degraded=precompute_failed
+        )
     except StaleIndexError as exc:
         # The repo_branches row for THIS branch changed under this worker, so
         # its whole transaction rolled back and THIS BRANCH IS NOT INDEXED.
@@ -1065,6 +1459,12 @@ def _index_one_branch(
     except Exception:
         logger.exception("failed to index %s@%s", name, branch)
         return BranchOutcome(branch=branch, status="failed")
+    finally:
+        # Mandatory, exactly like _index_one's _repo_ctx reset: ThreadPoolExecutor
+        # reuses worker threads without resetting their context, so a leaked timer
+        # would attribute this branch's sweep to the NEXT branch (or repo) that
+        # lands on this thread -- silently wrong numbers, which is worse than none.
+        reset_timer(timer_token)
 
 
 def _positive_int(raw: str) -> int:

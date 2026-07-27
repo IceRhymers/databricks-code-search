@@ -17,6 +17,40 @@ Deliberately skipped rather than failed when git or the base ref is unavailable
 (shallow clones, tarball checkouts, a worktree with no remote): a tripwire that
 fails spuriously on a developer laptop gets disabled, and a disabled tripwire
 guards nothing.
+
+``indexer/ingest.py`` (#106) joined the watch set once it became the
+production file source -- streaming tarball ingestion replaced
+``indexer/parse.py``'s ``iter_source_files`` as the caller of the extraction
+filter chain, and ``ingest.py`` also owns the ``lang``/``size`` derivation
+that ``indexer.store``'s delta gate relies on the tripwire to protect
+(``indexer/store.py``, the "two columns are deliberately NOT re-derived"
+note). Leaving it unwatched would point that part of the guard at dead code.
+``indexer/parse.py`` stays watched too: it still owns the production chunker
+(``iter_chunks``, called from ``indexer/job.py``) and the shared binary-sniff
+helper ``ingest.py`` imports, on top of its retained role as ``ingest.py``'s
+executable oracle -- only ``iter_source_files`` lost its production caller.
+
+**Expected false positive, not confined to a single future event.** Adding a
+new path to ``SEMANTICS_PATHS`` makes it an offender in any diff whose base
+predates the file's creation -- ``git diff --name-only`` lists ADDED files,
+not just changed ones. ``indexer/ingest.py`` postdates ``master`` (it was
+added by #106's first PR, which has not merged past
+``integration/indexer-performance``), so **every local run of this test on
+this branch or its descendants sees it as an offender today** -- not only
+the future diff that folds ``integration/indexer-performance`` into
+``master`` (#111). ``_base_ref()`` falls back to ``origin/master`` locally
+(there is usually no ``GITHUB_BASE_REF``), so this is the common case, not
+the rare one; CI is actually less likely to see it, since both workflows
+checkout at the default depth-1 and this test typically skips there instead
+of running. That is expected, not a regression, and not a reason to disable
+the test: resolve it via this tripwire's own documented escape below ("if
+this change genuinely cannot alter extraction output, say so in the PR AND
+ADJUST SEMANTICS_PATHS") -- the "say so in the PR" half only. Do NOT bump
+``INDEX_SEMANTICS_VERSION`` and do NOT remove ``indexer/ingest.py`` from
+``SEMANTICS_PATHS`` to silence it; the parity test
+(``tests/unit/test_ingest_parity.py``, which pins ``ingest.py`` against
+``parse.py`` field-for-field on the ``(path, lang, size, content)`` set) is
+what actually backs the "no output change" claim.
 """
 
 from __future__ import annotations
@@ -32,10 +66,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Modules that decide WHAT ends up in the index. A change to any of them can
 # alter extraction output for an unchanged commit, which is exactly the
 # condition the stored version stamp exists to detect.
+#
+# ``indexer/parse.py``'s ``iter_source_files`` keeps no production caller
+# after #106, but the module stays watched: it still owns the production
+# chunker (``iter_chunks``) and the shared binary sniff, on top of being
+# ``indexer/ingest.py``'s executable oracle. See the module docstring above
+# for why ``indexer/ingest.py`` joined this set and for the expected
+# same-branch false positive.
 SEMANTICS_PATHS = (
     "indexer/symbols.py",
     "indexer/parse.py",
     "indexer/languages.py",
+    "indexer/ingest.py",
 )
 
 # The constant lives in app/db/models.py (it is read by both indexer.store, which

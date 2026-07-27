@@ -32,6 +32,7 @@ from indexer.languages import (
     ParsedFile,
 )
 from indexer.store import StaleIndexError, _stamp_repo_branch, index_repo
+from indexer.timing import PhaseTimer, install_timer, reset_timer
 
 SCHEMA = "test_store"
 
@@ -135,14 +136,39 @@ def test_first_run_populates_and_stamps_commit(conn: Connection) -> None:
 
 @pytest.mark.integration
 def test_rerun_is_idempotent(conn: Connection) -> None:
+    """The first run stamps INDEX_SEMANTICS_VERSION, so the second run (identical
+    content, identical head_sha) hits the file-level delta gate: both files are
+    classified unchanged, so `symbols` in the returned IndexCounts is 0 (files
+    seen, not files re-inserted) -- not the pre-delta re-insert count of 2. See
+    test_rerun_is_idempotent_preserves_row_identity below for the stronger
+    row-identity property this test was originally reaching for.
+    """
     _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
     counts = _index_default(
         conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL)
     )
-    assert counts == IndexCounts(files=2, symbols=2, swept=0, edges=0)
+    assert counts == IndexCounts(files=2, symbols=0, swept=0, edges=0)
     assert _count(conn, "repos") == 1
     assert _count(conn, "files") == 2
     assert _count(conn, "symbols") == 2
+
+
+@pytest.mark.integration
+def test_rerun_is_idempotent_preserves_row_identity(conn: Connection) -> None:
+    """The stronger property test_rerun_is_idempotent was originally reaching
+    for: an unchanged re-run does not delete-and-reinsert ANYTHING -- files.id
+    and symbols.id survive byte-identical across the two runs (a delete-reinsert
+    would renumber the serials)."""
+    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
+    files_before = dict(conn.execute(text("SELECT path, id FROM files ORDER BY path")).all())
+    symbols_before = sorted(conn.execute(text("SELECT id FROM symbols")).scalars().all())
+    conn.rollback()
+
+    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
+    files_after = dict(conn.execute(text("SELECT path, id FROM files ORDER BY path")).all())
+    symbols_after = sorted(conn.execute(text("SELECT id FROM symbols")).scalars().all())
+    assert files_after == files_before
+    assert symbols_after == symbols_before
 
 
 @pytest.mark.integration
@@ -167,15 +193,56 @@ def test_mark_and_sweep_removes_deleted_file(conn: Connection) -> None:
     # (production hands a fresh engine.connect() per repo).
     conn.rollback()
 
-    # Re-run without util.py and with a new head SHA -> util.py is swept.
+    # Re-run without util.py and with a new head SHA -> util.py is swept. MAIN's
+    # content is identical across both runs, and the first run already stamped
+    # INDEX_SEMANTICS_VERSION, so the delta gate classifies MAIN unchanged: no
+    # symbol rewrite (symbols=0, not a re-insert count).
     counts = _index_default(conn, name="acme/widgets", head_sha="sha_second", items=_items(MAIN))
-    assert counts == IndexCounts(files=1, symbols=1, swept=1, edges=0)
+    assert counts == IndexCounts(files=1, symbols=0, swept=1, edges=0)
 
     assert _count(conn, "files", "path = 'util.py'") == 0
     assert _count(conn, "symbols", f"file_id = {removed_file_id}") == 0  # cascade
     assert _count(conn, "reference_edges", f"file_id = {removed_file_id}") == 0  # cascade
     assert _count(conn, "files") == 1
-    assert _count(conn, "files", "commit = 'sha_second'") == 1
+    # MAIN's row was classified unchanged (skipped), so its `commit` column stays
+    # at the FIRST run's SHA -- files.commit goes staler under delta indexing by
+    # design (no production read path resolves `commit:` from it; see
+    # indexer/store.py's index_repo docstring).
+    assert _count(conn, "files", "commit = 'sha_first'") == 1
+    assert _count(conn, "files", "commit = 'sha_second'") == 0
+
+
+@pytest.mark.integration
+def test_index_repo_records_the_sweep_phase(conn: Connection) -> None:
+    """The sweep duration reaches ``indexer.job``'s per-branch line ambiently.
+
+    ``index_repo`` returns a frozen ``IndexCounts`` and takes no timer parameter --
+    the sweep's cost travels out through the ``indexer.timing`` ContextVar instead,
+    which is what keeps the ``index_fn`` seam (and every fake of it) unchanged.
+    ``tests/unit/test_job.py`` pins the arithmetic against a fake ``index_fn``;
+    this pins the real cross-module wiring against the real sweep and real SQL.
+    """
+    _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(MAIN, UTIL))
+    conn.rollback()
+
+    timer = PhaseTimer()
+    token = install_timer(timer)
+    try:
+        # Re-run without util.py at a new SHA: the same scenario as
+        # test_mark_and_sweep_removes_deleted_file, so the counts are unchanged
+        # (MAIN classified unchanged under the delta gate -> symbols=0).
+        counts = _index_default(
+            conn, name="acme/widgets", head_sha="sha_second", items=_items(MAIN)
+        )
+    finally:
+        reset_timer(token)
+
+    assert counts == IndexCounts(files=1, symbols=0, swept=1, edges=0)
+    assert timer.total("sweep") > 0.0
+    # index_repo measures the sweep and nothing else -- every other phase is
+    # job.py's to record.
+    assert timer.total("db") == 0.0
+    assert timer.total("parse") == 0.0
 
 
 @pytest.mark.integration
@@ -191,8 +258,10 @@ def test_sweep_is_repo_scoped(conn: Connection) -> None:
     conn.rollback()
 
     # Re-index A without util.py at a new SHA -> A's util.py swept, B untouched.
+    # MAIN unchanged under the delta gate (A's first run already stamped
+    # INDEX_SEMANTICS_VERSION) -> symbols=0, same as the tests above.
     counts = _index_default(conn, name="acme/a", head_sha="a_second", items=_items(MAIN))
-    assert counts == IndexCounts(files=1, symbols=1, swept=1, edges=0)
+    assert counts == IndexCounts(files=1, symbols=0, swept=1, edges=0)
 
     assert _count(conn, "files", "repo_id = (SELECT id FROM repos WHERE name = 'acme/b')") == (
         b_files_before
@@ -234,6 +303,17 @@ def test_reindex_replaces_stale_edges_for_the_same_file(conn: Connection) -> Non
     deleted and reinserted, not accumulated -- proven by driving the two runs'
     ``ex.edges`` directly rather than depending on the real extractor to disagree
     with itself on unchanged content.
+
+    This is precisely the case the file-level delta gate (#104) would otherwise
+    skip: identical content_sha, different extraction output. In production that
+    combination can only arise from an extractor change, which mandates an
+    INDEX_SEMANTICS_VERSION bump and therefore closes the gate on its own -- so
+    forcing it closed here (the same ``UPDATE repo_branches SET
+    index_semantics_version = NULL`` idiom as
+    test_legacy_null_semantics_version_is_rewritten) is faithful to production,
+    not a workaround. This is the "unconditional-delete guard" and it must keep
+    its ORIGINAL assertion, not a relaxed one -- see the plan for issue #104,
+    §2.6a.
     """
     symbol = ExtractedSymbol("f", "function", 1, 3)
     content = "def f():\n    target()\n    return 1\n"
@@ -246,7 +326,8 @@ def test_reindex_replaces_stale_edges_for_the_same_file(conn: Connection) -> Non
     )
     file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
     assert _count(conn, "reference_edges", f"file_id = {file_id}") == 1
-    conn.rollback()
+    conn.execute(text("UPDATE repo_branches SET index_semantics_version = NULL"))
+    conn.commit()
 
     second_edge = ExtractedEdge(kind="call", target="new_target", line=2, enclosing=symbol)
     _index_default(
@@ -270,6 +351,15 @@ def test_reindex_replaces_stale_edges_for_the_same_file(conn: Connection) -> Non
 
 @pytest.mark.integration
 def test_reindex_with_identical_items_does_not_duplicate_edges(conn: Connection) -> None:
+    """The delete-before-insert idempotency of the edge writer, proven by forcing
+    the delta gate CLOSED (the same idiom as the two guard tests above) so the
+    second run genuinely re-executes the write path rather than classifying
+    main.py unchanged and skipping it -- which would make the `== 1` assertion
+    pass vacuously (nothing touched at all) rather than proving delete-then-
+    insert doesn't duplicate. Without this the first run's first-index-ever
+    baseline (version None) makes run 2's baseline INDEX_SEMANTICS_VERSION, and
+    the delta gate would otherwise open and skip main.py entirely.
+    """
     symbol = ExtractedSymbol("f", "function", 1, 3)
     item = (
         "main.py",
@@ -278,7 +368,8 @@ def test_reindex_with_identical_items_does_not_duplicate_edges(conn: Connection)
         [ExtractedEdge(kind="call", target="helper", line=2, enclosing=symbol)],
     )
     _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
-    conn.rollback()
+    conn.execute(text("UPDATE repo_branches SET index_semantics_version = NULL"))
+    conn.commit()
     _index_default(conn, name="acme/widgets", head_sha="sha_first", items=_items(item))
 
     file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
@@ -293,6 +384,12 @@ def test_reindex_to_zero_edges_sheds_all_rows(conn: Connection) -> None:
     upsert resolves to the SAME ``file_id`` -- isolating the write-side guard
     (``ex.edges`` empty must still run the delete) from the unrelated
     delete-and-reinsert-under-a-new-file-id path already covered above.
+
+    Same rationale as test_reindex_replaces_stale_edges_for_the_same_file: this
+    is identical content_sha with divergent extraction output, which in
+    production can only happen via an extractor change (mandating a semantics
+    version bump). The gate is forced closed here rather than the expected
+    values relaxed -- see the plan for issue #104, §2.6a.
     """
     symbol = ExtractedSymbol("f", "function", 1, 3)
     content = "def f():\n    helper()\n    return 1\n"
@@ -305,7 +402,8 @@ def test_reindex_to_zero_edges_sheds_all_rows(conn: Connection) -> None:
     )
     file_id = conn.execute(text("SELECT id FROM files WHERE path = 'main.py'")).scalar_one()
     assert _count(conn, "reference_edges", f"file_id = {file_id}") == 1
-    conn.rollback()
+    conn.execute(text("UPDATE repo_branches SET index_semantics_version = NULL"))
+    conn.commit()
 
     # Same content (same file_id) but this run's extraction yields zero edges.
     counts = _index_default(
@@ -565,7 +663,8 @@ def test_per_branch_cas_resume_is_independent_per_branch(conn: Connection) -> No
     conn.rollback()
 
     # Re-indexing 'a' again must succeed against its own baseline, unaffected by
-    # 'b' having indexed in between.
+    # 'b' having indexed in between. MAIN unchanged under the delta gate ('a's
+    # first run already stamped INDEX_SEMANTICS_VERSION) -> symbols=0.
     counts = index_repo(
         conn,
         name="acme/widgets",
@@ -574,7 +673,7 @@ def test_per_branch_cas_resume_is_independent_per_branch(conn: Connection) -> No
         head_sha="sha_a2",
         items=_items(MAIN),
     )
-    assert counts == IndexCounts(files=1, symbols=1, swept=0, edges=0)
+    assert counts == IndexCounts(files=1, symbols=0, swept=0, edges=0)
 
     stamps = dict(conn.execute(text("SELECT branch, last_indexed_commit FROM repo_branches")).all())
     assert stamps == {"a": "sha_a2", "b": "sha_b"}

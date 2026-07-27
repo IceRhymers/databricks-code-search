@@ -150,6 +150,14 @@ class SemanticOverrides(BaseModel):
     block only moves the second operand. Setting both is coherent: raise the floor
     for the whole corpus here, spot-override the outliers in the map.
 
+    ``embedding_concurrency`` (#107) bounds in-flight embedding requests per
+    worker; ``databricks_embedder`` clamps it to the batch count, so a value
+    larger than the number of batches a repo produces degrades to that count
+    rather than spawning a thread per batch. The ``le=8`` ceiling here matches
+    the existing ``index_concurrency`` bounded-field pattern -- see
+    ``app.config.Settings.semantic_embedding_concurrency`` for the in-flight
+    arithmetic against the SDK's 20-connection pool.
+
     Two ``Settings`` semantic knobs are deliberately absent, because exposing them
     would be a lie or a footgun: ``semantic_embedding_dim`` is pinned to
     ``SEMANTIC_EMBEDDING_DIM`` (the ``chunks.embedding`` column type and the 0004
@@ -180,6 +188,7 @@ class SemanticOverrides(BaseModel):
     embedding_model: str | None = Field(default=None, min_length=1)
     embedding_batch_size: int | None = Field(default=None, ge=1)
     embedding_timeout_s: float | None = Field(default=None, gt=0)
+    embedding_concurrency: int | None = Field(default=None, ge=1, le=8)
 
     @field_validator("embedding_endpoint")
     @classmethod
@@ -232,6 +241,7 @@ class SemanticOverrides(BaseModel):
             "embedding_model": "semantic_embedding_model",
             "embedding_batch_size": "semantic_embedding_batch_size",
             "embedding_timeout_s": "semantic_embedding_timeout_s",
+            "embedding_concurrency": "semantic_embedding_concurrency",
         }
         return {
             settings_field: value
@@ -245,26 +255,40 @@ class RepoConfig(BaseModel):
 
     ``index_concurrency`` is how many repos the indexing job works on at once.
     **The default of 4 is a disk bound, not a CPU one.** Each in-flight worker
-    holds ``MAX_TARBALL_BYTES`` (500 MB) *and* ``MAX_EXTRACTED_BYTES`` (2 GB)
-    alive simultaneously -- the downloaded tarball stays inside the worker's
-    ``TemporaryDirectory`` while the extraction runs beside it, so peak usage is
-    2.5 GB per worker: 10 GB at the default 4, 20 GB at the ceiling of 8.
+    holds ``MAX_TARBALL_BYTES`` (500 MB) inside its ``TemporaryDirectory``, and
+    that is the whole of its on-disk footprint: since #106 the archive is
+    streamed once in memory by ``indexer.ingest.iter_tar_source_files`` and never
+    extracted, so ``MAX_EXTRACTED_BYTES`` (2 GB, now in ``indexer.ingest``) caps
+    WORK rather than storage and does not add to this. Peak usage is 0.5 GB per
+    worker: 2 GB at the default 4, 4 GB at the ceiling of 8. (#106 lowered those
+    numbers 5x but deliberately left the default alone; #109 re-derives it.)
 
     **Returns at the ceiling are sublinear.** Symbol extraction does not
-    parallelise (measured at 0.95x on 4 threads), so Amdahl's law caps the
-    speedup well below 8x while the disk cost stays a hard linear 20 GB. Raise
-    it only knowing that trade.
+    parallelise across THREADS (measured at 0.95x on 4 threads -- the tree walk
+    is GIL-serialized) -- which is exactly why extraction now runs in a shared
+    process pool instead (``extract_processes``, below); that pool is decoupled
+    from ``index_concurrency`` entirely. Raise ``index_concurrency`` only
+    knowing you are buying disk-bound repo fan-out, not extraction throughput.
 
-    When semantic indexing is on, the effective worker count is clamped to 2 by
-    :func:`effective_workers`. That clamp is a **memory** bound, not a CPU one:
-    embedding materialises a whole repo's chunks in memory (~0.5-0.8 GB per
-    worker; 260 MB of vectors alone at the 8000-chunk ceiling).
+    When semantic indexing is on, the effective worker count is clamped to 4 by
+    :func:`effective_workers` (issue #109 re-derived this from 2: a measured
+    ``P_worst`` model -- ``(alpha+gamma)`` bytes-materialized-per-source-byte
+    coefficients, measured resident vector cost, #108's per-process RSS, and a
+    measured container memory ceiling -- showed N=4 clears 0.7x the container
+    budget with margin, and two live-job runs at N=4 confirmed it empirically:
+    peak self+children RSS landed at ~83% of budget, actually MORE comfortable
+    than N=2's own ~90%. See docs/perf/issue-109-measurements.md). That clamp is
+    still a **memory** bound, not a CPU one: embedding materialises a whole
+    repo's chunks in memory. Per-chunk vector cost is ~32 KB structural (dim=1024
+    Python float-list storage) but ~40.1 KB RESIDENT (measured; pymalloc
+    overhead/fragmentation) -- use the resident figure for headroom arithmetic --
+    so 313 MiB of vectors alone at the 8000-chunk ceiling.
 
     ``semantic_max_chunks_per_repo`` (the per-repo MAP) overrides that global
     8000-chunk ceiling for individual repos named here, without moving the global
-    default. It does NOT relax the 2-worker semantic clamp above -- a large
+    default. It does NOT relax the 4-worker semantic clamp above -- a large
     override still multiplies the per-worker memory cost of whichever of the (at
-    most 2) concurrent semantic workers happens to be indexing that repo.
+    most 4) concurrent semantic workers happens to be indexing that repo.
 
     The similarly-named ``semantic.max_chunks_per_repo`` (inside the ``semantic:``
     block, a single INT) moves that GLOBAL ceiling itself for the whole job. The
@@ -273,11 +297,25 @@ class RepoConfig(BaseModel):
     the job resolves ``entry.semantic_max_chunks or cfg.semantic_max_chunks_per_repo``
     and the ``semantic:`` block only supplies the second operand -- see
     :class:`SemanticOverrides`.
+
+    ``extract_processes`` (#108) sizes the shared, ``spawn``-based process pool
+    ``indexer.extract_pool`` runs symbol/edge extraction through -- one pool per
+    run, shared across every ``index_concurrency`` repo worker, so a single
+    giant repo's files parse on every available core rather than one thread's
+    worth. It is a CPU knob, entirely independent of ``index_concurrency``'s
+    disk bound above. ``None`` (the default) derives from the runtime:
+    affinity/cgroup-aware CPU count, clamped to 8 -- matching every other
+    parallelism knob in this repo (``index_concurrency``,
+    ``SemanticOverrides.embedding_concurrency``). Setting this to ``1`` restores
+    fully serial, in-process extraction and spawns no process pool at all --
+    the rollback switch, exercised the same way #107's
+    ``embedding_concurrency: 1`` is.
     """
 
     version: Literal[1]
     connections: list[Connection] = Field(min_length=1)
     index_concurrency: int = Field(default=4, ge=1, le=8)
+    extract_processes: int | None = Field(default=None, ge=1, le=8)
 
     # Per-repo override of Settings.semantic_max_chunks_per_repo (app/config.py, default
     # 8000), keyed by repo. Absent (the default) -> no repo gets an override, and
@@ -325,11 +363,17 @@ class RepoConfig(BaseModel):
 def effective_workers(config: RepoConfig, *, semantic_enabled: bool) -> int:
     """Worker-pool size for a run, applying the semantic memory clamp.
 
+    The clamp is 4 (issue #109; previously 2 -- see :class:`RepoConfig`'s
+    docstring for the re-derivation and empirical Arm A/B confirmation). It is a
+    ceiling, never a floor: an ``index_concurrency`` below the clamp passes
+    through unchanged, so N=3 (or any other legal value) is a real, reachable
+    ``effective_workers`` outcome, not just N in {1, 2, 4}.
+
     Takes a plain ``bool`` rather than ``Settings`` so this module keeps its
     import-light property (see the module docstring).
     """
     if semantic_enabled:
-        return min(config.index_concurrency, 2)
+        return min(config.index_concurrency, 4)
     return config.index_concurrency
 
 

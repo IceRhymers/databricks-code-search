@@ -114,21 +114,200 @@ of their own. Records emitted outside a worker (config resolution, the drain
 loop, third-party libraries) carry `-`.
 
 ```
-INFO indexer.job [-]: local disk at /tmp: 41.2 GB free of 64.0 GB total; 4 worker(s) x 2.5 GB peak
+INFO indexer.job [-]: local disk at /tmp: 41.2 GB free of 64.0 GB total; 4 worker(s) x 0.5 GB peak
 INFO indexer.fetch [acme/widgets]: ...
-INFO indexer.job [acme/widgets]: finished acme/widgets in 71.30s
-INFO indexer.job [acme/gadgets]: skipped acme/gadgets: already indexed at abc123 (semantics v1) in 0.41s
+INFO indexer.job [acme/widgets]: phase timing acme/widgets@main: total=204.92s resolve=0.00s download=12.10s parse=31.00s embed=88.20s db=64.50s sweep=0.30s other=8.82s
+INFO indexer.job [acme/widgets]: finished acme/widgets in 205.34s (resolve=0.42s list=0.00s)
+INFO indexer.job [acme/gadgets]: skipped acme/gadgets@main: already indexed at abc123 (semantics v1) in 0.41s
 ```
 
 **To find the giant:** grep for `finished .* in` and sort by the elapsed number.
 Wall-clock for the whole run is bounded below by the single slowest repo, so if
 one repo dominates, raising `index_concurrency` will not help — that is Amdahl's
 law asserting itself at the repo level, and the fix is to exclude the repo or
-accept the duration.
+accept the duration. **Still true for `index_concurrency` specifically** — but
+since #108 a single dominant repo is no longer bounded by one thread's `parse`
+time: its files parse on every `extract_processes` core via the shared
+extraction pool (§3), so raising *that* knob can move the giant's own duration,
+even though raising `index_concurrency` cannot.
 
 **To decide whether tuning is worth it:** compare the total on the completion
 line against the sum of the per-repo elapsed times. If the total is already
 close to the slowest single repo, the pool is not the bottleneck.
+
+### 2.1 Finding the dominant phase, not just the dominant repo
+
+Every **indexed** branch emits one `phase timing` line accounting for its entire
+wall clock. Skipped, failed, and conflicted branches emit none — there is nothing
+to attribute.
+
+```
+grep 'phase timing' run.log            # one line per indexed branch
+```
+
+The eight fields are fixed, always present, always in this order, always `%.2fs`.
+A phase that did not run prints `0.00s` rather than disappearing, so the line
+never changes shape between a semantic-on and a semantic-off run and every grep
+you write keeps working. Read the largest field; that is the branch's bottleneck.
+
+(There used to be a ninth, `extract=`. #106 removed the phase itself — the
+tarball is streamed once, in memory, and never extracted — so the field was
+deleted rather than pinned at `0.00s`. The "prints `0.00s` rather than
+disappearing" rule is about one build's semantic-on vs semantic-off runs, not a
+promise that the field set never changes across releases.)
+
+| Dominant phase | What it means | Which issue addresses it |
+|---|---|---|
+| `download` | archive I/O bound | — (the decompression it used to be paired with is now fused into `parse`, #106) |
+| `parse` | GIL-bound tree-sitter extraction — **plus, since #106, the archive's gzip decompression, tar-stream read and UTF-8 decode**, which used to be the separate `extract=` field | #108 (process-pool extraction) addresses the tree-sitter half only |
+| `embed` | serial AI Gateway round trips | #107 (concurrent embedding) |
+| `db` | round trips for the batch's changed/new files, plus one Postgres-side sequential scan per file for its symbol delete (see §2.3) | #105 (batched writes) — landed; §2.3 |
+| any of the above, on **unchanged** content | redundant work | #104 (file-level delta indexing) |
+
+`#104` narrows the **db** and **embed** costs to a branch's actual delta, not
+its size — but it does NOT touch `parse`: extraction still runs on every
+file every run (tree-sitter must produce a `FileExtraction` before
+`index_repo` can classify it, and `index_repo`'s classification happens
+*downstream* of extraction — the `FileExtraction` for an unchanged file is
+computed and then discarded), so an all-unchanged branch on a large repo still
+pays its full `download`+`parse` cost. `#108` (process-pool extraction) makes
+that cost cheaper by spreading it across cores — it does NOT skip it: every
+file is still parsed every run, including the unchanged ones. See
+`indexer.store`'s `delta write set …` line (below) to tell "this branch is
+genuinely mostly-new" from "this branch is mostly-unchanged but still parsing
+everything on every core" — deferring extraction past classification for the
+unchanged fraction is a real, larger follow-up win, deliberately left out of
+`#108`'s scope (it would change `index_repo`'s `items` contract).
+
+Five fields need interpretation before you act on them:
+
+- **`parse=` can RISE on a single branch after #108, even though the RUN's
+  total wall clock falls.** The shared extraction pool (§3) is shared across
+  every `index_concurrency` repo worker, so time a branch spends blocked in
+  `ExtractionPool.stream()` now includes queueing behind OTHER branches'
+  batches, not just this branch's own extraction. Reading one branch's `parse=`
+  in isolation and comparing it to a pre-#108 run will therefore sometimes look
+  like a regression when it is not — compare **run totals and the dominant
+  repo** instead (see `docs/perf/issue-108-measurements.md` for the shape of
+  that comparison).
+- **`resolve=0.00s` on a default branch is expected, not a bug.** That branch's
+  HEAD SHA came from the repo-level resolve, which happens once per repo outside
+  every branch's total and is reported on the repo's `finished` line as
+  `resolve=`. The `list=` on the same line is the branch-listing API call, which
+  is `0.00s` unless the repo has `branches:` globs configured (it is not called
+  at all otherwise) and which is paginated — on a monorepo with hundreds of
+  branches it is a real, and otherwise invisible, cost. The elapsed value in
+  `finished … in Xs` is measured on its own clock and is deliberately not
+  reconciled against the parenthesised numbers.
+- **`other=` is the unattributed residual**, `total` minus every measured phase,
+  clamped at zero. It covers the temp-dir teardown plus the pre-flight disk
+  check. Since #106 that teardown is an `rm -rf` of one compressed tarball, not
+  of a freshly extracted multi-GB tree, so `other` shrinks materially on large
+  repos — if you are reading an old run's numbers, do not go hunting for a
+  teardown cost that no longer exists. It exists so the line has no silently
+  missing time; a large `other` means something real is happening outside every
+  instrumented phase and is worth chasing.
+- **`embed=` covers chunking as well as the network.** It spans `iter_chunks`
+  (CPU/GIL-bound) *and* the serial AI Gateway round trips. #107 addresses only
+  the round trips, so before routing work there, confirm the phase is
+  network-bound rather than chunking-bound (a follow-up may split it into
+  `chunk=`/`embed=`).
+- **`db=` excludes parse and sweep, but the walk still happens inside the
+  transaction.** Files stream lazily through `index_repo`'s open transaction for
+  bounded memory, so file production is timed separately and subtracted from
+  `db`; the sweep is subtracted too. On the **non-semantic** path, though, the
+  file walk itself materializes inside that open transaction — since #106 that
+  is the tar stream (`ingest.py`), not `parse.py`'s `rglob`, on the first item.
+  That is long-standing behavior which this instrumentation merely makes visible
+  for the first time — it is not a new regression. What #106 *did* move into that
+  window is **archive validation**: the decompression-bomb cap, the
+  exactly-one-top-level-dir check, member-name and link-target safety, and any
+  `tarfile` corruption error are now raised as the stream is consumed rather than
+  before the connection is taken. A malformed archive therefore surfaces as a
+  rolled-back transaction and one briefly-held pooled connection instead of a
+  pre-connection failure. **The branch-level outcome is unchanged** —
+  `failed`, exit code non-zero, nothing written. On the semantic (production)
+  path nothing moved at all: the file list is materialized up front, so the
+  archive is fully validated before any connection is opened.
+
+### 2.2 The delta write set line (#104)
+
+Every `index_repo` call also emits one `indexer.store` INFO line, immediately
+before the sweep, in **both** the gate-open and gate-closed cases — one format
+string, no conditional fields, so it stays greppable either way:
+
+```
+INFO indexer.store [acme/widgets]: acme/widgets@main: delta write set 412/30214 files (unchanged=29790 membership=12, semantics gate open)
+INFO indexer.store [acme/gadgets]: acme/gadgets@main: delta write set 812/812 files (unchanged=0 membership=0, semantics gate closed: stored v3 != v4)
+```
+
+`unchanged` files write nothing at all (no file upsert, no symbol/edge
+delete-reinsert, no chunk write) and are never re-embedded. `membership` files
+are already stored under another branch and only need their `branches` array
+unioned in, plus a chunk write if semantic is on (see §4's accepted
+regressions). The leading fraction is `(changed/new) / (total seen)`. The gate
+is per-BRANCH: it opens only once that branch's own `repo_branches` stamp is
+at the current `INDEX_SEMANTICS_VERSION` — a branch's first run, or any run
+after a semantics bump, always shows `semantics gate closed`.
+
+```
+grep 'delta write set' run.log         # one line per index_repo call
+```
+
+A branch stuck at a low `unchanged=` fraction run after run either genuinely
+churns every run (nothing to fix) or has drifted out of delta eligibility —
+check its `repo_branches.index_semantics_version` against the current
+`INDEX_SEMANTICS_VERSION` and whether a sibling branch is stale (§4's
+provenance gate).
+
+### 2.3 Batched writes (#105)
+
+`index_repo`'s changed/new file loop no longer issues 5–7 statements per file
+(a file upsert, a symbol delete-then-conditional-insert, an edge
+delete-then-conditional-insert, and an optional chunk write). It accumulates
+files into a batch and flushes once the batch reaches whichever bound trips
+first — `_BATCH_MAX_FILES` (500 files) or `_BATCH_MAX_CONTENT_BYTES` (8 MiB of
+`pf.size`) — plus once more after the loop for whatever remains. Each flush
+issues ONE multi-row `files` upsert, ONE `DELETE ... WHERE file_id = ANY(...)`
+each for `symbols`/`reference_edges` over the whole batch, a param-budgeted
+bulk insert for each, and ONE `chunk_writer` call for the batch. The
+membership-only class (already a single `UPDATE ... RETURNING` per branch)
+gained nothing new to batch — its own chunk write collapsed from one call per
+file to one call for the whole class as part of the same change. This is
+invisible in the corpus: a batched write and a per-file write produce a
+byte-identical `files`/`symbols`/`reference_edges` corpus (verified across
+`_BATCH_MAX_FILES` ∈ {1, 2, 7, 500} and against the pre-#105 implementation
+directly) — there is no new log line, and no existing line's format changed.
+
+**`db=` on the `phase timing` line is the observable.** Round trips per
+changed/new file drop from 3–7 to a fraction of one; on a branch that is
+mostly re-writing content (a first index, or the first full re-index after an
+`INDEX_SEMANTICS_VERSION` bump), that collapses most of `db=`'s protocol-chatter
+component. It does **not** collapse `db=` to zero: one component of `db=` is
+CPU/IO-bound, not round-trip-bound, and batching does not touch it — `symbols`
+carries no index on `file_id` (`app/db/models.py`; `reference_edges` has
+`ix_reference_edges_file_id`, `symbols` has nothing), so `DELETE FROM symbols
+WHERE file_id = ANY(...)` is still a sequential scan of the whole `symbols`
+table per flush, just one scan per up-to-500 files instead of one per file.
+Adding that index is tracked separately (a migration, deliberately kept out of
+this change so it stays a zero-schema-change, `git revert`-safe deploy) and
+would make this component cheaper too, independent of batch size.
+
+**The win concentrates on a first index or a post-bump full reindex.** Once a
+branch is past its first run, file-level delta indexing (#104) already skips
+`db` work entirely for unchanged content — batching only ever helps the
+changed/new fraction that #104 leaves behind, so a branch with a small,
+steady delta was already cheap and will not visibly move on this line.
+
+**The batch bounds are source constants, not a config knob.** `_BATCH_MAX_FILES`
+and `_BATCH_MAX_CONTENT_BYTES` live in `indexer/store.py`, per this repo's
+"guardrail constants with config-level fixes, not override flags" convention
+(`indexer/AGENTS.md`). Raising `_BATCH_MAX_FILES` is a deploy, not a runtime
+toggle, and is bounded by libpq's Bind-message parameter ceiling
+(`_BATCH_MAX_FILES * _FILE_UPSERT_COLUMNS < 65535`, asserted at import time).
+`_BATCH_MAX_FILES = 1` degrades the write path back to per-file statement
+counts — useful for bisecting a suspected batching regression locally, but a
+source edit and redeploy, never a 2am incident-response lever.
 
 ---
 
@@ -138,37 +317,192 @@ close to the slowest single repo, the pool is not the bottleneck.
 |---|---|---|
 | `index_concurrency` | 1..8, default **4** | Repos in flight |
 | `MAX_TARBALL_BYTES` | 500 MB | The compressed download, per worker |
-| `MAX_EXTRACTED_BYTES` | 2 GB | The uncompressed tree, per worker |
+| `MAX_EXTRACTED_BYTES` | 2 GB | The streamed uncompressed content, per branch |
+| `extract_processes` (#108) | 1..8, default: derived (affinity/cgroup, capped 8) | Symbol/edge extraction worker processes, shared across ALL `index_concurrency` repo workers |
 
-The two byte caps **sum**, they do not `max()`: the tarball stays on disk inside
-the worker's temp directory while the extraction grows beside it. Peak local
-disk is therefore:
+Only the first of the two byte caps is a **disk** cap. Since #106 the tarball is
+streamed once, in memory, and is never extracted, so `MAX_EXTRACTED_BYTES` is a
+**work** cap — a decompression-bomb guard on how much content one branch may pull
+out of its archive — and it lives in `indexer/ingest.py`, beside its only
+consumer, rather than in `indexer/fetch.py`. #109 re-derived both this and
+`semantic_max_chunks_per_repo`'s global default as **memory** limits (pinned at
+the N=2 operating point, to avoid the circularity of solving for `B` from a
+model whose dominant term is `B`): a derived breach-regime ceiling of ~880 MiB
+(vs. the current 2 GB) and a derived chunk-cap ceiling of ~73,300 chunks (vs.
+the current 8000). **Neither was changed**: no repo in the #109 measurement
+corpus approached either the current or the derived byte ceiling (largest
+observed branch: ~31.5 MiB, ~3.6% of the derived bound), so this run gives no
+empirical signal either way, and lowering `MAX_EXTRACTED_BYTES` closes the
+whole run's reconciliation checkpoint on breach — too large a blast radius to
+change on an untested corpus. Both derived values are recorded here and in
+`docs/perf/issue-109-measurements.md` for the next time this needs re-deriving.
+The two therefore no longer sum: the compressed tarball is the only artifact on
+disk, so peak local disk is `index_concurrency` × 500 MB:
 
 | `index_concurrency` | Peak local disk |
 |---|---|
-| 1 | 2.5 GB |
-| 2 | 5 GB |
-| **4 (default)** | **10 GB** |
-| 8 (ceiling) | 20 GB |
+| 1 | 0.5 GB |
+| 2 | 1 GB |
+| **4 (default)** | **2 GB** |
+| 8 (ceiling) | 4 GB |
 
-**Returns at the ceiling are sublinear; the disk cost is not.** Symbol
-extraction was measured at **0.95x on 4 threads** — the tree walk is
-GIL-serialized and is ~56% of extraction time, so Amdahl's law caps the speedup
-well below 8x. Meanwhile the 20 GB is a hard, linear, unavoidable cost. Raise
-`index_concurrency` to 8 only knowing you are buying a fraction of a speedup
-with a doubling of disk.
+**`index_concurrency` no longer bounds extraction throughput; the disk cost is
+still linear.** Symbol extraction was measured at **0.95x on 4 threads** — the
+tree walk is GIL-serialized, so raising `index_concurrency` never bought
+extraction speedup, only more repos in flight at once. That measurement is
+exactly *why* extraction now runs in its own shared **process** pool instead
+(`extract_processes`, below) — decoupled from `index_concurrency` entirely.
+Raise `index_concurrency` only for repo-level (disk-bound) fan-out; raise
+`extract_processes` for CPU-bound extraction throughput. The 4 GB disk figure
+above is still a hard, linear, unavoidable cost of `index_concurrency` alone.
+(#106 lowered these numbers by 5x but deliberately did **not** move the default
+of 4; #109 re-derived it and left it at 4 -- see next.)
 
-**Semantic indexing clamps the pool to 2**, regardless of `index_concurrency`.
-That clamp is a *memory* bound, not a CPU one: embedding materialises a whole
-repo's chunks in memory (~0.5-0.8 GB per worker). The clamp is logged:
+**The `index_concurrency` default itself stays 4 (#109 measured, did not just
+inherit, this).** The per-thread ingest pass added by #106
+(`iter_tar_source_files`) mixes GIL-bound Python (the `tf.next()` walk,
+`fh.read()`, the NUL-strip, `str.decode` -- which does **not** release the GIL)
+with one GIL-releasing step (`zlib.decompress`). Measured thread-scaling on this
+pass: **1.15-1.20x at 4 concurrent threads**, both idle and with the extraction
+pool live -- short of the 2.0x threshold this repo's measurements use to call
+something "parallelizes", and consistent with a mostly GIL-held pass rather
+than a genuinely parallel one. No default change is warranted on CPU grounds;
+the semantic clamp raise to 4 (above) happens to make `effective_workers` equal
+`index_concurrency` at the default with zero separate change needed.
+
+**Semantic indexing clamps the pool to 4**, regardless of `index_concurrency`
+(issue #109 raised this from 2). That clamp is a *memory* bound, not a CPU one:
+embedding materialises a whole repo's chunks in memory (~32 KB/chunk structural,
+~40.1 KB/chunk resident, measured). **The clamp gates `index_concurrency`
+itself: raising the configured default above 4 is a no-op on the semantic path
+until the clamp moves too** (`effective_workers` is `min(index_concurrency,
+clamp)`) — this is why #109 could not treat the two knobs independently. The
+clamp is logged only when it actually reduces the configured value:
 
 ```
-INFO indexer.job [-]: semantic enabled: clamping index_concurrency 6 -> 2 (memory bound: ...)
+INFO indexer.job [-]: semantic enabled: clamping index_concurrency 6 -> 4 (memory bound: ...)
 ```
+
+At `index_concurrency <= 4` (the shipped default) the clamp is a no-op and this
+line does not appear at all — confirmed on the live dev job at `index_concurrency:
+4`, clamp 4: no clamp line, `4 worker(s)` on the disk line instead.
+
+**Re-derivation (#109).** A measured model —
+`P_worst(N) = N * max((alpha+gamma)*B_breach, (alpha+gamma)*(d*C) + V_cap*C) +
+extract_processes*R_proc + P_fixed`, coefficients measured across 4 corpora
+(`alpha+gamma` up to 4.64 bytes-materialized per source byte, `d` up to 3748
+bytes/chunk, `V_cap` 40.1 KB/chunk resident), against a measured container
+memory ceiling (`M`, read from cgroup + an allocate-until-failure bracket) —
+showed N=4 clears 70% of `M` with a large margin at the standard 8000-chunk
+global cap, and empirical confirmation on the real dev job agreed: two runs each
+at N=2 and N=4 measured `peak rss: self=... children=...` (issue #109's new
+instrumentation, `RUSAGE_SELF`/`RUSAGE_CHILDREN` at the end of `run()`) — N=2
+averaged ~90% of the 0.7*M budget, N=4 ~83%, both safely under, N=4 with *more*
+margin. See `docs/perf/issue-109-measurements.md` for the full derivation,
+every coefficient's provenance, and the two derived byte limits
+(`MAX_EXTRACTED_BYTES` and the chunk cap `C`) this same model yields.
+
+### Embedding concurrency (#107)
+
+`workers x concurrency` is the number that matters, not `concurrency` alone.
+Each of the (at most 4, semantic-clamped -- #109 raised this from 2) workers
+dispatches up to `semantic.embedding_concurrency` embedding batches at once
+(`app/embed.py:databricks_embedder`, order-preserving `ThreadPoolExecutor.map`):
+4 x 4 = 16 in-flight gateway requests at the default, **4 x 8 = 32 at the
+config.yaml-enforced ceiling of 8 — this now EXCEEDS the SDK's 20-connection
+pool** (the `CODE_SEARCH_SEMANTIC_EMBEDDING_CONCURRENCY` env var carries no
+ceiling, mirroring `semantic_embedding_batch_size`'s own unbounded env surface
+-- config.yaml is the job's real surface regardless). This combination was not
+reachable before #109 (2 x 8 = 16 stayed under the pool); it is now, and is
+flagged here rather than gated in code, matching this repo's "guardrail
+constants with config-level fixes, not override flags" convention -- lower
+`embedding_concurrency` if raising it alongside a near-ceiling
+`index_concurrency`.
+`embedding_concurrency: 1` is the rollback switch — fully serial embedding, no
+thread pool spawned. See `docs/runbooks/semantic-enablement.md` §4 for the full
+in-flight/memory arithmetic and the 429 posture.
+
+### Extraction process pool (#108)
+
+Symbol/edge extraction runs in a **shared, `spawn`-based process pool** — one
+pool per run, built once and shared across every `index_concurrency` repo
+worker, so a single dominant repo's files parse on every available core instead
+of being bound to one thread. This is a **CPU** knob, entirely independent of
+`index_concurrency`'s disk bound and the semantic clamp above: it adds no new
+corpus writer and does not change per-branch/per-repo sequencing (see §1.1) —
+"process pool" reads like a concurrency change to anyone who has internalized
+this runbook's §1.1, and it is not one.
+
+`extract_processes` (unset, the default) derives from the runtime:
+affinity/cgroup-aware CPU count, capped at 8 — the same ceiling as every other
+parallelism knob here. **Set it to `1` to disable the pool entirely** — fully
+serial, in-process extraction, no worker processes spawned at all — mirroring
+`embedding_concurrency: 1`'s rollback shape above. This is the 2am escape
+hatch if the pool ever misbehaves in this runtime; it is config-only, needs no
+redeploy, no migration, and no re-index.
+
+**How to tell whether the pool engaged**, once per run beside the disk line:
+
+```
+INFO indexer.extract_pool [-]: symbol extraction: 4 process(es) (spawn); pool preflight ok
+```
+
+Absent that line (or a `WARNING` in its place, also from the `indexer.extract_pool`
+logger), extraction ran in-process — either by config (`extract_processes: 1`)
+or because the pool degraded. Three WARNING shapes to recognize:
+
+- **`extraction pool preflight failed: ...`** — the pool never engaged for this
+  run at all (a bad sandbox, `/dev/shm` too small, an unguarded `__main__`
+  under `spawn`). The run proceeds at today's (pre-#108) speed. (A killed probe
+  worker may also print a stderr line like `resource_tracker: There appear to
+  be 1 leaked semaphore objects to clean up at shutdown` — harmless noise from
+  the kill path, not a separate problem.)
+- **`... rebuilt the pool (generation N, rebuild M/3)`** — a worker died
+  (`BrokenProcessPool`, e.g. a native crash in a grammar, an OOM kill). The
+  branch(es) in flight at that moment failed (up to `index_concurrency`
+  branches, semantic-clamped to 4 — **not just one**: the pool is shared, so a
+  break can surface on every repo worker holding a future at that instant).
+  Each failed branch re-indexes on its next run (it never got a stamp — the
+  same self-healing property §1 describes). The pool is rebuilt and later
+  branches run normally.
+- **`... rebuild budget (3) exhausted; latching to in-process extraction`** — a
+  deterministically poisoned file re-broke the pool three times running. The
+  rest of THIS run finishes in-process (slower, but correct and complete); the
+  next run gets a fresh pool.
+
+**Small repos engage fewer workers than `extract_processes` requests, and that
+is not a bug.** Batching is by 2 MB of aggregate qualifying-file content, not
+file count — a repo with less than `extract_processes x 2 MB` of parseable
+content never fills every worker. Such repos are fast regardless; watching one
+show fewer active workers than configured does not mean the pool "isn't
+working".
+
+**Ingestion stays serial — the pool cannot parallelize it.** Since #106 the tar
+stream is decompressed, decoded, and filtered in ONE pass on the repo-worker
+thread (`indexer.ingest.iter_tar_source_files`); the pool only parallelizes
+`extract_file` itself. On a real measured corpus this serial pass was ~11% of
+the pre-#108 serial total — small, but by Amdahl's law it is a hard ceiling on
+the *combined* (ingest + extract) speedup this pool can ever deliver, however
+many processes `extract_processes` uses. See
+`docs/perf/issue-108-measurements.md` for the full measurement and why it means
+AC1's "≥3x on 4+ cores" bar is met at 8 processes but not at 4 on that corpus —
+a real, structural finding, not a defect in the pool's own parallel efficiency
+(extraction alone scales at ~86% efficiency at 4 processes; the ceiling is the
+serial ingest pass, not the pool).
+
+**Memory**, added to the peak-usage arithmetic #109 inherits: each extraction
+worker process peaks at roughly 121 MB RSS (measured, all 7 grammars touched),
+so the pool adds `extract_processes x ~121 MB` on top of everything above —
+~484 MB at the default-derived 4, ~1.0 GB at the ceiling of 8. The pool's own
+bounded look-ahead window (scaled by `2 x extract_processes`: up to 2 MB of
+aggregate content per repo worker, plus a file-count backstop for near-zero-
+byte files) adds a few tens of MB per in-flight branch on top of that, and
+sits alongside (not instead of) the batched-write consumer's own up-to-8-MiB
+retention (#105, §2.3) for the same in-flight branch.
 
 ### The connection pool follows the workers
 
-Each worker holds exactly one connection, so the engine is built with
+Each worker holds exactly one connection AT A TIME, so the engine is built with
 `pool_size == effective workers`, `max_overflow=0`, `pool_timeout=30`. There is
 deliberately **zero headroom**: a connection leak stalls loudly for 30 seconds
 and then raises, rather than growing the pool silently. If you see a
@@ -176,18 +510,36 @@ and then raises, rather than growing the pool silently. If you see a
 connection, not an undersized pool — the pool is sized to the workers by
 construction.
 
+**"One connection at a time" holds by sequencing, not by construction (#104,
+verified by #109).** On the delta-gate-open semantic path a worker opens a
+*second*, short-lived connection (`indexer/job.py`'s `with engine.connect() as
+shas_conn:`, for the advisory `shas_fn` read) before its main `index_fn`
+connection — but that second connection is closed before embedding/`index_fn`
+starts, so at most one is ever open per worker at once. `pool_size ==
+effective_workers` (raised to 4 by #109 — see §3 above) stays correct only
+because of that ordering; a future change that opened both connections
+concurrently would silently under-provision the pool. Pinned by
+`tests/unit/test_job.py::test_shas_fn_connection_closes_before_embedding_starts`.
+
+**Since #109 raised the semantic clamp from 2 to 4, the Lakebase connection
+ceiling doubles on the semantic path too** — 4 concurrent connections at the
+new default vs. 2 before. Not observed to be a bottleneck in either Arm B run
+(no `QueuePool` timeouts, no degraded coverage), but worth knowing if a future
+Lakebase compute-size change is on the table alongside a semantic-path
+concurrency change.
+
 The app/serving pool is separate and unaffected (5, paired with a matching
 `CapacityLimiter`).
 
 ### The disk guard
 
 Before any bytes are downloaded, each worker checks free space on the filesystem
-it is about to write to. Below 2.5 GB it fails **that repo**, not the run:
+it is about to write to. Below 0.5 GB it fails **that repo**, not the run:
 
 ```
 ERROR indexer.job [acme/leviathan]: failed to index acme/leviathan
-OSError: insufficient local disk for acme/leviathan: 1904214016 bytes free at /tmp/tmpXXXX,
-need 2500000000 (...); lower index_concurrency in config.yaml
+OSError: insufficient local disk for acme/leviathan: 104214016 bytes free at /tmp/tmpXXXX,
+need 500000000 (...); lower index_concurrency in config.yaml
 ```
 
 A shortfall fails that repo alone, not the run, and the job exits non-zero.
@@ -196,12 +548,12 @@ and re-run — the completed repos are skipped, so the retry is cheap (see §1).
 
 **This guard is a pre-flight sanity check, not admission control.** It reserves
 nothing: each worker calls `shutil.disk_usage` independently before it writes,
-so at 5 GB free with 4 workers all four pass their check and all four then
+so at 1 GB free with 4 workers all four pass their check and all four then
 download. It reliably catches the *steady-state* case — disk already low when a
 repo starts — and turns it into the legible error above. It does **not** bound
 the *transient* case, where the combined footprint exhausts the disk mid-flight;
 that still surfaces as an opaque `tarfile` error. Sizing `index_concurrency` to
-your actual disk (2.5 GB per worker peak) is the real control.
+your actual disk (0.5 GB per worker peak) is the real control.
 
 ---
 
@@ -211,21 +563,83 @@ There is deliberately **no `--force_reindex` flag.** Forcing a re-index means
 clearing the provenance stamp, after which the normal skip logic re-indexes the
 affected repos on the next scheduled or manual run.
 
+**The stamp the skip seam actually reads is `repo_branches`, not `repos`.**
+`indexer/job.py`'s `_read_stamps` selects
+`RepoBranch.last_indexed_commit, RepoBranch.index_semantics_version` — the
+`repos` table's `index_semantics_version` column is a deprecated legacy stamp
+that no decision anywhere reads (`app/db/models.py` documents it write-only).
+An `UPDATE repos SET index_semantics_version = NULL` is therefore a **no-op**
+against the skip seam: the branch will look untouched and re-index on its own
+next scheduled cycle, not immediately, and the operator following an older
+version of this runbook would see nothing happen.
+
 ```sql
 -- everything
-UPDATE repos SET index_semantics_version = NULL;
+UPDATE repo_branches SET index_semantics_version = NULL;
 
--- one repo
-UPDATE repos SET index_semantics_version = NULL WHERE name = 'acme/widgets';
+-- one repo, every branch
+UPDATE repo_branches SET index_semantics_version = NULL
+  WHERE repo_id = (SELECT id FROM repos WHERE name = 'acme/widgets');
+
+-- one repo, one branch
+UPDATE repo_branches SET index_semantics_version = NULL
+  WHERE repo_id = (SELECT id FROM repos WHERE name = 'acme/widgets')
+    AND branch = 'main';
 ```
 
 Then run the job (`make index TARGET=<target>` or `databricks bundle run
 code_search_index -t <target>`).
 
+### 4.1 File-level delta indexing (#104): what changes about this remedy
+
+Once a branch's `repo_branches.index_semantics_version` matches the current
+`INDEX_SEMANTICS_VERSION`, `index_repo` skips rewriting any file whose
+`(path, content_sha)` it already has stored for that branch — see
+`indexer.store`'s module docstring for the full classification and the
+correctness proof. Two consequences change what "clear the stamp" actually
+buys you:
+
+**A degraded branch no longer self-heals on its own.** Before #104, ANY
+re-index rewrote the whole branch, so a branch whose semantic precompute
+failed (a chunk-cap breach, an embedder outage) caught its chunks up
+automatically on the next successful run. Under delta indexing, only
+*changed* files get re-embedded — a branch that never changes again carries
+that gap **forever** unless you clear its stamp. `indexer.job` emits one
+run-completion WARNING naming every branch that finished this way:
+
+```
+WARNING indexer.job [-]: 2 branch(es) finished with degraded semantic coverage this run (chunk precompute failed; core index is current, chunks are not, and delta indexing will NOT catch them up on their own -- clear their repo_branches.index_semantics_version stamp to force a full re-embed, see docs/runbooks/indexing-parallelism.md §4): acme/big-repo@main, acme/other@release
+```
+
+Grep for it (`grep 'degraded semantic coverage' run.log`) and clear the named
+branches' stamps with the one-branch form above once the underlying cause
+(chunk cap, embedder outage) is resolved.
+
+**The provenance gate can force a full re-index you did not ask for.** A
+branch only takes the cheaper "membership-only" path (acquiring content a
+*sibling* branch already stored, e.g. two branches sharing most of a
+monorepo) when **every** `repo_branches` row for that repo is at the current
+semantics version. If you clear one branch's stamp and leave siblings
+untouched, that is fine — but a repo with one branch stuck at an old version
+for any other reason (a persistently failing branch) will force every OTHER
+branch of that repo through the full write path for any file it shares with
+the stuck one, even though those branches are otherwise fully caught up. The
+`delta write set …` line's `membership=` count going to zero across a whole
+repo, with `unchanged=` still high, is the symptom — check for a sibling
+branch stuck at a stale `index_semantics_version` before assuming something
+is broken.
+
+**`semantic_max_chunks_per_repo` is enforced per RUN, not per branch's whole
+corpus.** The cap is evaluated over whatever `_precompute_chunk_writer`
+embeds, which under delta indexing is only the changed/new/membership-only
+files. A branch can drift above the nominal cap between full reindexes (a
+semantics bump, or its first index) — re-enforced in full at each of those.
+Not a bug; see `app/config.py`'s `semantic_max_chunks_per_repo` comment.
+
 ### Who can run this — read before you need it
 
-`UPDATE` on `repos` is held by **the identity that deployed the schema**, which
-owns the tables. Concretely:
+`UPDATE` on `repo_branches` (and `repos`) is held by **the identity that deployed
+the schema**, which owns every table, `repo_branches` included. Concretely:
 
 - **dev:** the developer who ran `make migrate` / `scripts/deploy.sh`. Table
   ownership carries `UPDATE` implicitly; no explicit grant was ever issued for
@@ -248,8 +662,23 @@ no in-repo record of it.
 ## 5. Changing extraction semantics
 
 If you change **what** gets extracted — `indexer/symbols.py`,
-`indexer/parse.py`, `indexer/languages.py` — you **must** bump
-`INDEX_SEMANTICS_VERSION` in `app/db/models.py`.
+`indexer/parse.py`, `indexer/languages.py`, `indexer/ingest.py` — you **must**
+bump `INDEX_SEMANTICS_VERSION` in `app/db/models.py`.
+
+**The same obligation now extends past the tripwire's watched files (#104).**
+`indexer/parse.py`'s chunker is already a watched path, so a change to
+`iter_chunks` still fires the tripwire. Swapping the embedding MODEL
+(`app/embed.py`) or changing `SEMANTIC_EMBEDDING_DIM` (`app/config.py`)
+without bumping `INDEX_SEMANTICS_VERSION` is NOT caught by the tripwire (both
+are deliberately unwatched — `app/embed.py` would otherwise fire on
+unrelated retry/batching edits and a noisy tripwire gets disabled) and now
+leaves every UNCHANGED file's vectors permanently stale under file-level
+delta indexing — before #104 the next HEAD move re-embedded everything
+anyway, so a missed bump here was self-limiting; it no longer is. This is not
+a new pattern: `INDEX_SEMANTICS_VERSION` version `2` was minted for exactly
+this reason (turning semantic search on by default so `chunks` backfills).
+Treat this as a reviewed convention, the same posture `indexer.store`'s
+module docstring takes for `lang`/`size` re-derivation.
 
 Without a bump, every already-indexed repo keeps serving output from the *old*
 extractor and never re-indexes, because its stored stamp still matches HEAD.

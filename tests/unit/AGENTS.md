@@ -11,7 +11,8 @@ Hermetic unit tests: no network, no database, no Databricks SDK instantiation. E
 |------|-------------|
 | `__init__.py` | Empty package marker. |
 | `test_branches.py` | `indexer.branches.resolve_branches`: glob matching, dedup, cap; empty globs → default branch only. |
-| `test_chunk_store.py` | `indexer.chunk_store.write_chunks` statement shape via a fake `Connection` recording `execute` calls; delete-then-insert, and proof no embedding call happens here. |
+| `test_bulk.py` | `indexer.bulk.insert_rows`: param-budgeted slicing into multi-row `VALUES` statements, no DB required. |
+| `test_chunk_store.py` | `indexer.chunk_store.write_chunks`/`write_chunks_batch` statement shape via a fake `Connection` recording `execute` calls; delete-then-insert (one `DELETE ... WHERE file_id = ANY(:ids)` since #105), and proof no embedding call happens here. |
 | `test_chunking.py` | `indexer.parse.iter_chunks` chunking behavior. |
 | `test_ci_branch.py` | `scripts/ci_branch.py` lifecycle with the SDK fully faked; pins that teardown NEVER raises and every create carries a TTL (leak protection for cancelled CI runs). |
 | `test_db_client.py` | Engine factory local (`PGHOST`) mode builds without instantiating the SDK; ORM models expose exactly the durable-core columns, constraints, and GIN indexes. |
@@ -38,7 +39,8 @@ Hermetic unit tests: no network, no database, no Databricks SDK instantiation. E
 | `test_semantics_version_tripwire.py` | CI tripwire: extraction-semantics changes must bump `INDEX_SEMANTICS_VERSION`. |
 | `test_service.py` | Keyset-cursor pagination in `app/service.py`: pure cursor encode/decode + pagination-mode gating with fake engine/`GrepResult` (real keyset SQL lives in integration). |
 | `test_smoke.py` | Pure predicate functions in `scripts/smoke.py`, loaded by file path (scripts/ is not a package). |
-| `test_store_chunk_writer.py` | `indexer.store`'s optional `chunk_writer` param with a hand-rolled fake `Connection`: writer called inside the same `conn.begin()` with `(repo_id, file_id, pf)`. |
+| `test_store_batching.py` | `indexer.store`'s batched changed/new write path (#105) at the statement level: boundary tripping by count and by bytes, the `excluded.*` trap, id mapping by `(path, content_sha)` (never row order), the intra-batch dedup guard, and the exact statement inventory of a mixed run. Extends `test_store_delta.py`'s `_FakeConn` idiom with a `files_returning`/`membership_returning` hook to script `RETURNING` row order independently of insertion order. |
+| `test_store_chunk_writer.py` | `indexer.store`'s optional `chunk_writer` param with a hand-rolled fake `Connection`: writer called inside the same `conn.begin()` with `(repo_id, pairs)`, `pairs` a sequence of `(file_id, pf)` (one call per batch since #105). |
 | `test_symbols.py` | `indexer.symbols.extract_symbols` across the V1 languages; nested symbols and the Python-vs-JS/TS method-kind asymmetry. |
 | `test_symbols_search.py` | `sym:` atom walker (pure) + rendered step-2 projection SQL; the composed two-query path is integration's job. |
 | `test_webui_main.py` | Route-level tests of the webui FastAPI backend via `app.dependency_overrides` of the `get_engine`/`get_settings` dependencies. |

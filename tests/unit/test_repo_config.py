@@ -213,13 +213,51 @@ def test_index_concurrency_out_of_range_raises_config_error(value: int) -> None:
     assert "index_concurrency" in str(excinfo.value)
 
 
+# --- extract_processes (#108) -------------------------------------------------
+
+
+@pytest.mark.unit
+def test_extract_processes_defaults_to_none() -> None:
+    """None means "derive from the runtime" (indexer.extract_pool.derive_process_count) --
+    omitting the field is the supported shape, since it predates #108."""
+    assert parse_config(_MINIMAL, source="cfg").extract_processes is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [1, 4, 8])
+def test_extract_processes_accepts_in_range(value: int) -> None:
+    raw = b"version: 1\nconnections:\n  - type: github\n    users: [u]\nextract_processes: %d\n" % (
+        value
+    )
+
+    assert parse_config(raw, source="cfg").extract_processes == value
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [0, 9])
+def test_extract_processes_out_of_range_raises_config_error(value: int) -> None:
+    """Matches index_concurrency's `1..8` ceiling -- every parallelism knob in this
+    repo shares it, and the pool's own sizing derivation already clamps to 8."""
+    raw = b"version: 1\nconnections:\n  - type: github\n    users: [u]\nextract_processes: %d\n" % (
+        value
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+
+    assert "extract_processes" in str(excinfo.value)
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("configured", "semantic_enabled", "expected"),
     [
         (8, False, 8),
-        (8, True, 2),
-        (4, True, 2),
+        (8, True, 4),  # issue #109: clamp raised from 2 to 4, re-derived + Arm B-confirmed
+        (5, True, 4),
+        (4, True, 4),
+        (3, True, 3),  # below the clamp -- passthrough, N=3 is a legal (unclamped) value too
+        (2, True, 2),
         (1, True, 1),  # the clamp is a ceiling, never a floor
         (1, False, 1),
     ],
@@ -323,7 +361,7 @@ def test_semantic_block_absent_is_a_noop() -> None:
 
 @pytest.mark.unit
 def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
-    """A fully-populated block emits all six Settings-named keys, values intact."""
+    """A fully-populated block emits all seven Settings-named keys, values intact."""
     raw = (
         b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
         b"semantic:\n"
@@ -333,6 +371,7 @@ def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
         b"  embedding_model: acme.embed-v2\n"
         b"  embedding_batch_size: 32\n"
         b"  embedding_timeout_s: 15.0\n"
+        b"  embedding_concurrency: 4\n"
     )
     cfg = parse_config(raw, source="cfg")
     assert cfg.semantic.settings_overrides() == {
@@ -342,6 +381,7 @@ def test_semantic_block_full_maps_every_field_to_its_settings_name() -> None:
         "semantic_embedding_model": "acme.embed-v2",
         "semantic_embedding_batch_size": 32,
         "semantic_embedding_timeout_s": 15.0,
+        "semantic_embedding_concurrency": 4,
     }
 
 
@@ -371,6 +411,8 @@ def test_semantic_block_partial_emits_only_set_fields() -> None:
         ("embedding_timeout_s", b"-2.5"),
         ("embedding_endpoint", b'""'),
         ("embedding_model", b'""'),
+        ("embedding_concurrency", b"0"),
+        ("embedding_concurrency", b"9"),
     ],
 )
 def test_semantic_block_rejects_out_of_bound_values(field: str, value: bytes) -> None:
@@ -471,10 +513,11 @@ def test_settings_overrides_keys_are_real_settings_fields_and_types_survive() ->
         embedding_model="custom.model",
         embedding_batch_size=8,
         embedding_timeout_s=5.5,
+        embedding_concurrency=6,
     )
     overrides = ov.settings_overrides()
-    # All six set -> all six emitted, and every key is a real Settings field.
-    assert len(overrides) == 6
+    # All seven set -> all seven emitted, and every key is a real Settings field.
+    assert len(overrides) == 7
     assert set(overrides) <= set(Settings.model_fields)
 
     # model_copy(update=) does NOT validate; re-validating the dumped model is what
@@ -487,6 +530,7 @@ def test_settings_overrides_keys_are_real_settings_fields_and_types_survive() ->
     assert revalidated.semantic_embedding_model == "custom.model"
     assert revalidated.semantic_embedding_batch_size == 8
     assert revalidated.semantic_embedding_timeout_s == 5.5
+    assert revalidated.semantic_embedding_concurrency == 6
 
 
 # --- parse failures -------------------------------------------------------

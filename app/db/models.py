@@ -45,7 +45,22 @@ Bump this whenever the *meaning* of what gets written changes: any change to
 ``indexer/symbols.py``, to ``indexer/parse.py``'s chunking, or to
 ``indexer/languages.py``'s extraction contract. A bump forces every repo to
 re-index once, because a repo's stored ``repos.index_semantics_version`` no
-longer matches. The CI tripwire enforces the bump obligation.
+longer matches. The CI tripwire enforces the bump obligation for those three
+files.
+
+**The obligation extends past the tripwire's reach (#104).** Swapping the
+embedding MODEL (``app/embed.py``) or changing ``SEMANTIC_EMBEDDING_DIM``
+(``app/config.py``) also requires a bump, but the tripwire does not watch
+either file (``app/embed.py`` deliberately -- it would otherwise fire on
+unrelated retry/batching edits) -- this is a reviewed convention, not a
+machine-enforced one. Before file-level delta indexing (issue #104) a missed
+bump here was self-limiting: the next HEAD move re-embedded a branch's whole
+corpus regardless. Under delta indexing only a CHANGED file re-embeds, so a
+missed bump now leaves every unchanged file's vectors silently stale forever
+-- exactly the failure this version column exists to prevent. This is not a
+new kind of case: version ``2`` was minted for precisely this reason (turning
+semantic search on by default, so every already-indexed branch had to
+re-index once for ``chunks`` to backfill).
 
 Migrations must never import this constant -- see
 ``app/alembic/versions/0002_index_semantics_version.py``.

@@ -17,7 +17,6 @@ from indexer.fetch import (
     RepoMeta,
     assert_disk_headroom,
     download_tarball,
-    extract_tarball,
     list_branches,
     list_org_repos,
     list_user_repos,
@@ -104,46 +103,10 @@ def test_download_tarball_rejects_oversized(
             download_tarball(client, ORG, REPO, SHA, tmp_path)
 
 
-@pytest.mark.unit
-def test_extract_tarball_rejects_decompression_bomb(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Cap below the summed member size -> extraction is refused before writing.
-    monkeypatch.setattr(fetch, "MAX_EXTRACTED_BYTES", 4)
-    tar_path = tmp_path / "source.tar.gz"
-    tar_path.write_bytes(CLEAN_TARBALL)
-    dest = tmp_path / "extracted"
-    with pytest.raises(ValueError, match="exceeding"):
-        extract_tarball(tar_path, dest)
-    assert not any(dest.iterdir()) if dest.exists() else True
-
-
-@pytest.mark.unit
-def test_extract_tarball_yields_top_level_dir(tmp_path: Path) -> None:
-    tar_path = tmp_path / "source.tar.gz"
-    tar_path.write_bytes(CLEAN_TARBALL)
-    root = extract_tarball(tar_path, tmp_path / "extracted")
-    assert root.name == TOP_DIR
-    assert (root / "README.md").read_text() == "# hello\n"
-    assert (root / "src" / "main.py").exists()
-
-
-@pytest.mark.unit
-def test_extract_tarball_neutralizes_path_traversal(tmp_path: Path) -> None:
-    malicious = _make_tarball(
-        {
-            f"{TOP_DIR}/ok.py": b"x = 1\n",
-            "../evil.txt": b"pwned\n",
-        }
-    )
-    tar_path = tmp_path / "evil.tar.gz"
-    tar_path.write_bytes(malicious)
-    dest = tmp_path / "extracted"
-
-    # The data filter blocks the escaping member; nothing is written outside dest.
-    with pytest.raises(tarfile.OutsideDestinationError):
-        extract_tarball(tar_path, dest)
-    assert not (dest.parent / "evil.txt").exists()
+# Extraction moved out of this module entirely (#106): the tarball is streamed
+# once, in memory, by `indexer.ingest.iter_tar_source_files`. The bomb cap, the
+# top-level-dir contract and the path-traversal rejections that used to be tested
+# here now live in tests/unit/test_ingest.py, against that function.
 
 
 # --- Enumeration -------------------------------------------------------------
@@ -499,14 +462,16 @@ def test_size_cap_error_names_overage_and_config_key(
 
 
 @pytest.mark.unit
-def test_required_free_bytes_sums_both_caps() -> None:
-    """Both caps are alive at once, so they SUM.
+def test_required_free_bytes_is_the_tarball_cap_alone() -> None:
+    """The compressed tarball is the only artifact on disk (#106).
 
-    The tarball stays on disk inside the worker's TemporaryDirectory while the
-    extracted tree grows beside it; a max() here would under-reserve by 500 MB
-    per worker and silently reintroduce the failure the guard exists to prevent.
+    It used to be the tarball PLUS its extraction, both alive at once inside the
+    worker's TemporaryDirectory, so the two caps summed. Nothing is extracted any
+    more -- `indexer.ingest.iter_tar_source_files` streams the archive in memory
+    -- so reserving `MAX_EXTRACTED_BYTES` on top would over-reserve 2 GB per
+    worker and cap `index_concurrency` on disk the job never touches.
     """
-    assert fetch.REQUIRED_FREE_BYTES == fetch.MAX_TARBALL_BYTES + fetch.MAX_EXTRACTED_BYTES
+    assert fetch.REQUIRED_FREE_BYTES == fetch.MAX_TARBALL_BYTES
 
 
 @pytest.mark.unit
@@ -527,7 +492,10 @@ def test_assert_disk_headroom_error_names_the_repo_and_the_config_key(
     """The whole point of the guard is diagnosability.
 
     An opaque ENOSPC from inside tarfile says neither which of N concurrent
-    workers overcommitted the disk nor what to change, so both are asserted.
+    workers overcommitted the disk nor what to change, so both are asserted. The
+    message also has to say WHAT the reserved number is, and since #106 that is
+    the compressed tarball alone -- an operator reading "plus a 2 GB extraction"
+    would size `index_concurrency` against a footprint that no longer exists.
     """
     monkeypatch.setattr(
         fetch.shutil, "disk_usage", lambda _p: _Usage(free=fetch.REQUIRED_FREE_BYTES - 1)
@@ -539,6 +507,8 @@ def test_assert_disk_headroom_error_names_the_repo_and_the_config_key(
     assert f"{ORG}/{REPO}" in message
     assert "index_concurrency" in message
     assert str(fetch.REQUIRED_FREE_BYTES) in message
+    assert "never extracted" in message
+    assert "extraction, both alive at once" not in message
 
 
 class _Usage:
