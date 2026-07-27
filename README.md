@@ -596,6 +596,12 @@ Note that auto-login fires **only** for OAuth (`databricks-cli`) profiles. On PA
 Azure profiles the proxy reports the failure rather than re-running login, so it cannot
 overwrite credentials you did not ask it to touch.
 
+Registering the server is also all it takes to deliver its guidance to the client: the MCP
+`initialize` handshake delivers the server's `instructions` to the client automatically, with
+no per-client or per-repo configuration needed. Any MCP client speaking the protocol receives
+it — Claude Code, Cursor, Windsurf, VS Code — not just the one shown above. What a client then
+does with it is client behavior, not something the protocol guarantees.
+
 ### Option B: native OAuth app connection
 
 Use this if you want the client to hold its own OAuth registration rather than ride on your
