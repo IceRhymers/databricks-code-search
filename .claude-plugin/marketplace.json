@@ -1,0 +1,14 @@
+{
+  "name": "databricks-code-search",
+  "description": "Marketplace for this repository's Claude Code skill plugin: cross-repository code-search best practices.",
+  "owner": {
+    "name": "databricks-code-search contributors"
+  },
+  "plugins": [
+    {
+      "name": "databricks-code-search",
+      "source": "./claude-plugin",
+      "description": "A skill for using an already-configured code-search MCP server across repositories."
+    }
+  ]
+}
