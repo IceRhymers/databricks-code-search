@@ -25,6 +25,10 @@ your own first. See [Configuring what gets indexed](#configuring-what-gets-index
 `make deploy` needs an authenticated Databricks CLI (`databricks auth login`), and a few
 one-time pieces cannot be scripted at all — those are next.
 
+Once it is deployed, point a client at it: configure an MCP client, then Claude Code can install
+an optional skill plugin with best practices — see
+[Connecting a client](#connecting-a-client).
+
 ## Manual prerequisites
 
 Four things the bundle cannot create, and which mostly need a human (or an account
@@ -534,6 +538,10 @@ Get the URL — `make deploy` prints it at step 11, and afterwards:
 databricks apps get <app-name> -o json | jq -r '.url'
 ```
 
+Claude Code users can optionally install this repository's skill plugin after configuring the
+server. The plugin adds tool-use guidance; it does not configure a server or change
+authentication, so this table still applies.
+
 There are two ways to authenticate. They differ in who has to do setup work, not in what the
 agent sees:
 
@@ -557,7 +565,29 @@ Authenticate the CLI once:
 databricks auth login --host https://<workspace-host>
 ```
 
-Then add the server. Claude Code:
+#### Claude Code: install the optional skill plugin
+
+This repository is also a Claude Code plugin marketplace. Its plugin installs a skill with
+cross-repository routing and tool-use best practices; it deliberately does **not** configure the
+server or register an MCP server.
+
+```bash
+# Replace <your-org> with the org that owns your fork.
+# (upstream: IceRhymers/databricks-code-search)
+claude plugin marketplace add <your-org>/databricks-code-search
+claude plugin install databricks-code-search@databricks-code-search
+```
+
+Both steps are also reachable as `/plugin` from inside a session. To run a local checkout
+without adding a marketplace at all:
+
+```bash
+claude --plugin-dir ./claude-plugin
+```
+
+#### Any client: register the server manually
+
+Add the server. Claude Code (without the plugin):
 
 ```bash
 claude mcp add code-search -- uvx uc-mcp-proxy --url https://<app-url>/mcp
@@ -592,15 +622,21 @@ Useful flags:
   which hangs a non-interactive job. Supply `DATABRICKS_TOKEN` (or M2M client
   credentials) instead.
 
+Multi-workspace users pick a profile here with `--profile`, or by exporting
+`DATABRICKS_CONFIG_PROFILE`. Use `--auth-type databricks-cli` when ambient `DATABRICKS_*`
+environment variables would otherwise be picked up first.
+
 Note that auto-login fires **only** for OAuth (`databricks-cli`) profiles. On PAT, M2M, or
 Azure profiles the proxy reports the failure rather than re-running login, so it cannot
 overwrite credentials you did not ask it to touch.
 
-Registering the server is also all it takes to deliver its guidance to the client: the MCP
+Registering the server is all it takes to deliver its guidance to the client: the MCP
 `initialize` handshake delivers the server's `instructions` to the client automatically, with
 no per-client or per-repo configuration needed. Any MCP client speaking the protocol receives
 it — Claude Code, Cursor, Windsurf, VS Code — not just the one shown above. What a client then
-does with it is client behavior, not something the protocol guarantees.
+does with it is client behavior, not something the protocol guarantees. The optional plugin adds
+request-text-triggered routing and best practices for Claude Code after manual setup; every
+client still receives the server instructions without it.
 
 ### Option B: native OAuth app connection
 
@@ -650,6 +686,15 @@ the app but lacks `CAN_USE`. Grant it in the app's permissions.
 **Tools list, but every search returns nothing.** The corpus is empty rather than the
 connection broken — check with `make smoke TARGET=dev ARGS=--expect-indexed`, and see
 [Configuring what gets indexed](#configuring-what-gets-indexed).
+
+**The `code-search` tools are missing after installing the plugin.** The plugin installs only
+an optional skill; it never registers an MCP server. Confirm the client has a manually configured
+`code-search` server with `/mcp` or `claude mcp list`, then follow the Option A or Option B setup
+above. Until the server is connected, the skill can only use workspace-local tools.
+
+**The skill never fires.** The skill is optional and the server's own instructions still route
+requests without it, so an absent skill is not a broken install. Confirm the part that matters
+— that the server is connected — with `/mcp`.
 
 ## Local development
 

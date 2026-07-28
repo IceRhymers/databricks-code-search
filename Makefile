@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migration set-secrets deploy deploy-prod smoke index destroy diagrams webui-wheel webui-build webui-test webui-verify-dist
+.PHONY: install run test test-integration lint fmt fmt-check requirements clean help migrate migration set-secrets deploy deploy-prod smoke index destroy diagrams webui-wheel webui-build webui-test webui-verify-dist plugin-validate
 
 # Secret scope/key for `set-secrets`. These MUST match the bundle variables
 # `github_token_secret_scope` / `github_token_secret_key` in databricks.yml
@@ -120,6 +120,10 @@ webui-verify-dist: ## Rebuild the frontend and fail if the committed dist/ is st
 		git --no-pager diff --stat -- webui/frontend/dist; \
 		exit 1; \
 	fi
+
+plugin-validate: ## CONVENIENCE ONLY (not a gate; not in CI or `make test`): validate the Claude Code plugin + marketplace manifests. Needs the `claude` CLI. The enforced floor is tests/unit/test_claude_plugin.py
+	claude plugin validate ./claude-plugin --strict
+	claude plugin validate . --strict
 
 destroy: ## Tear down the whole bundle for TARGET (typed-confirm; irreversible Lakebase data loss)
 	bash scripts/deploy.sh destroy $(TARGET)
