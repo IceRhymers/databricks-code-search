@@ -433,7 +433,9 @@ def _run(
     wc = _FakeWorkspaceClient("tok")
     engine = engine if engine is not None else _FakeEngine()
     handler = github if github is not None else _GitHub()
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://api.github.com"
+    ) as client:
         return run(
             config_path="/Workspace/x/config.yaml",
             scope="s",
@@ -480,6 +482,70 @@ def test_run_parses_files_and_symbols() -> None:
     # main.py + README.md both stored; main.py yields one function symbol.
     assert idx.calls == ["acme/widgets"]
     assert idx.counts == [IndexCounts(files=2, symbols=1, swept=0, edges=0)]
+
+
+# --- configurable GitHub API base (issue #127) ------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("api_base", "expected_base"),
+    [
+        (None, "https://api.github.com"),
+        ("https://api.acme.ghe.com", "https://api.acme.ghe.com"),
+    ],
+)
+def test_run_builds_client_with_configured_base_and_logs_startup(
+    api_base: str | None,
+    expected_base: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run() (the http_client-is-None branch) builds the one client against
+    ``github_api_base or "https://api.github.com"`` and logs the base at startup.
+
+    The real ``httpx.Client`` constructor is swapped for one that records the
+    ``base_url`` run() chose and wires a ``MockTransport`` behind it, so no real
+    network is touched while still exercising the exact construction site.
+    """
+    captured: dict[str, Any] = {}
+    real_client = httpx.Client
+
+    def fake_client(*args: Any, **kwargs: Any) -> httpx.Client:
+        captured["base_url"] = kwargs.get("base_url")
+        return real_client(transport=httpx.MockTransport(_GitHub()), base_url=kwargs["base_url"])
+
+    monkeypatch.setattr("indexer.job.httpx.Client", fake_client)
+
+    doc: dict[str, Any] = {
+        "version": 1,
+        "extract_processes": 1,
+        "connections": [{"type": "github", "repos": ["acme/widgets"]}],
+    }
+    if api_base is not None:
+        doc["github_api_base"] = api_base
+    config = RepoConfig.model_validate(doc)
+
+    with caplog.at_level(logging.INFO, logger="indexer.job"):
+        code = run(
+            config_path="/Workspace/x/config.yaml",
+            scope="s",
+            key="k",
+            endpoint="ep",
+            database="db",
+            workspace_client=_FakeWorkspaceClient("tok"),
+            engine=_FakeEngine(),
+            index_fn=_RecordingIndex(),
+            config_loader=lambda _client, _path: config,
+            reconcile_retired_fn=_noop_retired_fn,
+            reconcile_removed_fn=_noop_removed_fn,
+            shas_fn=_noop_shas_fn,
+        )
+
+    assert code == 0
+    assert captured["base_url"] == expected_base
+    messages = [r.getMessage() for r in caplog.records if r.name == "indexer.job"]
+    assert f"indexing against GitHub API base: {expected_base}" in messages
 
 
 # --- import health (the circular-import regression guard) -------------------
@@ -613,7 +679,9 @@ def test_config_error_returns_1_without_opening_the_database(
         raise ConfigError("failed to read config from '/Workspace/x/config.yaml' (HTTP 404)")
 
     idx = _RecordingIndex()
-    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_GitHub()), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="s",
@@ -1074,7 +1142,9 @@ def test_precompute_failure_marks_the_branch_outcome_degraded() -> None:
     def _down(_texts: list[str]) -> list[list[float]]:
         raise RuntimeError("serving endpoint unavailable")
 
-    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_GitHub()), base_url="https://api.github.com"
+    ) as client:
         outcome = _index_one_branch(
             "acme/widgets",
             org="acme",
@@ -1587,7 +1657,9 @@ def test_index_one_inner_reports_discovery_complete_for_a_normal_run() -> None:
     from indexer.job import _index_one_inner
     from indexer.resolve import RepoEntry
 
-    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_GitHub()), base_url="https://api.github.com"
+    ) as client:
         outcome = _index_one_inner(
             RepoEntry(name="acme/widgets", branch_globs=frozenset()),
             started=time.monotonic(),
@@ -1615,7 +1687,9 @@ def test_index_one_inner_reports_discovery_incomplete_when_capped() -> None:
     extra = [f"b{i:02d}" for i in range(SOFT_BRANCH_CAP + 5)]
     github = _GitHub(branches={"acme/widgets": ["main", *extra]})
     idx = _RecordingIndex()
-    with httpx.Client(transport=httpx.MockTransport(github)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(github), base_url="https://api.github.com"
+    ) as client:
         outcome = _index_one_inner(
             RepoEntry(name="acme/widgets", branch_globs=frozenset({"*"})),
             started=time.monotonic(),
@@ -1644,7 +1718,9 @@ def test_index_one_inner_default_flip_mirror_is_complete() -> None:
 
     github = _GitHub(branches={"acme/widgets": ["main", "master"]})
     idx = _RecordingIndex()
-    with httpx.Client(transport=httpx.MockTransport(github)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(github), base_url="https://api.github.com"
+    ) as client:
         outcome = _index_one_inner(
             RepoEntry(name="acme/widgets", branch_globs=frozenset({"main"})),
             started=time.monotonic(),
@@ -1849,7 +1925,9 @@ def test_engine_is_disposed_only_after_every_worker_returned(
 
     engine = _FakeEngine()
     monkeypatch.setattr(job, "create_db_engine", lambda **_kw: engine)
-    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_GitHub()), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="s",
@@ -1953,7 +2031,9 @@ def test_repo_context_is_reset_even_when_the_repo_fails() -> None:
 
     assert _repo_ctx.get() == "-"
     with (
-        httpx.Client(transport=httpx.MockTransport(_GitHub())) as client,
+        httpx.Client(
+            transport=httpx.MockTransport(_GitHub()), base_url="https://api.github.com"
+        ) as client,
         pytest.raises(ValueError),
     ):
         # A malformed entry: normalize_repo raises AFTER the context is set.
@@ -2050,7 +2130,9 @@ def _engine_kwargs(
         return _FakeEngine()
 
     monkeypatch.setattr(job, "create_db_engine", _record)
-    with httpx.Client(transport=httpx.MockTransport(_GitHub())) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_GitHub()), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="s",

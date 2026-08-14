@@ -64,7 +64,7 @@ def _handler(request: httpx.Request) -> httpx.Response:
 
 
 def _client() -> httpx.Client:
-    return httpx.Client(transport=httpx.MockTransport(_handler))
+    return httpx.Client(transport=httpx.MockTransport(_handler), base_url="https://api.github.com")
 
 
 @pytest.mark.unit
@@ -80,7 +80,9 @@ def test_resolve_branch_head_returns_the_commits_sha() -> None:
             return httpx.Response(200, json={"sha": "feature_sha"})
         return httpx.Response(404)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://api.github.com"
+    ) as client:
         assert resolve_branch_head(client, ORG, REPO, "feature/x") == "feature_sha"
 
 
@@ -128,7 +130,10 @@ def _recording_client(
         seen.append(request)
         return handler(request)
 
-    return httpx.Client(transport=httpx.MockTransport(record)), seen
+    return (
+        httpx.Client(transport=httpx.MockTransport(record), base_url="https://api.github.com"),
+        seen,
+    )
 
 
 @pytest.mark.unit
@@ -518,3 +523,144 @@ class _Usage:
         self.total = 100_000_000_000
         self.used = self.total - free
         self.free = free
+
+
+# --- configurable API base (issue #127) -------------------------------------
+
+
+@pytest.mark.unit
+def test_all_six_endpoints_hit_default_github_base_verbatim(tmp_path: Path) -> None:
+    """With the default base, every fetch function issues today's exact absolute URL.
+
+    The six URLs are now relative strings; the base_url on the client is what
+    reconstitutes them. Asserting the full ``str(request.url)`` (not just the
+    path) locks in that the default behaviour is byte-identical.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        path = request.url.path
+        if path == f"/repos/{ORG}/{REPO}":
+            return httpx.Response(200, json={"default_branch": BRANCH})
+        if path == f"/repos/{ORG}/{REPO}/commits/{BRANCH}":
+            return httpx.Response(200, json={"sha": SHA})
+        if path == f"/repos/{ORG}/{REPO}/tarball/{SHA}":
+            return httpx.Response(302, headers={"location": CODELOAD_URL})
+        if request.url == httpx.URL(CODELOAD_URL):
+            return httpx.Response(200, content=CLEAN_TARBALL)
+        return httpx.Response(200, json=[])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.github.com")
+    with client:
+        list_org_repos(client, ORG)
+        list_user_repos(client, "u")
+        list_branches(client, ORG, REPO)
+        resolve_branch_head(client, ORG, REPO, BRANCH)
+        resolve_ref(client, ORG, REPO)
+        download_tarball(client, ORG, REPO, SHA, tmp_path)
+
+    by_path = {r.url.path: r for r in seen}
+    assert (
+        str(by_path["/orgs/acme/repos"].url)
+        == "https://api.github.com/orgs/acme/repos?per_page=100&page=1"
+    )
+    assert (
+        str(by_path["/users/u/repos"].url)
+        == "https://api.github.com/users/u/repos?per_page=100&page=1"
+    )
+    assert (
+        str(by_path[f"/repos/{ORG}/{REPO}/branches"].url)
+        == f"https://api.github.com/repos/{ORG}/{REPO}/branches?per_page=100&page=1"
+    )
+    assert (
+        str(by_path[f"/repos/{ORG}/{REPO}/commits/{BRANCH}"].url)
+        == f"https://api.github.com/repos/{ORG}/{REPO}/commits/{BRANCH}"
+    )
+    assert str(by_path[f"/repos/{ORG}/{REPO}"].url) == f"https://api.github.com/repos/{ORG}/{REPO}"
+    assert (
+        str(by_path[f"/repos/{ORG}/{REPO}/tarball/{SHA}"].url)
+        == f"https://api.github.com/repos/{ORG}/{REPO}/tarball/{SHA}"
+    )
+
+
+@pytest.mark.unit
+def test_all_six_endpoints_target_enterprise_host(tmp_path: Path) -> None:
+    """With an enterprise base_url, EVERY request egresses to that host (Correction 3)."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        path = request.url.path
+        if path == f"/repos/{ORG}/{REPO}":
+            return httpx.Response(200, json={"default_branch": BRANCH})
+        if path == f"/repos/{ORG}/{REPO}/commits/{BRANCH}":
+            return httpx.Response(200, json={"sha": SHA})
+        if path == f"/repos/{ORG}/{REPO}/tarball/{SHA}":
+            # A same-host signed URL so the download completes within this handler.
+            return httpx.Response(200, content=CLEAN_TARBALL)
+        return httpx.Response(200, json=[])
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://api.acme.ghe.com"
+    )
+    with client:
+        list_org_repos(client, ORG)
+        list_user_repos(client, "u")
+        list_branches(client, ORG, REPO)
+        resolve_branch_head(client, ORG, REPO, BRANCH)
+        resolve_ref(client, ORG, REPO)
+        download_tarball(client, ORG, REPO, SHA, tmp_path)
+
+    assert seen, "no requests recorded"
+    for request in seen:
+        assert request.url.host == "api.acme.ghe.com", str(request.url)
+    # The tarball request in particular resolves to the full enterprise URL.
+    tarball_req = next(r for r in seen if r.url.path == f"/repos/{ORG}/{REPO}/tarball/{SHA}")
+    assert str(tarball_req.url) == f"https://api.acme.ghe.com/repos/{ORG}/{REPO}/tarball/{SHA}"
+
+
+@pytest.mark.unit
+def test_tarball_redirect_to_cross_host_signed_url_strips_authorization(
+    tmp_path: Path,
+) -> None:
+    """AC5: the tarball 302 may point at a DIFFERENT signed host (not codeload).
+
+    httpx follows the redirect and, because the target is a different origin,
+    strips the Authorization header before the cross-origin hop -- the signed URL
+    carries its own auth. The code assumes no ``codeload`` hostname.
+    """
+    signed_url = "https://enterprise-tarballs.acme.ghe.com/signed/x"
+    target_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{ORG}/{REPO}/tarball/{SHA}":
+            return httpx.Response(302, headers={"location": signed_url})
+        if str(request.url) == signed_url:
+            target_requests.append(request)
+            return httpx.Response(200, content=CLEAN_TARBALL)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://api.acme.ghe.com",
+        headers={"Authorization": "Bearer secret"},
+    )
+    with client:
+        out = download_tarball(client, ORG, REPO, SHA, tmp_path)
+
+    assert out.read_bytes() == CLEAN_TARBALL
+    assert len(target_requests) == 1
+    # httpx drops Authorization on a cross-origin redirect; the signed URL is
+    # self-authenticating, and the enterprise token must not leak to it.
+    assert "authorization" not in target_requests[0].headers
+
+
+@pytest.mark.unit
+def test_fetch_source_contains_no_github_com_api_literal() -> None:
+    """Structural residency guard (Correction 3): a future 7th call site written
+    with an absolute ``https://api.github.com/...`` URL would silently override
+    base_url and egress enterprise data to github.com. fetch.py must carry ZERO
+    such literals -- the base lives in job.py alone."""
+    source = Path(fetch.__file__).read_text(encoding="utf-8")
+    assert source.count("api.github.com") == 0

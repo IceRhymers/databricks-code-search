@@ -3,6 +3,20 @@
 # fast ("connection selects nothing") until you uncomment and fill one in.
 version: 1
 
+# The GitHub API base URL the indexer targets. Unset (the default) means
+# `https://api.github.com` — behavior is byte-identical to leaving this out, so
+# every existing config is unaffected. Set it to point the job at a GitHub
+# Enterprise Cloud deployment with data residency, where the API host is
+# `https://api.<enterprise>.ghe.com` (the WEB host is `https://<enterprise>.ghe.com`
+# — the leading `api.` label is the only difference, and `repos:` URLs you write
+# below use the WEB host). https-only; a scheme other than https, any userinfo
+# (`user@`), a path (a GHES `/api/v3` base is out of scope), a query, or a fragment
+# is rejected at parse time. A lone trailing slash is normalized off.
+# IMPORTANT: the PAT in the secret scope MUST be issued by that enterprise — a
+# github.com token will not authenticate against `api.<enterprise>.ghe.com`.
+# See docs/runbooks/enterprise-github.md.
+# github_api_base: https://api.acme.ghe.com
+
 # How many repos the job indexes at once. Default 4, max 8, min 1.
 # This is a DISK bound, not a CPU one: each worker holds its 500 MB tarball on
 # disk. That is the only on-disk artifact — the archive is streamed in memory and

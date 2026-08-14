@@ -142,6 +142,35 @@ def test_explicit_repo_bad_host_raises_value_error() -> None:
         )
 
 
+@pytest.mark.unit
+def test_explicit_enterprise_url_entry_resolves_under_enterprise_base() -> None:
+    """With github_api_base set, a URL-form repos: entry on the enterprise WEB host
+    is validated against the derived allowed_hosts and resolves."""
+    config = RepoConfig.model_validate(
+        {
+            "version": 1,
+            "github_api_base": "https://api.acme.ghe.com",
+            "connections": [{"type": "github", "repos": ["https://acme.ghe.com/acme/widgets"]}],
+        }
+    )
+    got = _resolve(config, orgs=_Enumerator(), users=_Enumerator())
+    assert got == ["acme/widgets"]
+
+
+@pytest.mark.unit
+def test_explicit_github_com_url_entry_rejected_under_enterprise_base() -> None:
+    """The github.com host is no longer allowed once the base is an enterprise host."""
+    config = RepoConfig.model_validate(
+        {
+            "version": 1,
+            "github_api_base": "https://api.acme.ghe.com",
+            "connections": [{"type": "github", "repos": ["https://github.com/acme/widgets"]}],
+        }
+    )
+    with pytest.raises(ValueError, match="unsupported host"):
+        _resolve(config, orgs=_Enumerator(), users=_Enumerator())
+
+
 # --- dedup across selectors and connections, first-seen order --------------
 
 

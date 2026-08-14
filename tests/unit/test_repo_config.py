@@ -22,6 +22,7 @@ from indexer.repo_config import (
     GitHubConnection,
     RepoConfig,
     SemanticOverrides,
+    derive_allowed_hosts,
     effective_workers,
     load_config,
     normalize_repo,
@@ -345,6 +346,144 @@ def test_semantic_max_chunks_per_repo_rejects_duplicate_keys_post_casefold() -> 
     with pytest.raises(ConfigError) as excinfo:
         parse_config(raw, source="cfg")
     assert "duplicate" in str(excinfo.value)
+
+
+# --- github_api_base (issue #127: configurable GitHub API base URL) ---------
+
+
+@pytest.mark.unit
+def test_github_api_base_defaults_to_none_and_default_hosts_unchanged() -> None:
+    """Omitting the field is byte-identical to today: base None, github.com hosts."""
+    cfg = parse_config(_MINIMAL, source="cfg")
+    assert cfg.github_api_base is None
+    # normalize_repo with the default (None) allowed_hosts still behaves as before.
+    assert normalize_repo("https://github.com/a/b") == "a/b"
+    assert normalize_repo("a/b") == "a/b"
+    with pytest.raises(ValueError):
+        normalize_repo("https://gitlab.com/a/b")
+
+
+@pytest.mark.unit
+def test_github_api_base_accepts_enterprise_origin() -> None:
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: https://api.acme.ghe.com\n"
+    )
+    cfg = parse_config(raw, source="cfg")
+    assert cfg.github_api_base == "https://api.acme.ghe.com"
+
+
+@pytest.mark.unit
+def test_github_api_base_normalizes_trailing_slash() -> None:
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: https://api.acme.ghe.com/\n"
+    )
+    cfg = parse_config(raw, source="cfg")
+    assert cfg.github_api_base == "https://api.acme.ghe.com"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"http://api.acme.ghe.com",  # scheme != https
+        b"https://api.x.ghe.com/api/v3",  # non-empty path (GHES-style, out of scope)
+        b"https://u@api.x.ghe.com",  # userinfo present
+        b"'https://api.x.ghe.com?x=1'",  # non-empty query
+        b"'https://api.x.ghe.com#frag'",  # non-empty fragment
+        b"api.acme.ghe.com",  # scheme-less
+        b"''",  # empty (min_length=1)
+        b"https://169.254.169.254",  # cloud metadata IP (host not in allowlist)
+        b"https://localhost",  # loopback host
+        b"'https://127.0.0.1'",  # loopback IP
+        b"https://evil.com",  # unrelated host
+        b"https://ghe.com.evil.com",  # suffix-spoof: does not end in .ghe.com label
+    ],
+)
+def test_github_api_base_rejects_bad_shapes(value: bytes) -> None:
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: " + value + b"\n"
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw, source="cfg")
+    assert "github_api_base" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_github_api_base_strips_surrounding_whitespace() -> None:
+    cfg = parse_config(
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: '  https://api.acme.ghe.com  '\n",
+        source="cfg",
+    )
+    assert cfg.github_api_base == "https://api.acme.ghe.com"
+
+
+@pytest.mark.unit
+def test_semantic_key_canonicalises_against_enterprise_host() -> None:
+    """With an enterprise base, a URL-form override key on the enterprise WEB host
+    (api. stripped) canonicalises; a github.com URL key is now rejected."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: https://api.acme.ghe.com\n"
+        b"semantic_max_chunks_per_repo:\n"
+        b'  "https://acme.ghe.com/acme/widgets": 20000\n'
+    )
+    cfg = parse_config(raw, source="cfg")
+    assert cfg.semantic_max_chunks_per_repo == {"acme/widgets": 20000}
+
+    raw_reject = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: https://api.acme.ghe.com\n"
+        b"semantic_max_chunks_per_repo:\n"
+        b'  "https://github.com/acme/widgets": 20000\n'
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        parse_config(raw_reject, source="cfg")
+    assert "unsupported host" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_semantic_key_rejects_degenerate_segments_regardless_of_base() -> None:
+    """`.`/`..` and non-two-segment keys stay rejected even with an enterprise base."""
+    raw = (
+        b"version: 1\nconnections:\n  - type: github\n    users: [u]\n"
+        b"github_api_base: https://api.acme.ghe.com\n"
+        b"semantic_max_chunks_per_repo:\n"
+        b'  "https://acme.ghe.com/acme/../secrets": 20000\n'
+    )
+    with pytest.raises(ConfigError):
+        parse_config(raw, source="cfg")
+
+
+@pytest.mark.unit
+def test_normalize_repo_with_enterprise_allowed_hosts() -> None:
+    """The web-form entry canonicalises against derived hosts; github.com now rejects."""
+    allowed = derive_allowed_hosts("https://api.acme.ghe.com")
+    assert (
+        normalize_repo("https://acme.ghe.com/acme/widgets", allowed_hosts=allowed) == "acme/widgets"
+    )
+    assert (
+        normalize_repo("https://www.acme.ghe.com/acme/widgets", allowed_hosts=allowed)
+        == "acme/widgets"
+    )
+    with pytest.raises(ValueError):
+        normalize_repo("https://github.com/acme/widgets", allowed_hosts=allowed)
+    # Bare org/repo never reaches the host check -- accepted under any allowed set.
+    assert normalize_repo("acme/widgets", allowed_hosts=allowed) == "acme/widgets"
+
+
+@pytest.mark.unit
+def test_derive_allowed_hosts() -> None:
+    assert derive_allowed_hosts(None) == frozenset({"github.com", "www.github.com"})
+    assert derive_allowed_hosts("https://api.github.com") == frozenset(
+        {"github.com", "www.github.com"}
+    )
+    assert derive_allowed_hosts("https://api.acme.ghe.com") == frozenset(
+        {"acme.ghe.com", "www.acme.ghe.com"}
+    )
 
 
 # --- semantic: block (config.yaml as the job's semantic-config surface) -----

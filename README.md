@@ -462,6 +462,21 @@ connections:
 `users` and `orgs` are expanded through the GitHub API at runtime; `repos` entries are
 taken verbatim with no enumeration call.
 
+### `github_api_base:` — targeting GitHub Enterprise Cloud
+
+By default the indexer talks to `https://api.github.com`. To point it at a GitHub Enterprise
+Cloud deployment with data residency, set the top-level `github_api_base` to that
+enterprise's API host, `https://api.<enterprise>.ghe.com` (the web host is
+`https://<enterprise>.ghe.com` — the leading `api.` is the only difference, and URL-form
+`repos:` entries use the **web** host). Unset is byte-identical to today. The value is
+validated at parse time: https-only, origin-only (no path — a GitHub Enterprise Server
+`/api/v3` base is out of scope), no userinfo, no query/fragment, and the host must be
+`api.github.com` or a `*.ghe.com` enterprise host (so a mistyped base can never point the
+token at an internal/metadata address); a trailing slash is normalized off.
+**The PAT in the secret scope must be issued by that enterprise** — a
+`github.com` token will not authenticate against `api.<enterprise>.ghe.com`. See
+[`docs/runbooks/enterprise-github.md`](docs/runbooks/enterprise-github.md).
+
 ### `branches:` — indexing more than the default branch
 
 `branches` is a list of glob patterns (`fnmatchcase`, exact-name match — not a regex)
@@ -685,6 +700,9 @@ Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
   query semantics, the grant-coupling this migration introduces)
 - [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md) —
   semantic search (default-on): the preload assumption, opt-out, embeddings, memory notes
+- [`docs/runbooks/enterprise-github.md`](docs/runbooks/enterprise-github.md) — pointing
+  the indexer at GitHub Enterprise Cloud (`github_api_base`, the web-vs-API host
+  relationship, the enterprise-issued-token requirement)
 - [`docs/runbooks/indexing-parallelism.md`](docs/runbooks/indexing-parallelism.md) —
   parallel indexing: worker sizing, skip-if-unchanged, compare-and-set stamping
 - [`docs/runbooks/reference-edges.md`](docs/runbooks/reference-edges.md) — the raw

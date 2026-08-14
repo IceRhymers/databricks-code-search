@@ -19,7 +19,6 @@ import httpx
 
 logger = logging.getLogger("indexer.fetch")
 
-_API_BASE = "https://api.github.com"
 _GITHUB_HEADERS = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
@@ -167,12 +166,12 @@ def _list_repos(client: httpx.Client, url: str, *, selector: str) -> list[RepoMe
 
 def list_org_repos(client: httpx.Client, org: str) -> list[RepoMeta]:
     """Every repo visible to the token under organization ``org``."""
-    return _list_repos(client, f"{_API_BASE}/orgs/{org}/repos", selector=org)
+    return _list_repos(client, f"/orgs/{org}/repos", selector=org)
 
 
 def list_user_repos(client: httpx.Client, user: str) -> list[RepoMeta]:
     """Every repo visible to the token owned by ``user``."""
-    return _list_repos(client, f"{_API_BASE}/users/{user}/repos", selector=user)
+    return _list_repos(client, f"/users/{user}/repos", selector=user)
 
 
 def list_branches(client: httpx.Client, org: str, repo: str) -> list[str]:
@@ -191,7 +190,7 @@ def list_branches(client: httpx.Client, org: str, repo: str) -> list[str]:
     ``indexer.job._index_one_inner``), never a silently short branch list.
     """
     items = _paginated_get(
-        client, f"{_API_BASE}/repos/{org}/{repo}/branches", selector=f"{org}/{repo} branches"
+        client, f"/repos/{org}/{repo}/branches", selector=f"{org}/{repo} branches"
     )
     return [str(item["name"]) for item in items]
 
@@ -202,7 +201,7 @@ def resolve_branch_head(client: httpx.Client, org: str, repo: str, branch: str) 
     The tarball is always downloaded by this SHA, never by the branch name.
     """
     commit = client.get(
-        f"{_API_BASE}/repos/{org}/{repo}/commits/{branch}",
+        f"/repos/{org}/{repo}/commits/{branch}",
         headers=_GITHUB_HEADERS,
     )
     commit.raise_for_status()
@@ -215,7 +214,7 @@ def resolve_ref(client: httpx.Client, org: str, repo: str) -> tuple[str, str]:
     Two calls: the repo metadata for the default branch, then
     :func:`resolve_branch_head` for that branch's immutable HEAD SHA.
     """
-    meta = client.get(f"{_API_BASE}/repos/{org}/{repo}", headers=_GITHUB_HEADERS)
+    meta = client.get(f"/repos/{org}/{repo}", headers=_GITHUB_HEADERS)
     meta.raise_for_status()
     default_branch = str(meta.json()["default_branch"])
     head_sha = resolve_branch_head(client, org, repo, default_branch)
@@ -254,11 +253,14 @@ def download_tarball(client: httpx.Client, org: str, repo: str, ref: str, dest: 
     ``ref`` MUST be the resolved SHA, never a branch: a push between resolve and
     download would otherwise yield a tree whose real SHA differs from the stamped
     ``head_sha`` and corrupt the mark-and-sweep key. GitHub answers with a 302 to
-    codeload, so ``follow_redirects=True`` is required.
+    a signed download host (codeload on github.com; an enterprise-specific host
+    on GHE Cloud), so ``follow_redirects=True`` is required. No hostname is
+    assumed -- httpx follows whatever ``Location`` the API returns and strips the
+    ``Authorization`` header on the cross-origin hop.
     """
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / "source.tar.gz"
-    url = f"{_API_BASE}/repos/{org}/{repo}/tarball/{ref}"
+    url = f"/repos/{org}/{repo}/tarball/{ref}"
     with client.stream("GET", url, headers=_GITHUB_HEADERS, follow_redirects=True) as resp:
         resp.raise_for_status()
         total = 0
