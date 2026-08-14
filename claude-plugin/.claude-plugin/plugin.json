@@ -1,0 +1,8 @@
+{
+  "name": "databricks-code-search",
+  "description": "A skill for using an already-configured code-search MCP server across repositories.",
+  "version": "0.1.0",
+  "author": {
+    "name": "databricks-code-search contributors"
+  }
+}

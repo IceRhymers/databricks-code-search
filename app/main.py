@@ -44,6 +44,7 @@ from typing import Any
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from starlette.applications import Starlette
@@ -677,7 +678,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 # ---------------------------------------------------------------------------------- tools
 #
 # Tools and routes are plain module functions registered onto a fresh ``FastMCP`` by
-# ``create_app()`` below (NOT decorated onto one module-global instance). A
+# ``build_mcp()`` below (NOT decorated onto one module-global instance). A
 # ``streamable_http_app`` caches a single ``StreamableHTTPSessionManager`` whose ``run()`` may
 # be entered only once per instance, so a per-instance factory is what lets each test (and any
 # future multi-mount) get its own session manager instead of reusing a spent one.
@@ -1047,21 +1048,55 @@ async def ready(request: Request) -> JSONResponse:
 
 # --------------------------------------------------------------------------- ASGI export
 
+# Server-level ``instructions`` land verbatim in every client's system prompt (via
+# ``initialize``), so this is the always-on channel: it answers "should I engage this server at
+# all" and routes the four entry-level tools. It deliberately does NOT enumerate
+# ``find_references``/``list_imports`` -- those are discoverable from the tool list once an
+# agent has engaged -- and it routes discovery through ``list_repos`` rather than asserting a
+# corpus exists, so it stays true against a freshly forked template with an empty index.
+SERVER_INSTRUCTIONS = """
+Indexed code search across many repositories -- including repositories that are NOT
+checked out in the current working directory.
 
-def create_app() -> Starlette:
-    """Build a fresh MCP ASGI app: a new ``FastMCP`` with tools/routes registered and its own
-    single-use ``StreamableHTTPSessionManager``. Production uses the module ``app`` below; tests
-    call this per test so each gets an unspent session manager (see the tools comment above)."""
-    mcp = FastMCP("code-search", lifespan=lifespan)
-    mcp.tool()(search_code)
-    mcp.tool()(semantic_search)
-    mcp.tool()(list_repos)
-    mcp.tool()(get_file)
-    mcp.tool()(find_references)
-    mcp.tool()(list_imports)
+Use these tools whenever a request names a repository, project, file, or symbol you
+cannot find locally. Local file tools only see the working directory; do not conclude
+that something does not exist based on a local search alone -- check list_repos first
+to see what is indexed.
+
+Then: search_code for exact text, regex, or symbol matches; semantic_search for
+natural-language questions about behavior; get_file to read a known path in full.
+""".strip()
+
+# All six tools are genuinely read-only against an external, open-world index (semantic-accuracy
+# grounds only -- Claude Code does not auto-approve on ``readOnlyHint``, so no routing credit is
+# claimed). Module-level constant because inlining ``ToolAnnotations(...)`` six times pushes
+# every registration line past ``line-length = 100`` (pyproject.toml).
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+
+
+def build_mcp() -> FastMCP:
+    """Build a fresh ``FastMCP`` with tools/routes registered and its own single-use
+    ``StreamableHTTPSessionManager``. Split out of ``create_app()`` so tool metadata
+    (``instructions``, ``list_tools()``) is reachable and unit-testable without standing up a
+    full HTTP session -- the Starlette app returned by ``streamable_http_app()`` does not expose
+    the ``FastMCP`` object it was built from. Each call still yields a fresh instance, preserving
+    the single-use session-manager constraint described in the tools comment above."""
+    mcp = FastMCP("code-search", instructions=SERVER_INSTRUCTIONS, lifespan=lifespan)
+    mcp.tool(title="Search Code", annotations=_READ_ONLY)(search_code)
+    mcp.tool(title="Semantic Search", annotations=_READ_ONLY)(semantic_search)
+    mcp.tool(title="List Indexed Repositories", annotations=_READ_ONLY)(list_repos)
+    mcp.tool(title="Get File", annotations=_READ_ONLY)(get_file)
+    mcp.tool(title="Find References", annotations=_READ_ONLY)(find_references)
+    mcp.tool(title="List Imports", annotations=_READ_ONLY)(list_imports)
     mcp.custom_route("/health", methods=["GET"])(health)
     mcp.custom_route("/ready", methods=["GET"])(ready)
-    return mcp.streamable_http_app()
+    return mcp
+
+
+def create_app() -> Starlette:
+    """Build a fresh MCP ASGI app. Production uses the module ``app`` below; tests call this
+    per test so each gets an unspent session manager (see the tools comment above)."""
+    return build_mcp().streamable_http_app()
 
 
 app = create_app()

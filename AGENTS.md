@@ -28,6 +28,7 @@ web UI. Everything deploys as one Databricks Asset Bundle.
 | `scripts/` | Deploy pipeline, smoke test, migration runner, CI branch lifecycle (see `scripts/AGENTS.md`) |
 | `docs/` | Runbooks and Graphviz diagrams (see `docs/AGENTS.md`) |
 | `resources/` | Bundle resource declarations: apps, job, Lakebase, grants (see `resources/AGENTS.md`) |
+| `claude-plugin/` | The Claude Code plugin shipped to consumers: one skill with code-search best practices (see `claude-plugin/AGENTS.md`) |
 
 ## For AI Agents
 
