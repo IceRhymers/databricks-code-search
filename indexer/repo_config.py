@@ -25,15 +25,32 @@ from __future__ import annotations
 
 import re
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
-_GITHUB_HOSTS = {"github.com", "www.github.com"}
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com"})
 
 
-def normalize_repo(entry: str) -> str:
+def derive_allowed_hosts(api_base: str | None) -> frozenset[str]:
+    """Hosts ``normalize_repo`` accepts in a URL-form entry, given the API base.
+
+    ``None`` (the default github.com base) keeps the canonical
+    ``{github.com, www.github.com}``. For a GitHub Enterprise Cloud base
+    (``https://api.<ent>.ghe.com``) the leading ``api.`` label is stripped to
+    the web host (``<ent>.ghe.com``), because a ``repos:`` entry a human writes
+    is the *web* URL, not the API URL.
+    """
+    if api_base is None:
+        return _GITHUB_HOSTS
+    host = urlsplit(api_base).hostname or ""
+    web = host[4:] if host.startswith("api.") else host
+    return frozenset({web, f"www.{web}"})
+
+
+def normalize_repo(entry: str, *, allowed_hosts: frozenset[str] | None = None) -> str:
     """Normalize a repo entry to canonical ``org/repo`` (the ``repos.name`` key).
 
     Accepts ``https://github.com/org/repo(.git)``, ``git@github.com:org/repo.git``,
@@ -48,13 +65,13 @@ def normalize_repo(entry: str) -> str:
     if slug.startswith("git@"):
         # git@github.com:org/repo.git
         host, _, path = slug[len("git@") :].partition(":")
-        if host not in _GITHUB_HOSTS:
+        if host not in (allowed_hosts if allowed_hosts is not None else _GITHUB_HOSTS):
             raise ValueError(f"unsupported host in repo entry: {entry!r}")
         slug = path
     elif "://" in slug:
         # https://github.com/org/repo(.git)
         scheme_host, _, path = slug.partition("://")[2].partition("/")
-        if scheme_host not in _GITHUB_HOSTS:
+        if scheme_host not in (allowed_hosts if allowed_hosts is not None else _GITHUB_HOSTS):
             raise ValueError(f"unsupported host in repo entry: {entry!r}")
         slug = path
 
@@ -317,6 +334,15 @@ class RepoConfig(BaseModel):
     index_concurrency: int = Field(default=4, ge=1, le=8)
     extract_processes: int | None = Field(default=None, ge=1, le=8)
 
+    # The GitHub API base URL the indexer targets. Absent (the default `None`) is
+    # byte-identical to today: `indexer.job` builds the one httpx.Client against
+    # `https://api.github.com`. Set to `https://api.<enterprise>.ghe.com` to point
+    # a data-residency GitHub Enterprise Cloud deployment. The bearer token (in the
+    # Authorization header, never here) MUST be issued by that enterprise -- a
+    # github.com PAT won't authenticate against api.<ent>.ghe.com. See the
+    # `_validate_github_api_base` validator for the accepted shape.
+    github_api_base: str | None = Field(default=None, min_length=1)
+
     # Per-repo override of Settings.semantic_max_chunks_per_repo (app/config.py, default
     # 8000), keyed by repo. Absent (the default) -> no repo gets an override, and
     # indexer.resolve.resolve_repos leaves RepoEntry.semantic_max_chunks at None, which
@@ -333,6 +359,61 @@ class RepoConfig(BaseModel):
     # exclusions (embedding_dim, chunk_max_tokens).
     semantic: SemanticOverrides = SemanticOverrides()
 
+    @field_validator("github_api_base")
+    @classmethod
+    def _validate_github_api_base(cls, value: str | None) -> str | None:
+        """Reject anything but a bare ``https://`` origin on a supported host (a token-exfil guard).
+
+        The value becomes the httpx ``base_url`` for every GitHub call and every
+        request carries the bearer token, so a bad value here is caught at
+        config-parse time (:class:`ConfigError`) rather than as a mid-run request
+        surprise. Like :func:`SemanticOverrides._require_workspace_relative_path`,
+        this is a config-surface guard, and it is an allow-*list*, not just an
+        allow-*shape*: userinfo (``@``) would ship the token to an
+        attacker-controlled host; a scheme other than https would send it in
+        cleartext; a path/query/fragment points at a misconfiguration (a GHES
+        ``/api/v3``-style base is out of scope -- see the module docstring); and
+        the host itself must be ``api.github.com`` or a ``*.ghe.com`` enterprise
+        host, so a metadata/loopback/internal target (``169.254.169.254``,
+        ``localhost``) can never receive the token even from a mistyped config. A
+        lone trailing slash is normalized off and the canonical origin returned.
+        """
+        if value is None:
+            return value
+        value = value.strip()
+        parts = urlsplit(value)
+        if parts.scheme != "https":
+            raise ValueError(f"github_api_base must use https (got {value!r})")
+        if not parts.hostname:
+            raise ValueError(f"github_api_base has no hostname (got {value!r})")
+        if "@" in parts.netloc:
+            raise ValueError(
+                f"github_api_base must not contain userinfo ('@') -- the bearer token "
+                f"could be sent off-host (got {value!r})"
+            )
+        if parts.query or parts.fragment:
+            raise ValueError(
+                f"github_api_base must not contain a query or fragment (got {value!r})"
+            )
+        if parts.path not in ("", "/"):
+            raise ValueError(
+                f"github_api_base must be an origin with no path (a GHES '/api/v3' base is "
+                f"out of scope; got {value!r})"
+            )
+        # Host allowlist: the only supported deployments are github.com (API host
+        # api.github.com) and GitHub Enterprise Cloud data residency (*.ghe.com).
+        # Restricting the host here -- not just the URL shape -- keeps a mistyped or
+        # hostile base from ever pointing the bearer token at a metadata/loopback/
+        # internal address (the token lives only in the Authorization header, so it
+        # goes wherever this host says).
+        if parts.hostname != "api.github.com" and not parts.hostname.endswith(".ghe.com"):
+            raise ValueError(
+                "github_api_base host must be api.github.com or a *.ghe.com enterprise host "
+                f"(got {value!r})"
+            )
+        # Normalize a lone trailing slash off; return the canonical origin.
+        return value[:-1] if value.endswith("/") else value
+
     @model_validator(mode="after")
     def _normalize_semantic_overrides(self) -> RepoConfig:
         """Canonicalise override keys through ``normalize_repo`` and reject collisions.
@@ -346,8 +427,9 @@ class RepoConfig(BaseModel):
         """
         normalized: dict[str, int] = {}
         seen_casefold: set[str] = set()
+        allowed_hosts = derive_allowed_hosts(self.github_api_base)
         for raw_key, cap in self.semantic_max_chunks_per_repo.items():
-            key = normalize_repo(raw_key)
+            key = normalize_repo(raw_key, allowed_hosts=allowed_hosts)
             folded = key.casefold()
             if folded in seen_casefold:
                 raise ValueError(

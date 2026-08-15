@@ -153,7 +153,9 @@ def test_token_never_appears_in_debug_logs(caplog: pytest.LogCaptureFixture) -> 
     token = read_github_token(wc, "scope", "key")
     assert token == SENTINEL  # sanity: the sentinel really is the decoded token
 
-    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_handler), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="scope",
@@ -197,7 +199,9 @@ def _error_handler(request: httpx.Request) -> httpx.Response:
 def test_token_never_appears_on_error_path(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
     wc = _FakeWorkspaceClient()
-    with httpx.Client(transport=httpx.MockTransport(_error_handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_error_handler), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="scope",
@@ -227,7 +231,9 @@ def test_token_never_appears_during_enumeration(caplog: pytest.LogCaptureFixture
     """
     caplog.set_level(logging.DEBUG)
     wc = _FakeWorkspaceClient()
-    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_handler), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="scope",
@@ -269,7 +275,9 @@ def test_reconciliation_failure_never_logs_exception_message(
     def _reconcile_removed_leaks(conn: Any, *, desired_repos: Any) -> list[str]:
         raise RuntimeError(f"db error near table: {SENTINEL}")
 
-    with httpx.Client(transport=httpx.MockTransport(_handler)) as client:
+    with httpx.Client(
+        transport=httpx.MockTransport(_handler), base_url="https://api.github.com"
+    ) as client:
         code = run(
             config_path="/Workspace/x/config.yaml",
             scope="scope",

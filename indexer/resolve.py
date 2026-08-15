@@ -27,7 +27,7 @@ from fnmatch import fnmatchcase
 import httpx
 
 from indexer.fetch import RepoMeta, list_org_repos, list_user_repos
-from indexer.repo_config import GitHubConnection, RepoConfig, normalize_repo
+from indexer.repo_config import GitHubConnection, RepoConfig, derive_allowed_hosts, normalize_repo
 
 logger = logging.getLogger("indexer.resolve")
 
@@ -130,6 +130,12 @@ def resolve_repos(
     # (index, enumerated, retained, explicit, tallies) per connection.
     summaries: list[tuple[int, int, int, int, dict[str, int]]] = []
 
+    # Derived once for the whole run: an explicit URL-form `repos:` entry is
+    # validated against the web host(s) of the configured API base (github.com by
+    # default, `<ent>.ghe.com` for a GHE Cloud base). Bare `org/repo` entries never
+    # reach the host check, so this only matters for URL-form entries.
+    allowed = derive_allowed_hosts(config.github_api_base)
+
     for index, connection in enumerate(config.connections):
         enumerated: list[RepoMeta] = []
         for org in connection.orgs:
@@ -150,7 +156,7 @@ def resolve_repos(
 
         # Explicit entries bypass every exclude rule -- naming a repo by hand is
         # an unambiguous instruction, and it costs zero enumeration calls.
-        explicit = [normalize_repo(entry) for entry in connection.repos]
+        explicit = [normalize_repo(entry, allowed_hosts=allowed) for entry in connection.repos]
 
         for name in [*retained, *explicit]:
             # Dedup case-INSENSITIVELY while keeping the first-seen spelling.

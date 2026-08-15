@@ -383,7 +383,17 @@ def run(
 
     owns_http = http_client is None
     if http_client is None:
-        http_client = httpx.Client(headers={"Authorization": f"Bearer {token}"}, timeout=60.0)
+        # The default is byte-identical to the historical hard-coded base; an
+        # operator points a data-residency GitHub Enterprise Cloud deployment via
+        # config.yaml's `github_api_base`. The base is not a secret (the token
+        # lives only in the Authorization header), so it is safe to log.
+        base_url = config.github_api_base or "https://api.github.com"
+        logger.info("indexing against GitHub API base: %s", base_url)
+        http_client = httpx.Client(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=60.0,
+        )
 
     # Resolve BEFORE opening a database connection: a bad config must cost
     # nothing but the enumeration calls it already made.
