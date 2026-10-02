@@ -16,7 +16,14 @@ dependencies = [
     "anyio",
     "uvicorn[standard]",
     "psycopg[binary]>=3.1",
-    "sqlalchemy>=2.0",
+    # Upper-bounded at <2.0.52: 2.0.52 changed compiled-SQL rendering (typed casts like
+    # `%(p)s::VARCHAR` and `ESCAPE '\'` instead of the untyped/`'\\'` forms), which the
+    # exact-SQL-text assertions in tests/unit/test_query_compiler.py and
+    # tests/unit/test_references.py pin. uv.lock is gitignored (issue #3), so without
+    # this ceiling CI's fresh `uv sync` resolves 2.0.52+ and those tests fail while a
+    # stale local env on 2.0.51 passes. Revisit the assertions (make them
+    # version-tolerant) to lift the ceiling.
+    "sqlalchemy>=2.0,<2.0.52",
     "alembic>=1.13",
     "pgvector>=0.3",
     "httpx>=0.27",
