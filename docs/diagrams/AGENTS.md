@@ -19,7 +19,7 @@ artifacts, but versioned ones. Never hand-edit a PNG.
 | `architecture.png` | Committed 144dpi render of `architecture.dot` (embedded in the README intro) |
 | `overall-architecture.dot` | Full system view: everything the bundle deploys and who talks to what — both apps, identities/grants, the secret scope, and the AI Gateway embedding path |
 | `overall-architecture.png` | Committed 144dpi render of `overall-architecture.dot` |
-| `deploy-pipeline.dot` | The 11 steps of `scripts/deploy.sh full`, including the split migrate/grant steps and the dashed first-activation fallback branches for each app |
+| `deploy-pipeline.dot` | The 12 steps of `scripts/deploy.sh full`, including the Lakebase Search preflight before migrate, the split migrate/grant steps, and the dashed first-activation fallback branches for each app |
 | `deploy-pipeline.png` | Committed 144dpi render of `deploy-pipeline.dot` |
 
 ## Subdirectories

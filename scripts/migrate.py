@@ -5,9 +5,9 @@ engine via :func:`app.db.client.create_db_engine` (which handles OAuth for
 Lakebase), injects the live connection into Alembic, and runs ``upgrade head``.
 The core chain includes the semantic ``chunks`` revision (``0004``) -- semantic
 search is default-on, so its DDL is part of every routine migrate. The 0004 DDL
-requires the project's Databricks-managed ``shared_preload_libraries`` to include
-``lakebase_vector,lakebase_text`` (a stated project assumption; see
-``docs/runbooks/semantic-enablement.md``).
+requires the project to have **Lakebase Search enabled** (the GA self-serve project
+toggle that makes ``lakebase_vector``/``lakebase_text`` installable -- a stated
+project assumption; see ``docs/runbooks/semantic-enablement.md``).
 
 Grants are opt-in via ``--apply-grants`` and default OFF, so a routine migration
 never touches role privileges. When enabled, the app (read-only) role named by

@@ -10,7 +10,7 @@ within the same per-batch flush.
 This module never calls the embedder: ``chunks`` arrives with vectors already
 computed by :mod:`app.embed`, so writing them is pure DML with no network
 call inside the caller's lock window. ``ts`` is a ``GENERATED`` column in
-production (backed by the beta ``lakebase_text`` extension) and is therefore
+production (backed by the ``lakebase_text`` extension) and is therefore
 never written here -- it derives from ``content``.
 
 Note: unlike ``symbols``, the current ``app.db.semantic.chunks`` schema has no

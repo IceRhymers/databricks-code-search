@@ -23,7 +23,7 @@ The MCP server Databricks App: a FastMCP streamable-HTTP service exposing the in
 | [`db/`](db/AGENTS.md) | Lakebase engine factory (per-connection OAuth), ORM models, grant SQL builders, standalone `chunks` Core table |
 | [`query/`](query/AGENTS.md) | Zoekt-style query parser (pure stdlib, seven fields) and AST → SQLAlchemy `Select` compiler |
 | [`search/`](search/AGENTS.md) | Grep (per-line rescan), `sym:` definition search, hybrid semantic RRF search, shared `QueryTooBroadError` |
-| [`alembic/`](alembic/AGENTS.md) | Migration env + the 0001→0004 core revision chain (also covers `versions/`) |
+| [`alembic/`](alembic/AGENTS.md) | Migration env + the 0001→0006 core revision chain (also covers `versions/`) |
 
 ## For AI Agents
 

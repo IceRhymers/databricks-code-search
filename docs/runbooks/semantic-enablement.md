@@ -4,34 +4,47 @@
 needed on the MCP app, the webui app, or the indexer job. Enablement for a target is
 simply `make deploy TARGET=<dev|prod>` — the `chunks` DDL rides the core migration
 chain (`app/alembic/versions/0004_semantic_chunks.py`, applied by `make migrate` at
-deploy step 5), and the deploy's own grant steps (7 and 9) cover it.
+deploy step 6, gated by the step-5 Lakebase Search preflight), and the deploy's own
+grant steps (8 and 10) cover it.
 
-## 1. Project assumption: managed `shared_preload_libraries`
+## 1. Project assumption: Lakebase Search is enabled on the project
 
 **Stated project assumption:** every target Lakebase project (dev, prod, and the
-`code-search-ci` CI project) has `lakebase_vector,lakebase_text` in its
-Databricks-**managed** `shared_preload_libraries`. This was formerly a gate; it is now
-an assumption the migration relies on.
+`code-search-ci` CI project) has **Lakebase Search enabled**. This is what makes the
+`lakebase_vector` / `lakebase_text` / `lakebase_tokenizer` extensions installable; it
+was formerly a gate (a managed `shared_preload_libraries` change requested via support);
+since Lakebase Search went GA it is a self-serve, documented step the migration relies on.
 
-The preload is **not** settable through the endpoint/project API or the bundle —
-attempting to set it that way returns `"setting cannot be changed"`. Getting it added
-is an out-of-band request (UI / Databricks support) against the specific Lakebase
-project, and **it is irreversible and project-level**: once added, it cannot be
-removed from that project.
+**Enabling it (GA, self-serve):** in the Lakebase project, open **Settings** →
+**Lakebase Search** → **Enable Lakebase Search**. See
+<https://docs.databricks.com/aws/en/oltp/projects/lakebase-search>. Enabling:
 
-If a project lacks the preload, `CREATE EXTENSION lakebase_vector` (and
-`lakebase_text`) fails with "must be loaded via shared_preload_libraries" — now
+- **restarts all computes in the project**, dropping active connections (do it before
+  deploying, not during);
+- makes the three extensions available to `CREATE EXTENSION`;
+- is **irreversible and project-level** — once enabled it cannot be turned off for that
+  project.
+
+Enabling is not (yet) exposed through the project API / SDK / bundle — the
+`ProjectSpec`/`ProjectSettings` surfaces carry no search flag (verified against
+`databricks.sdk.service.postgres`, 2026-10) — so the deploy pipeline *probes* for it and
+stops with instructions rather than enabling it for you (see `scripts/deploy.sh`'s
+Lakebase Search preflight step).
+
+If a project does not have Lakebase Search enabled, `CREATE EXTENSION lakebase_vector`
+(and `lakebase_text`) fails with "must be loaded via shared_preload_libraries" — now
 surfacing at `make migrate` / `make deploy` time. That failure is the **intended
 fail-loud signal**: it means the assumption does not hold for this project yet. Do not
-work around it; go get the preload added, then re-run the deploy.
+work around it; enable Lakebase Search on the project, then re-run the deploy.
 
-Ground truth (verified live against the `code-search` Lakebase project, 2026-07-19):
-before enablement the managed preload was
+Ground truth (verified live against the `code-search` Lakebase project, 2026-07-19,
+pre-GA): before enablement the managed preload was
 `neon,pg_stat_statements,databricks_auth,auto_explain`. After the Databricks-side
 change added `lakebase_vector,lakebase_text`, `CREATE EXTENSION IF NOT EXISTS
 lakebase_tokenizer` / `lakebase_vector` / `lakebase_text` all succeeded in that order,
 and the revision's DDL (`vector_cosine_ops` ANN index via `lakebase_ann`,
-`tsvector_bm25_ops` BM25 index via `lakebase_bm25`) built clean. See
+`tsvector_bm25_ops` BM25 index via `lakebase_bm25`) built clean. The GA "Enable Lakebase
+Search" toggle performs the same underlying change self-serve. See
 `app/alembic/versions/0004_semantic_chunks.py` for the exact DDL and
 access-method/opclass ground truth this depends on.
 
@@ -50,12 +63,15 @@ make deploy TARGET=<dev|prod>
 
 That is the whole procedure. Specifically, the pipeline (`scripts/deploy.sh`):
 
-- **step 5 (`make migrate`)** applies the core chain up to `0004`, which creates the
+- **step 5 (Lakebase Search preflight)** probes that the project has Lakebase Search
+  enabled and stops with the enable instructions if not — before the migration below
+  would fail mid-deploy on `CREATE EXTENSION`.
+- **step 6 (`make migrate`)** applies the core chain up to `0004`, which creates the
   extensions, `chunks` (including the `start_line`/`end_line` columns, issue #44), and
   both lakebase indexes. On a project that already ran the retired
   `make migrate-semantic`, `0004`'s `to_regclass('chunks')` guard skips the CREATE,
   adds the line-range columns, and drops the orphaned `alembic_version_semantic`.
-- **steps 7 and 9** re-apply the wildcard grants **after** the migration, so both app
+- **steps 8 and 10** re-apply the wildcard grants **after** the migration, so both app
   SPs get `SELECT` on `chunks` and (prod) the job SP gets write + `chunks_id_seq`
   usage. No manual grant reconciliation is needed on the deploy path.
 
@@ -221,9 +237,9 @@ just after a somewhat longer wait than serial dispatch's instant fail-fast.
 
 `0004`'s `downgrade()` drops the BM25/ANN indexes and the `chunks` table, but **does
 not** drop the `lakebase_tokenizer` / `lakebase_vector` / `lakebase_text` extensions —
-they are database-wide objects, and dropping/recreating them buys nothing since the
-managed-preload change (section 1) is itself irreversible per project. Downgrading
-only removes the schema objects this feature owns; it does not "un-preload" the
+they are database-wide objects, and dropping/recreating them buys nothing since enabling
+Lakebase Search on the project (section 1) is itself irreversible. Downgrading only
+removes the schema objects this feature owns; it does not disable Lakebase Search on the
 project. For a behavioral rollback, prefer the opt-out flag (section 3).
 
 ## 6. Indexer job config: the `semantic:` block

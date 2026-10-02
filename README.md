@@ -55,7 +55,7 @@ native per-client OAuth. See [Connecting a client](#connecting-a-client).
 
 `make smoke ARGS=--enable-mcp` is not blocked by this: it authenticates with your own
 Databricks login (`WorkspaceClient().config.authenticate()`), so it needs `CAN_USE` on the
-app but not the app connection. `deploy.sh`'s step-11 reminder says no client can reach
+app but not the app connection. `deploy.sh`'s step-12 reminder says no client can reach
 `/mcp` without the app connection; that holds for external MCP clients but not for
 `make smoke`.
 
@@ -64,12 +64,14 @@ secret scope (`code-search` / `github_token` by default). `make deploy` will do 
 you if `GITHUB_TOKEN` is exported; without it the deploy still succeeds and the app still
 serves, but indexing has no credential and the corpus stays empty.
 
-**4. Lakebase Search preload (stated project assumption).** The Lakebase project's
-Databricks-managed `shared_preload_libraries` must already include
-`lakebase_vector,lakebase_text` — semantic search is default-on and its DDL rides
-`make migrate`, which fails loudly (`must be loaded via shared_preload_libraries`) on a
-project without it. Not settable through the bundle or the API; requested out-of-band per
-project, and **irreversible**. See
+**4. Enable Lakebase Search on the Lakebase project (GA).** Semantic search is
+default-on, and its DDL rides `make migrate` — the target Lakebase project must have
+**Lakebase Search enabled** before the first deploy, or the migration fails loudly
+(`must be loaded via shared_preload_libraries`). Enabling is self-serve: in the
+project, **Settings → Lakebase Search → Enable Lakebase Search**
+([docs](https://docs.databricks.com/aws/en/oltp/projects/lakebase-search)). It restarts
+the project's computes and is **irreversible**. `make deploy` probes for this and stops
+with the same instructions before attempting the migration. See
 [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
 
 ## Setting this up with an agent
@@ -95,7 +97,8 @@ Ask your human for the pieces you cannot do yourself:
 - **Databricks CLI auth** — `databricks auth login --host https://<workspace-host>` is
   an interactive browser flow.
 - **The account-admin prerequisites above** — service principals (always), the OAuth
-  app connection (only for native MCP OAuth), and the Lakebase preload confirmation.
+  app connection (only for native MCP OAuth), and enabling Lakebase Search on the
+  project.
 
 ## Architecture
 
@@ -339,8 +342,9 @@ embeddings go through the workspace AI Gateway, so `make deploy` is the whole en
 story. Each result carries the chunk's `start_line`/`end_line` (null for rows indexed
 before line tracking). Opt out with `CODE_SEARCH_SEMANTIC_ENABLED=0` (on both apps and the
 job); disabled, it returns `semantic_enabled: false` and touches neither the database nor
-the embedder. The target Lakebase project's managed preload including
-`lakebase_vector,lakebase_text` is a stated project assumption — see
+the embedder. The target Lakebase project must have Lakebase Search enabled (the GA
+project-level toggle that makes `lakebase_vector`/`lakebase_text` installable) — a stated
+project assumption; see
 [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md).
 
 `find_references` and `list_imports` serve the knowledge-graph reference edges. They are
@@ -407,7 +411,7 @@ JOB_RUN_AS_SP=<client-id> make deploy-prod
 
 The pipeline, in order:
 
-<img src="docs/diagrams/deploy-pipeline.png" alt="The eleven steps of deploy.sh full, with the migrate and grant steps split around each app's activation" width="720">
+<img src="docs/diagrams/deploy-pipeline.png" alt="The twelve steps of deploy.sh full, with the Lakebase Search preflight before migrate and the grant steps split around each app's activation" width="720">
 
 1. **Validate** the bundle; for prod, assert `JOB_RUN_AS_SP` is non-empty.
 2. **Build the webui wheel** (`make webui-wheel`) so webui's source sync ships a fresh
@@ -416,20 +420,22 @@ The pipeline, in order:
    Compute is not started yet.
 4. **Seed the GitHub secret** if it is missing and `GITHUB_TOKEN` is set; otherwise warn
    and continue.
-5. **Migrate** the schema as the deploying identity, *without* grants.
-6. **Activate the MCP app** via `bundle run`, then poll for `ACTIVE` (15s × 10).
-7. **Apply grants — MCP app** — read-only for its app SP, write for the job SP on prod.
-8. **Activate webui** via `bundle run`, then poll for `ACTIVE` (15s × 10).
-9. **Apply grants — webui** — read-only for its app SP.
-10. **Index** — always runs; a failure warns without aborting the deploy.
-11. **Print both app URLs** and the reminder about the MCP app's OAuth app connection.
+5. **Lakebase Search preflight** — probe that the project has Lakebase Search enabled;
+   stop with the enable instructions (self-serve, GA) before attempting the migration.
+6. **Migrate** the schema as the deploying identity, *without* grants.
+7. **Activate the MCP app** via `bundle run`, then poll for `ACTIVE` (15s × 10).
+8. **Apply grants — MCP app** — read-only for its app SP, write for the job SP on prod.
+9. **Activate webui** via `bundle run`, then poll for `ACTIVE` (15s × 10).
+10. **Apply grants — webui** — read-only for its app SP.
+11. **Index** — always runs; a failure warns without aborting the deploy.
+12. **Print both app URLs** and the reminder about the MCP app's OAuth app connection.
 
-Steps 5/7 and 8/9 are split the same way for each app: a service principal's Postgres role
-does not exist until that app first activates, so granting before activation cannot work —
-each grant pass runs after its app's activation step and retries (5 × 10s) to absorb
-role-visibility lag.
+Steps 6/8 and 9/10 are split the same way for each app: a service principal's Postgres
+role does not exist until that app first activates, so granting before activation cannot
+work — each grant pass runs after its app's activation step and retries (5 × 10s) to
+absorb role-visibility lag.
 
-If step 6 or step 8 never reaches `ACTIVE`, the script falls back to
+If step 7 or step 9 never reaches `ACTIVE`, the script falls back to
 `databricks apps deploy <app> --source-code-path`, re-runs `bundle run`, and re-probes. The
 script calls this the first-activation fallback.
 
@@ -547,7 +553,7 @@ only, so it will pass even when the app SP is missing its SELECT grant.
 The server speaks streamable HTTP at `https://<app-url>/mcp`. Every caller needs `CAN_USE`
 on the app, whichever path below you take.
 
-Get the URL — `make deploy` prints it at step 11, and afterwards:
+Get the URL — `make deploy` prints it at step 12, and afterwards:
 
 ```bash
 databricks apps get <app-name> -o json | jq -r '.url'
@@ -750,7 +756,11 @@ Run the server locally with `make run` (binds `DATABRICKS_APP_PORT`, else 8000).
   deploying multi-branch indexing (`branches:` globs, the 20-branch cap, `branch:`
   query semantics, the grant-coupling this migration introduces)
 - [`docs/runbooks/semantic-enablement.md`](docs/runbooks/semantic-enablement.md) —
-  semantic search (default-on): the preload assumption, opt-out, embeddings, memory notes
+  semantic search (default-on): the Lakebase Search GA project assumption, opt-out,
+  embeddings, memory notes
+- [`docs/runbooks/lakebase-search-ops.md`](docs/runbooks/lakebase-search-ops.md) —
+  Lakebase Search operations: extension/index upgrades, BM25/VACUUM maintenance,
+  cold-start prewarm, query-time tuning knobs
 - [`docs/runbooks/enterprise-github.md`](docs/runbooks/enterprise-github.md) — pointing
   the indexer at GitHub Enterprise Cloud (`github_api_base`, the web-vs-API host
   relationship, the enterprise-issued-token requirement)

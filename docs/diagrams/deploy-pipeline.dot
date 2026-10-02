@@ -1,5 +1,6 @@
-// The 11 steps of `scripts/deploy.sh full` (issue #35 added steps 2, 8, 9 for the second
-// app, webui), and why 5/7 and 8/9 are each split.
+// The 12 steps of `scripts/deploy.sh full` (issue #35 added the second app, webui;
+// the Lakebase Search preflight was inserted before migrate when Lakebase Search went
+// GA), and why 6/8 and 9/10 are each split.
 // Regenerate with `make diagrams` (do not hand-edit the PNG).
 digraph deploy {
   rankdir=TB;
@@ -15,32 +16,34 @@ digraph deploy {
   s2 [label="2  make webui-wheel\nstage webui/wheels/app.whl"];
   s3 [label="3  bundle deploy\nLakebase · catalog · secret scope · job · both apps"];
   s4 [label="4  seed GITHUB_TOKEN\nskipped with a warning if unset"];
-  s5 [label="5  migrate schema\nas deploying identity, NO grants",
+  s5 [label="5  Lakebase Search preflight\nstop with enable instructions if not enabled",
+      fillcolor="#ebf8ff", color="#2b6cb0"];
+  s6 [label="6  migrate schema\nas deploying identity, NO grants",
       fillcolor="#fffaf0", color="#c05621"];
-  s6 [label="6  bundle run code_search\npoll for ACTIVE (15s × 10)",
+  s7 [label="7  bundle run code_search\npoll for ACTIVE (15s × 10)",
       fillcolor="#fffaf0", color="#c05621"];
-  s7 [label="7  apply grants — code_search\napp SP read · job SP write (prod)",
+  s8 [label="8  apply grants — code_search\napp SP read · job SP write (prod)",
       fillcolor="#fffaf0", color="#c05621"];
-  s8 [label="8  bundle run webui\npoll for ACTIVE (15s × 10)",
+  s9 [label="9  bundle run webui\npoll for ACTIVE (15s × 10)",
       fillcolor="#fffaf0", color="#c05621"];
-  s9 [label="9  apply grants — webui\napp SP read only",
+  s10 [label="10  apply grants — webui\napp SP read only",
       fillcolor="#fffaf0", color="#c05621"];
-  s10 [label="10  index\nalways runs; failure warns, does not abort"];
-  s11 [label="11  print both app URLs\n+ OAuth app-connection reminder (MCP app only)"];
+  s11 [label="11  index\nalways runs; failure warns, does not abort"];
+  s12 [label="12  print both app URLs\n+ OAuth app-connection reminder (MCP app only)"];
 
   fallback1 [label="first-activation fallback (code_search)\napps deploy --source-code-path\nthen re-run + re-probe",
             shape=note, fillcolor="#fff5f5", color="#c53030", fontsize=10];
   fallback2 [label="first-activation fallback (webui)\napps deploy --source-code-path\nthen re-run + re-probe",
             shape=note, fillcolor="#fff5f5", color="#c53030", fontsize=10];
 
-  // weight pins steps 1-11 to a straight spine so the fallback branches pull off to
+  // weight pins steps 1-12 to a straight spine so the fallback branches pull off to
   // the side instead of bending the main path.
-  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> s7 -> s8 -> s9 -> s10 -> s11 [weight=100];
-  s6 -> fallback1 [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
-  fallback1 -> s7 [style=dashed, color="#c53030"];
-  s8 -> fallback2 [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
-  fallback2 -> s9 [style=dashed, color="#c53030"];
+  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> s7 -> s8 -> s9 -> s10 -> s11 -> s12 [weight=100];
+  s7 -> fallback1 [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
+  fallback1 -> s8 [style=dashed, color="#c53030"];
+  s9 -> fallback2 [label="  never ACTIVE  ", style=dashed, color="#c53030", fontcolor="#c53030"];
+  fallback2 -> s10 [style=dashed, color="#c53030"];
 
-  { rank=same; s6; fallback1; }
-  { rank=same; s8; fallback2; }
+  { rank=same; s7; fallback1; }
+  { rank=same; s9; fallback2; }
 }

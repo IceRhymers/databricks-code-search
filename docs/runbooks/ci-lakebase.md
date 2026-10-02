@@ -32,11 +32,14 @@ the job on every PR). Provision the CI project promptly after landing this workf
    `databricks.yml`. It must be separate: every run creates and drops tables, which
    must never happen in a data-bearing project.
 
-2. **Enable the preload on it.** Its Databricks-managed `shared_preload_libraries`
-   must include `lakebase_vector,lakebase_text` — the stated project assumption (see
-   [`semantic-enablement.md`](semantic-enablement.md) §1; irreversible, not settable
-   via the API). Without it, the workflow's migrate step fails with
-   `must be loaded via shared_preload_libraries`.
+2. **Enable Lakebase Search on it.** The CI project must have **Lakebase Search
+   enabled** — the GA self-serve project toggle (Settings → Lakebase Search → Enable;
+   irreversible), which makes the `lakebase_vector`/`lakebase_text` extensions
+   installable. This is the stated project assumption (see
+   [`semantic-enablement.md`](semantic-enablement.md) §1). Without it, the workflow's
+   migrate step fails with `must be loaded via shared_preload_libraries`. This replaces
+   the pre-GA out-of-band `shared_preload_libraries` support request — the CI project
+   can now be enabled self-serve, which unblocks this workflow.
 
 3. **Configure repository auth and settings.**
    - Secrets: `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`

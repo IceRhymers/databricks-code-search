@@ -16,7 +16,8 @@ Makefile instead. The Python scripts import from `app/` (`app.db.client`,
 ## Key Files
 | File | Description |
 |------|-------------|
-| `deploy.sh` | `full`/`destroy` orchestrator. `full` is an 11-step pipeline: (1) validate bundle JSON, (2) `make webui-wheel`, (3) `bundle deploy`, (4) GitHub-token secret check/seed, (5) `make migrate` schema-only (no grants), (6) `bundle run code_search` + wait ACTIVE, (7) MCP-app SP grants (retry 5×10s), (8) `bundle run webui` + wait ACTIVE, (9) webui SP grants (retry 5×10s), (10) first index run (non-fatal), (11) URL banner + OAuth-app-connection reminder. `destroy` is a typed-confirm (project name) teardown. Helpers: `die`, `req` (empty/null guard), `retry`, `grant_attempt`, `jval`/`jworkspace` (guarded JSON readers), `wait_active` (~10×15s probe with `databricks apps deploy` fallback on first activation) |
+| `deploy.sh` | `full`/`destroy` orchestrator. `full` is a 12-step pipeline: (1) validate bundle JSON, (2) `make webui-wheel`, (3) `bundle deploy`, (4) GitHub-token secret check/seed, (5) Lakebase Search preflight probe, (6) `make migrate` schema-only (no grants), (7) `bundle run code_search` + wait ACTIVE, (8) MCP-app SP grants (retry 5×10s), (9) `bundle run webui` + wait ACTIVE, (10) webui SP grants (retry 5×10s), (11) first index run (non-fatal), (12) URL banner + OAuth-app-connection reminder. `destroy` is a typed-confirm (project name) teardown. Helpers: `die`, `req` (empty/null guard), `retry`, `grant_attempt`, `jval`/`jworkspace` (guarded JSON readers), `wait_active` (~10×15s probe with `databricks apps deploy` fallback on first activation) |
+| `lakebase_search_preflight.py` | Step-5 probe: exits non-zero with the self-serve enable instructions when the target project lacks `lakebase_vector`/`lakebase_text` in `pg_available_extensions` (i.e. Lakebase Search is not enabled). Runs before `make migrate` so 0004's `CREATE EXTENSION` never fails mid-deploy. Enabling is not exposed through the project API/SDK/bundle, so it probes and instructs — it cannot enable |
 | `smoke.py` | Post-deploy smoke test: `/health` (liveness), `/ready` (the grant oracle — proves the app SP's SELECT grant, which owner-side SQL cannot), direct-SQL `SELECT 1` (connectivity only), corpus count under `--expect-indexed`, and a live MCP `search_code` leg under `--enable-mcp` (https-only, validates the zoekt-parity envelope). Pure predicates at top are I/O-free and unit-testable; heavy imports (`httpx`/`mcp`/`sqlalchemy`/`databricks.sdk`) are lazy. All requests carry a fresh Databricks OAuth bearer (U2M or M2M). Never a silent green |
 | `migrate.py` | Single Alembic entry point: opens the engine via `app.db.client.create_db_engine`, resolves one schema (`PGSCHEMA` or `current_schema()`) that pins search_path + version table + grants together, runs `upgrade head`. Grants are opt-in via `--apply-grants` and applied independently per role: `APP_SP_ROLE` (read-only) and `JOB_WRITER_ROLE` (write), each validated and asserted present in `pg_roles` first; at least one must be set |
 | `ci_branch.py` | `up`/`down` lifecycle for an ephemeral Lakebase branch per CI run (real `lakebase_ann`/`lakebase_bm25` surface exists in no Postgres image). `up` forks `production` with `replace_existing=True` and a protobuf-`Duration` TTL (default 7200s cost backstop), resolves the auto-provisioned READ_WRITE endpoint (never creates one — the API rejects a second), prints `LAKEBASE_ENDPOINT`/`LAKEBASE_DATABASE` for `$GITHUB_ENV`. `down` purges best-effort and never fails the build |
@@ -26,17 +27,20 @@ Makefile instead. The Python scripts import from `app/` (`app.db.client`,
 
 ### Working In This Directory
 - **Step ordering in `deploy.sh` is the whole point of the file — do not reorder.**
-  Grants (steps 7 and 9) must follow each app's activation (steps 6 and 8) because an
+  Grants (steps 8 and 10) must follow each app's activation (steps 7 and 9) because an
   app SP's Postgres role does not exist until the app's first activation; `migrate.py`
   asserts the role exists in `pg_roles` before granting, and the 5×10s `retry` only
   absorbs visibility lag, not a missing activation.
-- Step 5 runs `make migrate` **without** grants deliberately (Decision A1): the
-  developer identity owns the tables, and neither app SP role exists yet.
-- Do not renumber the `[N/11]` steps without updating `README.md`, which references
-  step numbers explicitly (steps 6/8 fallback, step 11 URL banner) and embeds
-  `docs/diagrams/deploy-pipeline.png` ("the eleven steps of deploy.sh full").
+- Step 5 (Lakebase Search preflight) must precede step 6 (`make migrate`): it stops the
+  deploy with the self-serve enable instructions before 0004's `CREATE EXTENSION` would
+  fail mid-migration. Step 6 runs `make migrate` **without** grants deliberately
+  (Decision A1): the developer identity owns the tables, and neither app SP role exists
+  yet.
+- Do not renumber the `[N/12]` steps without updating `README.md`, which references
+  step numbers explicitly (steps 7/9 fallback, step 12 URL banner) and embeds
+  `docs/diagrams/deploy-pipeline.png` ("the twelve steps of deploy.sh full").
 - Prod requires `JOB_RUN_AS_SP` (the pre-created job run-as SP client id): `deploy.sh`
-  dies without it, threads it as `--var job_run_as_sp=...`, and step 7 asserts **both**
+  dies without it, threads it as `--var job_run_as_sp=...`, and step 8 asserts **both**
   the app SP role and the job writer role before granting. The writer role comes from
   the guarded env, never from bundle JSON (which resolves the var to its `""` default).
 - On dev, `grant_attempt` passes `JOB_WRITER_ROLE=""` — falsy, so `migrate.py` skips

@@ -11,13 +11,16 @@ with no separate operator ceremony. This supersedes the formerly GATED revision
 ``make migrate-semantic`` into a separate ``alembic_version_semantic`` table).
 
 **Project-level assumption (was a gate, now an assumption):** the target Lakebase
-project's Databricks-managed ``shared_preload_libraries`` already includes
-``lakebase_vector,lakebase_text``. That preload change is irreversible,
-project-level, and performed out-of-band (UI/support) -- this migration cannot
-perform it. When the preload is absent, ``CREATE EXTENSION`` fails loudly with
-"must be loaded via shared_preload_libraries" -- now at ``make migrate``/deploy
-time -- and that error IS the signal to go complete the preload prerequisite.
-See ``docs/runbooks/semantic-enablement.md``.
+project has **Lakebase Search enabled** — the GA self-serve project toggle
+(Settings → Lakebase Search → Enable) that makes ``lakebase_vector`` /
+``lakebase_text`` installable. Enabling is irreversible, project-level, restarts the
+project's computes, and is (as of 2026-10) not exposed through the project API/SDK/
+bundle, so this migration cannot perform it; ``scripts/deploy.sh`` probes for it and
+stops with instructions before reaching this revision. Pre-GA, the same precondition
+was an out-of-band managed ``shared_preload_libraries`` support request. When the
+precondition is absent, ``CREATE EXTENSION`` fails loudly with "must be loaded via
+shared_preload_libraries" -- now at ``make migrate``/deploy time -- and that error IS
+the signal to go enable Lakebase Search. See ``docs/runbooks/semantic-enablement.md``.
 
 **Idempotency guard:** a project that already ran the old gated migration has
 ``chunks`` (and possibly ``alembic_version_semantic``). ``to_regclass('chunks')``
@@ -75,8 +78,8 @@ def upgrade() -> None:
     # dependency on the base `vector` extension, so a bare CREATE EXTENSION fails with
     # 'required extension "vector" is not installed' on a project where `vector` isn't
     # pre-installed; CASCADE installs declared dependencies. It does NOT weaken the
-    # fail-loud preload check -- when the managed shared_preload_libraries prerequisite
-    # is absent, CREATE EXTENSION still errors with "must be loaded via
+    # fail-loud Lakebase-Search check -- when Lakebase Search is not enabled on the
+    # project, CREATE EXTENSION still errors with "must be loaded via
     # shared_preload_libraries", which remains the intended signal (see module
     # docstring + the enablement runbook).
     op.execute("CREATE EXTENSION IF NOT EXISTS lakebase_tokenizer CASCADE")
@@ -121,9 +124,9 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Drop the indexes then the table. Intentionally NOT dropping the lakebase_*
-    # extensions: they are database-wide objects whose enabling preload is itself
-    # irreversible and project-level, mirroring 0001's do-not-drop-the-extension
-    # rationale for pg_trgm.
+    # extensions: they are database-wide objects, and enabling Lakebase Search on the
+    # project is itself irreversible and project-level, mirroring 0001's
+    # do-not-drop-the-extension rationale for pg_trgm.
     op.execute("DROP INDEX IF EXISTS ix_chunks_ts_bm25")
     op.execute("DROP INDEX IF EXISTS ix_chunks_embedding_ann")
     op.execute("DROP TABLE IF EXISTS chunks")
