@@ -4,8 +4,9 @@
 #
 # Usage: deploy.sh <full|destroy> [TARGET]   (TARGET defaults to dev)
 #
-#   full     validate -> deploy -> secret-check -> migrate(schema) -> run+activate ->
-#            grants(post-activation) -> optional first index -> banner.
+#   full     validate -> deploy -> secret-check -> Lakebase-Search-preflight ->
+#            migrate(schema) -> run+activate -> grants(post-activation) ->
+#            optional first index -> banner.
 #   destroy  typed-confirm teardown of the whole bundle (irreversible Lakebase data loss).
 #
 # Single commands (smoke, index) live in the Makefile; this script owns only the ordering
@@ -113,16 +114,16 @@ cmd_full() {
 	#    uploads whatever is on disk at deploy time. The webui App installs on the uv path
 	#    (pyproject.toml + uv.lock, no requirements.txt) so it runs on Python 3.12; a stale/missing
 	#    wheel or lock means the webui app can't import `app.*` (or install) at start.
-	echo "deploy: [2/11] make webui-wheel"
+	echo "deploy: [2/12] make webui-wheel"
 	make webui-wheel
 
 	# 3. Deploy — ships definitions (Lakebase project/endpoint/catalog, prod job_writer role,
 	#    secret scope, job, both app definitions). Does NOT start app compute.
-	echo "deploy: [3/11] bundle deploy -t $TARGET"
+	echo "deploy: [3/12] bundle deploy -t $TARGET"
 	databricks bundle deploy -t "$TARGET" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"}
 
 	# 4. GitHub token secret check (indexing is optional for a running app).
-	echo "deploy: [4/11] GitHub token secret check (scope=$scope key=$key)"
+	echo "deploy: [4/12] GitHub token secret check (scope=$scope key=$key)"
 	if databricks secrets list-secrets "$scope" -o json 2>/dev/null |
 		jq -e --arg k "$key" 'any(.[]; .key==$k)' >/dev/null 2>&1; then
 		echo "deploy: secret '$key' already present in scope '$scope'"
@@ -133,15 +134,28 @@ cmd_full() {
 			"or re-run deploy after setting it"
 	fi
 
-	# 5. Migrate (schema only) — alembic upgrade head as the developer identity. No grants yet:
-	#    neither app's SP pg role exists until its first activation (steps 6, 8). The developer
+	# 5. Lakebase Search preflight — probe that the project has Lakebase Search enabled
+	#    BEFORE make migrate's 0004 CREATE EXTENSION fails mid-deploy with the less
+	#    actionable "must be loaded via shared_preload_libraries". Enabling is not exposed
+	#    through the project API/SDK/bundle, so this probes and instructs; it cannot enable.
+	#    Endpoint/database come from the same bundle-validate JSON the Makefile resolves.
+	echo "deploy: [5/12] Lakebase Search preflight"
+	local lb_ep lb_db
+	lb_ep="projects/$(req "$(jval lakebase_project_name)" "lakebase project name")/branches/production/endpoints/$(req "$(jval lakebase_endpoint_name)" "lakebase endpoint name")"
+	lb_db=$(req "$(jval database_name)" "database name")
+	LAKEBASE_ENDPOINT="$lb_ep" LAKEBASE_DATABASE="$lb_db" \
+		uv run python scripts/lakebase_search_preflight.py ||
+		die "Lakebase Search preflight failed (see above) — enable it, then re-run deploy"
+
+	# 6. Migrate (schema only) — alembic upgrade head as the developer identity. No grants yet:
+	#    neither app's SP pg role exists until its first activation (steps 7, 9). The developer
 	#    thereby owns the tables and needs no later job grant on dev.
-	echo "deploy: [5/11] make migrate (schema only)"
+	echo "deploy: [6/12] make migrate (schema only)"
 	make migrate TARGET="$TARGET"
 
-	# 6. Run the MCP app — ships app source AND starts compute; the app SP + its pg role
+	# 7. Run the MCP app — ships app source AND starts compute; the app SP + its pg role
 	#    materialize here.
-	echo "deploy: [6/11] bundle run code_search (ship source + start compute)"
+	echo "deploy: [7/12] bundle run code_search (ship source + start compute)"
 	databricks bundle run code_search -t "$TARGET" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"}
 	state=$(wait_active "$app_name")
 	if [ "$state" != ACTIVE ]; then
@@ -154,9 +168,9 @@ cmd_full() {
 			die "app '$app_name' never reached ACTIVE (last state: ${state:-unknown})"
 	fi
 
-	# 7. Grants for the MCP app (post-activation). APP_SP_ROLE is derived FRESH from apps get
+	# 8. Grants for the MCP app (post-activation). APP_SP_ROLE is derived FRESH from apps get
 	#    at this moment and guarded by req before it can ever reach validate_role.
-	echo "deploy: [7/11] grants (post-activation)"
+	echo "deploy: [8/12] grants (post-activation)"
 	app_sp_role=$(req "$(databricks apps get "$app_name" -o json |
 		jq -er '.service_principal_client_id')" "app SP client id")
 	# dev grants the app only (job_writer_role="" is falsy → migrate.py's `if job_env:` skips
@@ -178,9 +192,9 @@ cmd_full() {
 	retry 5 10 grant_attempt "$app_sp_role" "$job_writer_role" "$TARGET" ||
 		die "grants failed after retries (is the app SP role visible in pg_roles yet?)"
 
-	# 8. Run webui — same shape as step 6, second app, second SP, same first-activation
+	# 9. Run webui — same shape as step 7, second app, second SP, same first-activation
 	#    fallback.
-	echo "deploy: [8/11] bundle run webui (ship source + start compute)"
+	echo "deploy: [9/12] bundle run webui (ship source + start compute)"
 	databricks bundle run webui -t "$TARGET" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"}
 	state=$(wait_active "$webui_app_name")
 	if [ "$state" != ACTIVE ]; then
@@ -192,21 +206,21 @@ cmd_full() {
 			die "app '$webui_app_name' never reached ACTIVE (last state: ${state:-unknown})"
 	fi
 
-	# 9. Grants for webui (post-activation) — same read-only grant as the MCP app's SP (step 7),
-	#    applied to webui's own SP. No job-writer role here: the job grant was already applied
-	#    in step 7 and is not re-applied per app (grant_attempt's job_role arg is "" → skipped,
-	#    same falsy-skip behavior as dev in step 7).
-	echo "deploy: [9/11] webui grants (post-activation)"
+	# 10. Grants for webui (post-activation) — same read-only grant as the MCP app's SP (step 8),
+	#     applied to webui's own SP. No job-writer role here: the job grant was already applied
+	#     in step 8 and is not re-applied per app (grant_attempt's job_role arg is "" → skipped,
+	#     same falsy-skip behavior as dev in step 8).
+	echo "deploy: [10/12] webui grants (post-activation)"
 	webui_sp_role=$(req "$(databricks apps get "$webui_app_name" -o json |
 		jq -er '.service_principal_client_id')" "webui app SP client id")
 	retry 5 10 grant_attempt "$webui_sp_role" "" "$TARGET" ||
 		die "webui grants failed after retries (is the webui app SP role visible in pg_roles yet?)"
 
-	# 10. First index — the config is the only source of truth, and only the job can resolve it
+	# 11. First index — the config is the only source of truth, and only the job can resolve it
 	#     (expanding orgs/users needs the GitHub API + the secret + the pydantic filters).
 	#     Non-fatal: a missing GitHub token (step 4 only warns) must not abort a deploy whose
 	#     apps are already ACTIVE and granted.
-	echo "deploy: [10/11] first index"
+	echo "deploy: [11/12] first index"
 	if databricks bundle run code_search_index -t "$TARGET" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"}; then
 		echo "deploy: first index complete"
 	else
@@ -214,10 +228,10 @@ cmd_full() {
 			"then re-run 'make index TARGET=$TARGET'" >&2
 	fi
 
-	# 11. Final banner.
+	# 12. Final banner.
 	url=$(req "$(databricks apps get "$app_name" -o json | jq -er '.url')" "app url")
 	webui_url=$(req "$(databricks apps get "$webui_app_name" -o json | jq -er '.url')" "webui app url")
-	echo "deploy: [11/11] DONE — app URL: $url"
+	echo "deploy: [12/12] DONE — app URL: $url"
 	echo "deploy: DONE — webui URL: $webui_url"
 	echo "deploy: reminder — the account-admin OAuth app connection (M2M) for the custom MCP app"
 	echo "deploy: cannot be created by the bundle; an account admin must create it before external"
